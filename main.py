@@ -2,12 +2,15 @@ import os
 import json
 import logging
 import tempfile
+import base64
+import requests
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
+from pdf2image import convert_from_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,6 +68,54 @@ def transcribe_audio(file_path):
         )
     return transcript.text
 
+def image_to_base64(image_path):
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+def transcribe_image_base64(image_base64):
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Transcribi todo el texto que ves en esta imagen de forma completa y ordenada. "
+                            "Si es un presupuesto, factura, nota o documento, extrae todos los datos visibles: "
+                            "cliente, montos, conceptos, fechas, condiciones, totales, observaciones. "
+                            "Devuelve el texto plano sin formato especial."
+                        )
+                    }
+                ]
+            }
+        ],
+        max_tokens=1500
+    )
+    return response.choices[0].message.content.strip()
+
+def transcribe_image(image_path):
+    image_base64 = image_to_base64(image_path)
+    return transcribe_image_base64(image_base64)
+
+def transcribe_pdf(pdf_path):
+    pages = convert_from_path(pdf_path, dpi=150)
+    textos = []
+    for i, page in enumerate(pages):
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            page.save(tmp.name, "JPEG")
+            texto_pagina = transcribe_image(tmp.name)
+            os.unlink(tmp.name)
+            textos.append(f"--- Pagina {i+1} ---\n{texto_pagina}")
+    return "\n\n".join(textos)
+
 def clasificar_mensaje(text):
     prompt = (
         "Clasifica el siguiente mensaje en UNA de estas categorias:\n"
@@ -74,7 +125,7 @@ def clasificar_mensaje(text):
         "- cliente_update: actualizar estado de cliente existente, cambiar fecha, marcar cerrado, perdido, etc.\n"
         "- tarea: algo para hacer, pendiente, recordatorio de accion\n"
         "- recorrida: visita a campo, recorrida tecnica, inspeccion, reporte de visita\n"
-        "- presupuesto: presupuesto enviado, cotizacion, propuesta economica\n"
+        "- presupuesto: presupuesto enviado, cotizacion, propuesta economica, factura, nota de pedido\n"
         "- compra: comprar material, insumo, herramienta\n"
         "- idea: idea de negocio, contenido, post, mejora, proyecto futuro\n\n"
         "Responde UNICAMENTE con una de estas palabras: receta, cliente_nuevo, cliente_consulta, cliente_update, tarea, recorrida, presupuesto, compra, idea\n\n"
@@ -357,7 +408,7 @@ async def enviar_recordatorios(context):
         atrasados = []
 
         for c in clientes:
-            estado = c.get("Estado", "")
+            estado = str(c.get("Estado", "")).lower()
             if estado in ["cerrado", "perdido"]:
                 continue
             fecha_seg = c.get("Fecha seguimiento", "")
@@ -394,6 +445,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         text = None
+        es_archivo = False
 
         if message.voice:
             await context.bot.send_message(chat_id=chat_id, text="Transcribiendo audio...")
@@ -403,14 +455,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = transcribe_audio(tmp.name)
                 os.unlink(tmp.name)
 
+        elif message.photo:
+            await context.bot.send_message(chat_id=chat_id, text="Leyendo imagen...")
+            photo = message.photo[-1]
+            file = await context.bot.get_file(photo.file_id)
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                await file.download_to_drive(tmp.name)
+                text = transcribe_image(tmp.name)
+                os.unlink(tmp.name)
+            es_archivo = True
+
+        elif message.document:
+            mime = message.document.mime_type or ""
+            if mime.startswith("image/"):
+                await context.bot.send_message(chat_id=chat_id, text="Leyendo imagen...")
+                file = await context.bot.get_file(message.document.file_id)
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    await file.download_to_drive(tmp.name)
+                    text = transcribe_image(tmp.name)
+                    os.unlink(tmp.name)
+                es_archivo = True
+            elif mime == "application/pdf":
+                await context.bot.send_message(chat_id=chat_id, text="Leyendo PDF...")
+                file = await context.bot.get_file(message.document.file_id)
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    await file.download_to_drive(tmp.name)
+                    text = transcribe_pdf(tmp.name)
+                    os.unlink(tmp.name)
+                es_archivo = True
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="Formato no soportado. Manda texto, audio, imagen o PDF.")
+                return
+
         elif message.text:
             text = message.text
 
         else:
-            await context.bot.send_message(chat_id=chat_id, text="Solo puedo procesar texto o audio.")
+            await context.bot.send_message(chat_id=chat_id, text="Solo puedo procesar texto, audio, imagenes o PDFs.")
             return
 
         await context.bot.send_message(chat_id=chat_id, text="Procesando...")
+
+        # Si tiene caption, combinarlo con el texto extraido
+        if es_archivo and message.caption:
+            text = message.caption + "\n\n" + text
 
         categoria = clasificar_mensaje(text)
         sh = get_google_sheet()
@@ -631,7 +719,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
+    app.add_handler(MessageHandler(
+        filters.TEXT | filters.VOICE | filters.PHOTO | filters.Document.ALL,
+        handle_message
+    ))
 
     # Recordatorio diario a las 8am Argentina (UTC-3 = 11:00 UTC)
     app.job_queue.run_daily(
@@ -644,4 +735,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
