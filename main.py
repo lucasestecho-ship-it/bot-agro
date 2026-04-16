@@ -98,7 +98,6 @@ REGLAS IMPORTANTES:
 - La orden de carga va DENTRO de cada producto, no es un campo global.
 - La dosis es SOLO el número, sin unidad ni texto. Ejemplo: "2" no "2 kg/ha".
 - La unidad va separada. Ejemplo: "kg/ha", "L/ha", "cc/ha".
-- Escribí campo, lote y cultivo siempre en minúsculas.
 - No uses markdown, no uses backticks, respondé SOLO el JSON puro.
 
 El mensaje es: {text}"""
@@ -174,6 +173,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text="🔄 Procesando datos...")
 
         data = extract_data_with_gpt(text)
+
+        # Forzar minúsculas en Python, no depender de GPT
+        data["campo"] = data.get("campo", "").lower()
+        data["lote"] = data.get("lote", "").lower()
+        data["cultivo"] = data.get("cultivo", "").lower()
 
         superficie_desde_hoja2 = False
         if not data.get("superficie") or data.get("superficie") == "null":
