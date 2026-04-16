@@ -32,7 +32,6 @@ def get_sheet():
     return sh.worksheet("Hoja 1")
 
 def get_superficie_from_hoja2(lote):
-    """Busca la superficie de un lote en la Hoja 2 (col A=lote, col B=superficie)."""
     try:
         creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         scopes = [
@@ -44,8 +43,8 @@ def get_superficie_from_hoja2(lote):
         sh = gc.open_by_key(GOOGLE_SHEET_ID)
         hoja2 = sh.worksheet("Hoja 2")
 
-        lotes = hoja2.col_values(1)        # Columna A
-        superficies = hoja2.col_values(2)  # Columna B
+        lotes = hoja2.col_values(1)
+        superficies = hoja2.col_values(2)
 
         lote_normalizado = lote.strip().lower()
         for i, nombre in enumerate(lotes):
@@ -58,7 +57,7 @@ def get_superficie_from_hoja2(lote):
         return None
 
 def get_next_receta_number(worksheet):
-    values = worksheet.col_values(11)  # Columna K = Receta
+    values = worksheet.col_values(11)
     nums = []
     for v in values[1:]:
         try:
@@ -99,6 +98,7 @@ REGLAS IMPORTANTES:
 - La orden de carga va DENTRO de cada producto, no es un campo global.
 - La dosis es SOLO el número, sin unidad ni texto. Ejemplo: "2" no "2 kg/ha".
 - La unidad va separada. Ejemplo: "kg/ha", "L/ha", "cc/ha".
+- Escribí campo, lote y cultivo siempre en minúsculas.
 - No uses markdown, no uses backticks, respondé SOLO el JSON puro.
 
 El mensaje es: {text}"""
@@ -113,7 +113,6 @@ El mensaje es: {text}"""
     return json.loads(raw)
 
 def calcular_consumo(dosis, superficie):
-    """Multiplica dosis por superficie, devuelve el resultado o vacío si no se puede."""
     try:
         return round(float(str(dosis).replace(",", ".")) * float(str(superficie).replace(",", ".")), 2)
     except:
@@ -127,19 +126,19 @@ def save_to_sheet(worksheet, data, receta_num):
         consumo = calcular_consumo(dosis, superficie)
 
         row = [
-            data.get("fecha", ""),           # A - Fecha
-            data.get("campo", ""),            # B - Campo
-            data.get("cultivo", ""),          # C - Cultivo
-            data.get("lote", ""),             # D - Lote
-            data.get("labor", "Pulverización"), # E - Labor
-            superficie,                        # F - Sup (ha)
-            producto.get("producto", ""),     # G - Producto
-            dosis,                             # H - Dosis
-            producto.get("unidad", ""),       # I - Unidad
-            producto.get("orden_carga", ""),  # J - Orden carga
-            receta_num,                        # K - Receta
-            "",                                # L - receta real (vacío)
-            consumo                            # M - consumo producto
+            data.get("fecha", ""),
+            data.get("campo", ""),
+            data.get("cultivo", ""),
+            data.get("lote", ""),
+            data.get("labor", "Pulverización"),
+            superficie,
+            producto.get("producto", ""),
+            dosis,
+            producto.get("unidad", ""),
+            producto.get("orden_carga", ""),
+            receta_num,
+            "",
+            consumo
         ]
         rows.append(row)
 
@@ -155,7 +154,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = None
 
-        # Si es audio/voz
         if message.voice:
             await context.bot.send_message(chat_id=chat_id, text="🎙️ Transcribiendo audio...")
 
@@ -166,7 +164,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = transcribe_audio(tmp.name)
                 os.unlink(tmp.name)
 
-        # Si es texto
         elif message.text:
             text = message.text
 
@@ -176,10 +173,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(chat_id=chat_id, text="🔄 Procesando datos...")
 
-        # Extraer datos con GPT
         data = extract_data_with_gpt(text)
 
-        # Si no se mencionó superficie, buscarla en Hoja 2
         superficie_desde_hoja2 = False
         if not data.get("superficie") or data.get("superficie") == "null":
             sup = get_superficie_from_hoja2(data.get("lote", ""))
@@ -187,12 +182,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data["superficie"] = sup
                 superficie_desde_hoja2 = True
 
-        # Guardar en Sheet
         worksheet = get_sheet()
         receta_num = get_next_receta_number(worksheet)
         rows = save_to_sheet(worksheet, data, receta_num)
 
-        # Armar respuesta
         productos_texto = "\n".join([
             f"  • {r[6]}: {r[7]} {r[8]} | orden: {r[9]} | consumo: {r[12]}"
             for r in rows
