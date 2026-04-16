@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]
 openai
 gspread
 google-auth
+pdf2image
