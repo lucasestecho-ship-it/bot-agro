@@ -60,7 +60,7 @@ def get_superficie_from_hoja2(lote):
 def get_next_receta_number(worksheet):
     values = worksheet.col_values(11)  # Columna K = Receta
     nums = []
-    for v in values[1:]:  # saltar encabezado
+    for v in values[1:]:
         try:
             n = int(v)
             if n > 0:
@@ -88,13 +88,19 @@ Extraé la información y respondé ÚNICAMENTE con JSON puro, sin texto adicion
   "lote": "nombre del lote",
   "labor": "Pulverización",
   "superficie": "número de hectáreas solo el número, null si no menciona",
-  "orden_carga": "número si lo menciona, sino null",
   "productos": [
-    {{"producto": "nombre del producto 1", "dosis": "solo el número sin texto ni unidad, ejemplo: 2", "unidad": "solo la unidad, ejemplo: kg/ha o L/ha o cc/ha"}},
-    {{"producto": "nombre del producto 2", "dosis": "solo el número sin texto ni unidad, ejemplo: 0.1", "unidad": "solo la unidad, ejemplo: kg/ha o L/ha o cc/ha"}}
+    {{"producto": "nombre del producto 1", "dosis": "solo el número sin texto ni unidad", "unidad": "solo la unidad, ejemplo: kg/ha o L/ha o cc/ha", "orden_carga": "número de orden de carga de este producto, null si no menciona"}},
+    {{"producto": "nombre del producto 2", "dosis": "solo el número sin texto ni unidad", "unidad": "solo la unidad, ejemplo: kg/ha o L/ha o cc/ha", "orden_carga": "número de orden de carga de este producto, null si no menciona"}}
   ]
 }}
-IMPORTANTE: No uses markdown, no uses backticks, respondé SOLO el JSON puro sin ningún formato adicional.
+
+REGLAS IMPORTANTES:
+- El usuario puede dictar la orden de carga de distintas formas: "orden de carga 1 harrier bio, 2 roundup", o "primero harrier bio, segundo roundup", o "harrier bio primero, roundup segundo". En todos los casos asigná el número correspondiente: primero=1, segundo=2, tercero=3, cuarto=4, quinto=5.
+- La orden de carga va DENTRO de cada producto, no es un campo global.
+- La dosis es SOLO el número, sin unidad ni texto. Ejemplo: "2" no "2 kg/ha".
+- La unidad va separada. Ejemplo: "kg/ha", "L/ha", "cc/ha".
+- No uses markdown, no uses backticks, respondé SOLO el JSON puro.
+
 El mensaje es: {text}"""
 
     response = openai_client.chat.completions.create(
@@ -106,21 +112,34 @@ El mensaje es: {text}"""
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
+def calcular_consumo(dosis, superficie):
+    """Multiplica dosis por superficie, devuelve el resultado o vacío si no se puede."""
+    try:
+        return round(float(str(dosis).replace(",", ".")) * float(str(superficie).replace(",", ".")), 2)
+    except:
+        return ""
+
 def save_to_sheet(worksheet, data, receta_num):
     rows = []
     for producto in data["productos"]:
+        superficie = data.get("superficie", "")
+        dosis = producto.get("dosis", "")
+        consumo = calcular_consumo(dosis, superficie)
+
         row = [
-            data.get("fecha", ""),
-            data.get("campo", ""),
-            data.get("cultivo", ""),
-            data.get("lote", ""),
-            data.get("labor", "Pulverización"),
-            data.get("superficie", ""),
-            producto.get("producto", ""),
-            producto.get("dosis", ""),
-            producto.get("unidad", ""),
-            data.get("orden_carga", ""),
-            receta_num
+            data.get("fecha", ""),           # A - Fecha
+            data.get("campo", ""),            # B - Campo
+            data.get("cultivo", ""),          # C - Cultivo
+            data.get("lote", ""),             # D - Lote
+            data.get("labor", "Pulverización"), # E - Labor
+            superficie,                        # F - Sup (ha)
+            producto.get("producto", ""),     # G - Producto
+            dosis,                             # H - Dosis
+            producto.get("unidad", ""),       # I - Unidad
+            producto.get("orden_carga", ""),  # J - Orden carga
+            receta_num,                        # K - Receta
+            "",                                # L - receta real (vacío)
+            consumo                            # M - consumo producto
         ]
         rows.append(row)
 
@@ -174,7 +193,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = save_to_sheet(worksheet, data, receta_num)
 
         # Armar respuesta
-        productos_texto = "\n".join([f"  • {r[6]}: {r[7]} {r[8]}" for r in rows])
+        productos_texto = "\n".join([
+            f"  • {r[6]}: {r[7]} {r[8]} | orden: {r[9]} | consumo: {r[12]}"
+            for r in rows
+        ])
         sup_label = f"{data.get('superficie')} ha _(desde registro de lotes)_" if superficie_desde_hoja2 else f"{data.get('superficie')} ha"
         respuesta = f"""✅ *Receta #{receta_num} guardada!*
 
