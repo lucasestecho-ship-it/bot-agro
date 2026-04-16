@@ -31,6 +31,32 @@ def get_sheet():
     sh = gc.open_by_key(GOOGLE_SHEET_ID)
     return sh.worksheet("Hoja 1")
 
+def get_superficie_from_hoja2(lote):
+    """Busca la superficie de un lote en la Hoja 2 (col A=lote, col B=superficie)."""
+    try:
+        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        hoja2 = sh.worksheet("Hoja 2")
+
+        lotes = hoja2.col_values(1)        # Columna A
+        superficies = hoja2.col_values(2)  # Columna B
+
+        lote_normalizado = lote.strip().lower()
+        for i, nombre in enumerate(lotes):
+            if nombre.strip().lower() == lote_normalizado:
+                if i < len(superficies):
+                    return superficies[i]
+        return None
+    except Exception as e:
+        logger.warning(f"No se pudo obtener superficie de Hoja 2: {e}")
+        return None
+
 def get_next_receta_number(worksheet):
     values = worksheet.col_values(11)  # Columna K = Receta
     nums = []
@@ -61,7 +87,7 @@ Extraé la información y respondé ÚNICAMENTE con JSON puro, sin texto adicion
   "cultivo": "cultivo",
   "lote": "nombre del lote",
   "labor": "Pulverización",
-  "superficie": "número de hectáreas solo el número",
+  "superficie": "número de hectáreas solo el número, null si no menciona",
   "orden_carga": "número si lo menciona, sino null",
   "productos": [
     {{"producto": "nombre del producto 1", "dosis": "solo el número sin texto ni unidad, ejemplo: 2", "unidad": "solo la unidad, ejemplo: kg/ha o L/ha o cc/ha"}},
@@ -75,7 +101,7 @@ El mensaje es: {text}"""
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
-    
+
     raw = response.choices[0].message.content
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
@@ -97,63 +123,72 @@ def save_to_sheet(worksheet, data, receta_num):
             receta_num
         ]
         rows.append(row)
-    
+
     for row in rows:
         worksheet.append_row(row)
-    
+
     return rows
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     chat_id = message.chat_id
-    
+
     try:
         text = None
-        
+
         # Si es audio/voz
         if message.voice:
             await context.bot.send_message(chat_id=chat_id, text="🎙️ Transcribiendo audio...")
-            
+
             file = await context.bot.get_file(message.voice.file_id)
-            
+
             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
                 await file.download_to_drive(tmp.name)
                 text = transcribe_audio(tmp.name)
                 os.unlink(tmp.name)
-        
+
         # Si es texto
         elif message.text:
             text = message.text
-        
+
         else:
             await context.bot.send_message(chat_id=chat_id, text="❌ Solo puedo procesar mensajes de texto o audio.")
             return
-        
+
         await context.bot.send_message(chat_id=chat_id, text="🔄 Procesando datos...")
-        
+
         # Extraer datos con GPT
         data = extract_data_with_gpt(text)
-        
+
+        # Si no se mencionó superficie, buscarla en Hoja 2
+        superficie_desde_hoja2 = False
+        if not data.get("superficie") or data.get("superficie") == "null":
+            sup = get_superficie_from_hoja2(data.get("lote", ""))
+            if sup:
+                data["superficie"] = sup
+                superficie_desde_hoja2 = True
+
         # Guardar en Sheet
         worksheet = get_sheet()
         receta_num = get_next_receta_number(worksheet)
         rows = save_to_sheet(worksheet, data, receta_num)
-        
+
         # Armar respuesta
         productos_texto = "\n".join([f"  • {r[6]}: {r[7]} {r[8]}" for r in rows])
+        sup_label = f"{data.get('superficie')} ha _(desde registro de lotes)_" if superficie_desde_hoja2 else f"{data.get('superficie')} ha"
         respuesta = f"""✅ *Receta #{receta_num} guardada!*
 
 📅 Fecha: {data.get('fecha')}
 🌾 Campo: {data.get('campo')}
 🌱 Cultivo: {data.get('cultivo')}
 📍 Lote: {data.get('lote')}
-📐 Superficie: {data.get('superficie')} ha
+📐 Superficie: {sup_label}
 
 🧪 Productos:
 {productos_texto}"""
-        
+
         await context.bot.send_message(chat_id=chat_id, text=respuesta, parse_mode="Markdown")
-        
+
     except Exception as e:
         logger.error(f"Error: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Error al procesar: {str(e)}")
