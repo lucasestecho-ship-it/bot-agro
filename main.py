@@ -2,13 +2,12 @@ import os
 import json
 import logging
 import tempfile
-import requests
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +16,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+MY_CHAT_ID = 1144480769
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -29,9 +29,6 @@ def get_google_sheet():
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
-
-def get_sheet():
-    return get_google_sheet().worksheet("Hoja 1")
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -70,13 +67,17 @@ def transcribe_audio(file_path):
 
 def clasificar_mensaje(text):
     prompt = (
-        "Clasificá el siguiente mensaje en UNA de estas categorías:\n"
-        "- receta: si habla de aplicación fitosanitaria, agroquímicos, pulverización, lotes, cultivos, productos como roundup, harrier, etc.\n"
-        "- tarea: si es algo para hacer, llamar a alguien, resolver algo, pendiente\n"
-        "- compra: si hay que comprar algo, un producto, material, insumo\n"
-        "- idea: si es una idea, post, contenido, proyecto futuro, algo que estaria bueno hacer, propuesta de redes sociales, tema para publicar, contenido para instagram, facebook, youtube u otras plataformas\n"
-        "- cliente: si menciona un cliente, visita, reunion, trabajo para alguien\n\n"
-        "Responde UNICAMENTE con una de estas palabras: receta, tarea, compra, idea, cliente\n\n"
+        "Clasifica el siguiente mensaje en UNA de estas categorias:\n"
+        "- receta: aplicacion fitosanitaria, agroquimicos, pulverizacion, lotes, cultivos, productos como roundup, harrier, etc.\n"
+        "- cliente_nuevo: registrar nuevo cliente, oportunidad comercial, contacto nuevo, posible trabajo\n"
+        "- cliente_consulta: consultar estado de clientes, ver pendientes, ver seguimientos\n"
+        "- cliente_update: actualizar estado de cliente existente, cambiar fecha, marcar cerrado, perdido, etc.\n"
+        "- tarea: algo para hacer, pendiente, recordatorio de accion\n"
+        "- recorrida: visita a campo, recorrida tecnica, inspeccion, reporte de visita\n"
+        "- presupuesto: presupuesto enviado, cotizacion, propuesta economica\n"
+        "- compra: comprar material, insumo, herramienta\n"
+        "- idea: idea de negocio, contenido, post, mejora, proyecto futuro\n\n"
+        "Responde UNICAMENTE con una de estas palabras: receta, cliente_nuevo, cliente_consulta, cliente_update, tarea, recorrida, presupuesto, compra, idea\n\n"
         f"Mensaje: {text}"
     )
     response = openai_client.chat.completions.create(
@@ -85,51 +86,153 @@ def clasificar_mensaje(text):
     )
     return response.choices[0].message.content.strip().lower()
 
-def extract_data_with_gpt(text):
+def extract_receta(text):
     today = datetime.now().strftime("%d/%m/%Y")
     prompt = (
-        "Sos un asistente agronomo. El usuario te dicta datos de una aplicacion fitosanitaria.\n"
-        "Extrae la informacion y responde UNICAMENTE con JSON puro, sin texto adicional, sin explicaciones, sin markdown, sin backticks, solo el JSON puro:\n"
+        "Sos un asistente agronomo. Extrae datos de aplicacion fitosanitaria y responde SOLO JSON puro:\n"
         "{\n"
-        f'  "fecha": "usa {today} si no menciona otra fecha",\n'
+        f'  "fecha": "usa {today} si no menciona",\n'
         '  "campo": "nombre del campo",\n'
         '  "cultivo": "cultivo",\n'
         '  "lote": "nombre del lote",\n'
         '  "labor": "Pulverizacion",\n'
-        '  "superficie": "numero de hectareas solo el numero, null si no menciona",\n'
+        '  "superficie": "numero o null",\n'
         '  "productos": [\n'
-        '    {"producto": "nombre del producto 1", "dosis": "solo el numero sin texto ni unidad", "unidad": "solo la unidad, ejemplo: kg/ha o L/ha o cc/ha", "orden_carga": "numero de orden de carga de este producto, null si no menciona"},\n'
-        '    {"producto": "nombre del producto 2", "dosis": "solo el numero sin texto ni unidad", "unidad": "solo la unidad, ejemplo: kg/ha o L/ha o cc/ha", "orden_carga": "numero de orden de carga de este producto, null si no menciona"}\n'
+        '    {"producto": "nombre", "dosis": "solo numero", "unidad": "kg/ha o L/ha o cc/ha", "orden_carga": "numero o null"}\n'
         '  ]\n'
-        '}\n\n'
-        'REGLAS IMPORTANTES:\n'
-        '- El usuario puede dictar la orden de carga de distintas formas: "orden de carga 1 harrier bio, 2 roundup", o "primero harrier bio, segundo roundup", o "harrier bio primero, roundup segundo". En todos los casos asigna el numero correspondiente: primero=1, segundo=2, tercero=3, cuarto=4, quinto=5.\n'
-        '- La orden de carga va DENTRO de cada producto, no es un campo global.\n'
-        '- La dosis es SOLO el numero, sin unidad ni texto. Ejemplo: "2" no "2 kg/ha".\n'
-        '- La unidad va separada. Ejemplo: "kg/ha", "L/ha", "cc/ha".\n'
-        '- No uses markdown, no uses backticks, responde SOLO el JSON puro.\n\n'
-        f'El mensaje es: {text}'
+        '}\n'
+        'REGLAS: orden de carga: primero=1, segundo=2, etc. Dosis solo numero. Solo JSON sin markdown.\n'
+        f'Mensaje: {text}'
     )
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content
-    raw = raw.replace("```json", "").replace("```", "").strip()
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_cliente_nuevo(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    fecha_default = (datetime.now() + timedelta(days=3)).strftime("%d/%m/%Y")
+    prompt = (
+        "Extrae datos de este nuevo cliente y responde SOLO JSON puro:\n"
+        "{\n"
+        f'  "fecha": "{today}",\n'
+        '  "cliente": "nombre del cliente",\n'
+        '  "empresa": "empresa o establecimiento o null",\n'
+        '  "zona": "zona o localidad o null",\n'
+        '  "provincia": "provincia o null",\n'
+        '  "contacto": "nombre de contacto o null",\n'
+        '  "telefono": "telefono o null",\n'
+        '  "email": "email o null",\n'
+        '  "origen": "como llego: recomendacion, instagram, web, conocido, etc. o null",\n'
+        '  "necesidad": "que necesita o null",\n'
+        '  "tipo_trabajo": "aguadas, caminos, apotreramiento, topografia, pasturas, asesoramiento integral, otro o null",\n'
+        '  "estado": "nuevo, contactado, reunion pendiente, presupuesto pendiente, presupuesto enviado, en seguimiento, cerrado, perdido",\n'
+        '  "proxima_accion": "que hay que hacer o null",\n'
+        f'  "fecha_seguimiento": "fecha DD/MM/YYYY, si no menciona usa {fecha_default}",\n'
+        '  "presupuesto": "monto o pendiente",\n'
+        '  "probabilidad_cierre": "alta, media, baja o null",\n'
+        '  "prioridad": "alta, media, baja",\n'
+        '  "observaciones": "cualquier dato extra o null"\n'
+        '}\n'
+        f'Hoy es {today}. Mensaje: {text}'
+    )
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_cliente_update(text):
+    prompt = (
+        "El usuario quiere actualizar un cliente. Responde SOLO JSON puro:\n"
+        "{\n"
+        '  "cliente": "nombre del cliente a actualizar",\n'
+        '  "nuevo_estado": "nuevo estado o null",\n'
+        '  "proxima_accion": "nueva accion o null",\n'
+        '  "fecha_seguimiento": "nueva fecha DD/MM/YYYY o null",\n'
+        '  "observaciones": "nueva observacion o null"\n'
+        '}\n'
+        f'Mensaje: {text}'
+    )
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_tarea(text):
     today = datetime.now().strftime("%d/%m/%Y")
+    fecha_default = (datetime.now() + timedelta(days=1)).strftime("%d/%m/%Y")
     prompt = (
-        "Extrae los datos de esta tarea y responde SOLO con JSON puro:\n"
+        "Extrae datos de esta tarea y responde SOLO JSON puro:\n"
         "{\n"
         f'  "fecha": "{today}",\n'
-        '  "tarea": "descripcion clara de la tarea",\n'
-        '  "persona": "nombre de la persona involucrada si menciona, sino null",\n'
-        '  "prioridad": "Alta, Media o Baja segun la urgencia que transmite el mensaje. Si no se menciona, usa Media",\n'
-        '  "estado": "Pendiente"\n'
+        '  "tarea": "descripcion de la tarea",\n'
+        '  "cliente": "cliente relacionado o null",\n'
+        '  "categoria": "comercial, tecnico, compra, administrativo, contenido",\n'
+        '  "responsable": "nombre o Lucas si no menciona",\n'
+        '  "estado": "pendiente",\n'
+        '  "prioridad": "alta, media, baja",\n'
+        f'  "fecha_limite": "fecha DD/MM/YYYY, si no menciona usa {fecha_default}",\n'
+        '  "observaciones": "extra o null"\n'
         '}\n'
         f'Mensaje: {text}'
+    )
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_recorrida(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    fecha_default = (datetime.now() + timedelta(days=14)).strftime("%d/%m/%Y")
+    prompt = (
+        "Extrae datos de esta recorrida de campo y responde SOLO JSON puro:\n"
+        "{\n"
+        f'  "fecha": "{today}",\n'
+        '  "cliente": "nombre del cliente o campo",\n'
+        '  "campo": "nombre del campo o lote o null",\n'
+        '  "zona": "zona o localidad o null",\n'
+        '  "resumen": "resumen general de la visita",\n'
+        '  "problemas": "problemas detectados o null",\n'
+        '  "recomendaciones": "recomendaciones o null",\n'
+        '  "urgencia": "alta, media, baja",\n'
+        f'  "proxima_visita": "fecha DD/MM/YYYY, si no menciona usa {fecha_default}",\n'
+        '  "observaciones": "extra o null"\n'
+        '}\n'
+        f'Hoy es {today}. Mensaje: {text}'
+    )
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_presupuesto(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    prompt = (
+        "Extrae datos de este presupuesto y responde SOLO JSON puro:\n"
+        "{\n"
+        f'  "fecha": "{today}",\n'
+        '  "cliente": "nombre del cliente",\n'
+        '  "trabajo": "tipo de trabajo",\n'
+        '  "descripcion": "descripcion del trabajo o null",\n'
+        '  "honorarios": "monto o 0",\n'
+        '  "viaticos": "monto o 0",\n'
+        '  "total": "monto total o 0",\n'
+        '  "estado": "borrador, enviado, aprobado, rechazado",\n'
+        f'  "fecha_envio": "fecha DD/MM/YYYY o {today}",\n'
+        '  "fecha_respuesta": "fecha esperada o pendiente",\n'
+        '  "observaciones": "extra o null"\n'
+        '}\n'
+        f'Hoy es {today}. Mensaje: {text}'
     )
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
@@ -141,12 +244,18 @@ def extract_tarea(text):
 def extract_compra(text):
     today = datetime.now().strftime("%d/%m/%Y")
     prompt = (
-        "Extrae los datos de esta compra y responde SOLO con JSON puro:\n"
+        "Extrae datos de esta compra y responde SOLO JSON puro:\n"
         "{\n"
         f'  "fecha": "{today}",\n'
-        '  "producto": "nombre del producto a comprar",\n'
-        '  "cantidad": "cantidad si menciona, sino null",\n'
-        '  "estado": "Pendiente"\n'
+        '  "cliente_obra": "cliente u obra relacionada o null",\n'
+        '  "material": "nombre del material o producto",\n'
+        '  "cantidad": "cantidad o null",\n'
+        '  "unidad": "unidad de medida o null",\n'
+        '  "proveedor": "proveedor o a definir",\n'
+        '  "precio_unitario": "precio o 0",\n'
+        '  "total": "total o 0",\n'
+        '  "estado": "a cotizar, cotizado, pedido, recibido",\n'
+        '  "observaciones": "extra o null"\n'
         '}\n'
         f'Mensaje: {text}'
     )
@@ -160,11 +269,14 @@ def extract_compra(text):
 def extract_idea(text):
     today = datetime.now().strftime("%d/%m/%Y")
     prompt = (
-        "Extrae los datos de esta idea y responde SOLO con JSON puro:\n"
+        "Extrae datos de esta idea y responde SOLO JSON puro:\n"
         "{\n"
         f'  "fecha": "{today}",\n'
+        '  "tipo": "contenido, negocio, mejora, producto, proceso u otro",\n'
         '  "idea": "descripcion de la idea",\n'
-        '  "categoria": "una categoria corta: post, proyecto, producto, proceso u otra"\n'
+        '  "cliente_tema": "cliente o tema relacionado o general",\n'
+        '  "estado": "nueva",\n'
+        '  "observaciones": "extra o null"\n'
         '}\n'
         f'Mensaje: {text}'
     )
@@ -175,25 +287,35 @@ def extract_idea(text):
     raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
-def extract_cliente(text):
-    today = datetime.now().strftime("%d/%m/%Y")
-    prompt = (
-        "Extrae los datos de este mensaje de cliente y responde SOLO con JSON puro:\n"
-        "{\n"
-        f'  "fecha": "{today}",\n'
-        '  "cliente": "nombre del cliente o empresa",\n'
-        '  "tema": "de que se trata, que quiere o necesita",\n'
-        '  "prioridad": "Alta, Media o Baja segun la urgencia. Si no se menciona, usa Media",\n'
-        '  "estado": "Pendiente"\n'
-        '}\n'
-        f'Mensaje: {text}'
-    )
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+def get_clientes_activos():
+    try:
+        hoja = get_google_sheet().worksheet("clientes")
+        return hoja.get_all_records()
+    except Exception as e:
+        logger.error(f"Error obteniendo clientes: {e}")
+        return []
+
+def buscar_y_actualizar_cliente(nombre, nuevo_estado=None, proxima_accion=None, fecha_seguimiento=None, observaciones=None):
+    try:
+        hoja = get_google_sheet().worksheet("clientes")
+        clientes = hoja.col_values(2)
+        nombre_lower = nombre.strip().lower()
+        for i, c in enumerate(clientes):
+            if c.strip().lower() == nombre_lower:
+                fila = i + 1
+                if nuevo_estado:
+                    hoja.update_cell(fila, 12, nuevo_estado)
+                if proxima_accion:
+                    hoja.update_cell(fila, 13, proxima_accion)
+                if fecha_seguimiento:
+                    hoja.update_cell(fila, 14, fecha_seguimiento)
+                if observaciones:
+                    hoja.update_cell(fila, 18, observaciones)
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"Error actualizando cliente: {e}")
+        return False
 
 def calcular_consumo(dosis, superficie):
     try:
@@ -201,7 +323,7 @@ def calcular_consumo(dosis, superficie):
     except:
         return ""
 
-def save_to_sheet(worksheet, data, receta_num):
+def save_receta(worksheet, data, receta_num):
     rows = []
     for producto in data["productos"]:
         superficie = data.get("superficie", "")
@@ -227,6 +349,45 @@ def save_to_sheet(worksheet, data, receta_num):
         worksheet.append_row(row)
     return rows
 
+async def enviar_recordatorios(context):
+    try:
+        today = datetime.now().date()
+        clientes = get_clientes_activos()
+        pendientes_hoy = []
+        atrasados = []
+
+        for c in clientes:
+            estado = c.get("Estado", "")
+            if estado in ["cerrado", "perdido"]:
+                continue
+            fecha_seg = c.get("Fecha seguimiento", "")
+            cliente = c.get("Cliente", "")
+            proxima = c.get("Proxima accion", "")
+            if fecha_seg:
+                try:
+                    fecha = datetime.strptime(fecha_seg, "%d/%m/%Y").date()
+                    dias_diff = (today - fecha).days
+                    if fecha == today:
+                        pendientes_hoy.append("- " + cliente + ": " + proxima)
+                    elif dias_diff > 0:
+                        atrasados.append("- " + cliente + " (hace " + str(dias_diff) + " dias): " + proxima)
+                except:
+                    pass
+
+        if not pendientes_hoy and not atrasados:
+            return
+
+        msg = "Buenos dias! Resumen comercial:\n\n"
+        if pendientes_hoy:
+            msg += "PARA HOY:\n" + "\n".join(pendientes_hoy) + "\n\n"
+        if atrasados:
+            msg += "ATRASADOS:\n" + "\n".join(atrasados) + "\n"
+
+        await context.bot.send_message(chat_id=MY_CHAT_ID, text=msg)
+
+    except Exception as e:
+        logger.error(f"Error en recordatorios: {e}")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     chat_id = message.chat_id
@@ -246,7 +407,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = message.text
 
         else:
-            await context.bot.send_message(chat_id=chat_id, text="Solo puedo procesar mensajes de texto o audio.")
+            await context.bot.send_message(chat_id=chat_id, text="Solo puedo procesar texto o audio.")
             return
 
         await context.bot.send_message(chat_id=chat_id, text="Procesando...")
@@ -255,7 +416,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sh = get_google_sheet()
 
         if categoria == "receta":
-            data = extract_data_with_gpt(text)
+            data = extract_receta(text)
             data["campo"] = (data.get("campo") or "").lower()
             data["lote"] = (data.get("lote") or "").lower()
             data["cultivo"] = (data.get("cultivo") or "").lower()
@@ -269,7 +430,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             worksheet = sh.worksheet("Hoja 1")
             receta_num = get_next_receta_number(worksheet)
-            rows = save_to_sheet(worksheet, data, receta_num)
+            rows = save_receta(worksheet, data, receta_num)
 
             productos_texto = "\n".join([
                 "  - " + r[6] + ": " + str(r[7]) + " " + r[8] + " | orden: " + str(r[9]) + " | consumo: " + str(r[12])
@@ -286,66 +447,177 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Productos:\n" + productos_texto
             )
 
+        elif categoria == "cliente_nuevo":
+            data = extract_cliente_nuevo(text)
+            sh.worksheet("clientes").append_row([
+                data.get("fecha", ""),
+                data.get("cliente", ""),
+                data.get("empresa", ""),
+                data.get("zona", ""),
+                data.get("provincia", ""),
+                data.get("contacto", ""),
+                data.get("telefono", ""),
+                data.get("email", ""),
+                data.get("origen", ""),
+                data.get("necesidad", ""),
+                data.get("tipo_trabajo", ""),
+                data.get("estado", ""),
+                data.get("proxima_accion", ""),
+                data.get("fecha_seguimiento", ""),
+                data.get("presupuesto", ""),
+                data.get("probabilidad_cierre", ""),
+                data.get("prioridad", ""),
+                data.get("observaciones", "")
+            ])
+            respuesta = (
+                "Cliente guardado!\n\n"
+                "Cliente: " + str(data.get("cliente", "")) + "\n"
+                "Empresa: " + str(data.get("empresa", "") or "-") + "\n"
+                "Zona: " + str(data.get("zona", "") or "-") + "\n"
+                "Tipo de trabajo: " + str(data.get("tipo_trabajo", "") or "-") + "\n"
+                "Estado: " + str(data.get("estado", "")) + "\n"
+                "Proxima accion: " + str(data.get("proxima_accion", "") or "-") + "\n"
+                "Seguimiento: " + str(data.get("fecha_seguimiento", "")) + "\n"
+                "Prioridad: " + str(data.get("prioridad", ""))
+            )
+
+        elif categoria == "cliente_consulta":
+            clientes = get_clientes_activos()
+            activos = [c for c in clientes if str(c.get("Estado", "")).lower() not in ["cerrado", "perdido"]]
+            if not activos:
+                respuesta = "No hay clientes activos en seguimiento."
+            else:
+                lineas = ["Clientes activos:\n"]
+                for c in activos:
+                    lineas.append(
+                        "- " + str(c.get("Cliente", "")) + "\n"
+                        "  Estado: " + str(c.get("Estado", "")) + "\n"
+                        "  Proxima accion: " + str(c.get("Proxima accion", "")) + "\n"
+                        "  Seguimiento: " + str(c.get("Fecha seguimiento", "")) + "\n"
+                    )
+                respuesta = "\n".join(lineas)
+
+        elif categoria == "cliente_update":
+            data = extract_cliente_update(text)
+            nombre = data.get("cliente", "")
+            ok = buscar_y_actualizar_cliente(
+                nombre,
+                nuevo_estado=data.get("nuevo_estado"),
+                proxima_accion=data.get("proxima_accion"),
+                fecha_seguimiento=data.get("fecha_seguimiento"),
+                observaciones=data.get("observaciones")
+            )
+            if ok:
+                respuesta = "Cliente " + nombre + " actualizado."
+            else:
+                respuesta = "No encontre el cliente '" + nombre + "'. Verifica el nombre."
+
         elif categoria == "tarea":
             data = extract_tarea(text)
-            sh.worksheet("Hoja 3").append_row([
+            sh.worksheet("tareas").append_row([
                 data.get("fecha", ""),
                 data.get("tarea", ""),
-                data.get("persona", ""),
+                data.get("cliente", ""),
+                data.get("categoria", ""),
+                data.get("responsable", ""),
+                data.get("estado", ""),
                 data.get("prioridad", ""),
-                data.get("estado", "Pendiente")
+                data.get("fecha_limite", ""),
+                data.get("observaciones", "")
             ])
             respuesta = (
                 "Tarea guardada!\n\n"
-                + str(data.get("tarea")) + "\n"
-                "Persona: " + str(data.get("persona") or "-") + "\n"
-                "Prioridad: " + str(data.get("prioridad")) + "\n"
-                "Estado: " + str(data.get("estado"))
+                + str(data.get("tarea", "")) + "\n"
+                "Cliente: " + str(data.get("cliente", "") or "-") + "\n"
+                "Categoria: " + str(data.get("categoria", "")) + "\n"
+                "Prioridad: " + str(data.get("prioridad", "")) + "\n"
+                "Fecha limite: " + str(data.get("fecha_limite", ""))
+            )
+
+        elif categoria == "recorrida":
+            data = extract_recorrida(text)
+            sh.worksheet("recorridas").append_row([
+                data.get("fecha", ""),
+                data.get("cliente", ""),
+                data.get("campo", ""),
+                data.get("zona", ""),
+                data.get("resumen", ""),
+                data.get("problemas", ""),
+                data.get("recomendaciones", ""),
+                data.get("urgencia", ""),
+                data.get("proxima_visita", ""),
+                data.get("observaciones", "")
+            ])
+            respuesta = (
+                "Recorrida guardada!\n\n"
+                "Cliente: " + str(data.get("cliente", "")) + "\n"
+                "Campo: " + str(data.get("campo", "") or "-") + "\n"
+                "Resumen: " + str(data.get("resumen", "")) + "\n"
+                "Urgencia: " + str(data.get("urgencia", "")) + "\n"
+                "Proxima visita: " + str(data.get("proxima_visita", ""))
+            )
+
+        elif categoria == "presupuesto":
+            data = extract_presupuesto(text)
+            sh.worksheet("presupuestos").append_row([
+                data.get("fecha", ""),
+                data.get("cliente", ""),
+                data.get("trabajo", ""),
+                data.get("descripcion", ""),
+                data.get("honorarios", ""),
+                data.get("viaticos", ""),
+                data.get("total", ""),
+                data.get("estado", ""),
+                data.get("fecha_envio", ""),
+                data.get("fecha_respuesta", ""),
+                data.get("observaciones", "")
+            ])
+            respuesta = (
+                "Presupuesto guardado!\n\n"
+                "Cliente: " + str(data.get("cliente", "")) + "\n"
+                "Trabajo: " + str(data.get("trabajo", "")) + "\n"
+                "Total: " + str(data.get("total", "")) + "\n"
+                "Estado: " + str(data.get("estado", "")) + "\n"
+                "Fecha envio: " + str(data.get("fecha_envio", ""))
             )
 
         elif categoria == "compra":
             data = extract_compra(text)
-            sh.worksheet("Hoja 4").append_row([
+            sh.worksheet("compras").append_row([
                 data.get("fecha", ""),
-                data.get("producto", ""),
+                data.get("cliente_obra", ""),
+                data.get("material", ""),
                 data.get("cantidad", ""),
-                data.get("estado", "Pendiente")
+                data.get("unidad", ""),
+                data.get("proveedor", ""),
+                data.get("precio_unitario", ""),
+                data.get("total", ""),
+                data.get("estado", ""),
+                data.get("observaciones", "")
             ])
             respuesta = (
                 "Compra guardada!\n\n"
-                + str(data.get("producto")) + "\n"
-                "Cantidad: " + str(data.get("cantidad") or "-") + "\n"
-                "Estado: " + str(data.get("estado"))
+                + str(data.get("material", "")) + "\n"
+                "Cantidad: " + str(data.get("cantidad", "") or "-") + " " + str(data.get("unidad", "") or "") + "\n"
+                "Obra: " + str(data.get("cliente_obra", "") or "-") + "\n"
+                "Estado: " + str(data.get("estado", ""))
             )
 
         elif categoria == "idea":
             data = extract_idea(text)
-            sh.worksheet("Hoja 5").append_row([
+            sh.worksheet("ideas").append_row([
                 data.get("fecha", ""),
+                data.get("tipo", ""),
                 data.get("idea", ""),
-                data.get("categoria", "")
+                data.get("cliente_tema", ""),
+                data.get("estado", ""),
+                data.get("observaciones", "")
             ])
             respuesta = (
                 "Idea guardada!\n\n"
-                + str(data.get("idea")) + "\n"
-                "Categoria: " + str(data.get("categoria"))
-            )
-
-        elif categoria == "cliente":
-            data = extract_cliente(text)
-            sh.worksheet("Hoja 6").append_row([
-                data.get("fecha", ""),
-                data.get("cliente", ""),
-                data.get("tema", ""),
-                data.get("prioridad", ""),
-                data.get("estado", "Pendiente")
-            ])
-            respuesta = (
-                "Cliente guardado!\n\n"
-                + str(data.get("cliente")) + "\n"
-                "Tema: " + str(data.get("tema")) + "\n"
-                "Prioridad: " + str(data.get("prioridad")) + "\n"
-                "Estado: " + str(data.get("estado"))
+                + str(data.get("idea", "")) + "\n"
+                "Tipo: " + str(data.get("tipo", "")) + "\n"
+                "Tema: " + str(data.get("cliente_tema", "") or "-")
             )
 
         else:
@@ -360,8 +632,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.VOICE, handle_message))
+
+    # Recordatorio diario a las 8am Argentina (UTC-3 = 11:00 UTC)
+    app.job_queue.run_daily(
+        enviar_recordatorios,
+        time=datetime.strptime("11:00", "%H:%M").time()
+    )
+
     logger.info("Bot iniciado!")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
