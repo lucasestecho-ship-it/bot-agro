@@ -73,7 +73,7 @@ def clasificar_mensaje(text):
 - receta: si habla de aplicación fitosanitaria, agroquímicos, pulverización, lotes, cultivos, productos como roundup, harrier, etc.
 - tarea: si es algo para hacer, llamar a alguien, resolver algo, pendiente
 - compra: si hay que comprar algo, un producto, material, insumo
-- idea: si es una idea, post, contenido, proyecto futuro
+- idea: si es una idea, post, contenido, proyecto futuro, algo que estaría bueno hacer, propuesta de redes sociales, tema para publicar, contenido para instagram, facebook, youtube u otras plataformas
 - cliente: si menciona un cliente, visita, reunión, trabajo para alguien
 
 Respondé ÚNICAMENTE con una de estas palabras: receta, tarea, compra, idea, cliente
@@ -171,4 +171,112 @@ Mensaje: {text}"""
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("`
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_cliente(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    prompt = f"""Extraé los datos de este mensaje de cliente y respondé SOLO con JSON puro:
+{{
+  "fecha": "{today}",
+  "cliente": "nombre del cliente o empresa",
+  "tema": "de qué se trata, qué quiere o necesita",
+  "prioridad": "Alta, Media o Baja según la urgencia. Si no se menciona, usá Media",
+  "estado": "Pendiente"
+}}
+Mensaje: {text}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def calcular_consumo(dosis, superficie):
+    try:
+        return round(float(str(dosis).replace(",", ".")) * float(str(superficie).replace(",", ".")), 2)
+    except:
+        return ""
+
+def save_to_sheet(worksheet, data, receta_num):
+    rows = []
+    for producto in data["productos"]:
+        superficie = data.get("superficie", "")
+        dosis = producto.get("dosis", "")
+        consumo = calcular_consumo(dosis, superficie)
+        row = [
+            data.get("fecha", ""),
+            data.get("campo", ""),
+            data.get("cultivo", ""),
+            data.get("lote", ""),
+            data.get("labor", "Pulverización"),
+            superficie,
+            producto.get("producto", ""),
+            dosis,
+            producto.get("unidad", ""),
+            producto.get("orden_carga", ""),
+            receta_num,
+            "",
+            consumo
+        ]
+        rows.append(row)
+    for row in rows:
+        worksheet.append_row(row)
+    return rows
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    chat_id = message.chat_id
+
+    try:
+        text = None
+
+        if message.voice:
+            await context.bot.send_message(chat_id=chat_id, text="🎙️ Transcribiendo audio...")
+            file = await context.bot.get_file(message.voice.file_id)
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                await file.download_to_drive(tmp.name)
+                text = transcribe_audio(tmp.name)
+                os.unlink(tmp.name)
+
+        elif message.text:
+            text = message.text
+
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="❌ Solo puedo procesar mensajes de texto o audio.")
+            return
+
+        await context.bot.send_message(chat_id=chat_id, text="🔄 Procesando...")
+
+        categoria = clasificar_mensaje(text)
+        sh = get_google_sheet()
+
+        if categoria == "receta":
+            data = extract_data_with_gpt(text)
+            data["campo"] = (data.get("campo") or "").lower()
+            data["lote"] = (data.get("lote") or "").lower()
+            data["cultivo"] = (data.get("cultivo") or "").lower()
+
+            superficie_desde_hoja2 = False
+            if not data.get("superficie") or data.get("superficie") == "null":
+                sup = get_superficie_from_hoja2(data.get("lote", ""))
+                if sup:
+                    data["superficie"] = sup
+                    superficie_desde_hoja2 = True
+
+            worksheet = sh.worksheet("Hoja 1")
+            receta_num = get_next_receta_number(worksheet)
+            rows = save_to_sheet(worksheet, data, receta_num)
+
+            productos_texto = "\n".join([
+                f"  • {r[6]}: {r[7]} {r[8]} | orden: {r[9]} | consumo: {r[12]}"
+                for r in rows
+            ])
+            sup_label = f"{data.get('superficie')} ha _(desde registro de lotes)_" if superficie_desde_hoja2 else f"{data.get('superficie')} ha"
+            respuesta = f"""✅ *Receta #{receta_num} guardada!*
+
+📅 Fecha: {data.get('fecha')}
+🌾 Campo: {data.get('campo')}
+🌱 Cultivo: {data.get('cultivo')}
+📍 Lote: {data.ge
