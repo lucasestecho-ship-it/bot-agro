@@ -20,7 +20,7 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-def get_sheet():
+def get_google_sheet():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -28,24 +28,16 @@ def get_sheet():
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(GOOGLE_SHEET_ID)
-    return sh.worksheet("Hoja 1")
+    return gc.open_by_key(GOOGLE_SHEET_ID)
+
+def get_sheet():
+    return get_google_sheet().worksheet("Hoja 1")
 
 def get_superficie_from_hoja2(lote):
     try:
-        creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
-        hoja2 = sh.worksheet("Hoja 2")
-
+        hoja2 = get_google_sheet().worksheet("Hoja 2")
         lotes = hoja2.col_values(1)
         superficies = hoja2.col_values(2)
-
         lote_normalizado = lote.strip().lower()
         for i, nombre in enumerate(lotes):
             if nombre.strip().lower() == lote_normalizado:
@@ -75,6 +67,24 @@ def transcribe_audio(file_path):
             file=audio_file
         )
     return transcript.text
+
+def clasificar_mensaje(text):
+    prompt = f"""Clasificá el siguiente mensaje en UNA de estas categorías:
+- receta: si habla de aplicación fitosanitaria, agroquímicos, pulverización, lotes, cultivos, productos como roundup, harrier, etc.
+- tarea: si es algo para hacer, llamar a alguien, resolver algo, pendiente
+- compra: si hay que comprar algo, un producto, material, insumo
+- idea: si es una idea, post, contenido, proyecto futuro
+- cliente: si menciona un cliente, visita, reunión, trabajo para alguien
+
+Respondé ÚNICAMENTE con una de estas palabras: receta, tarea, compra, idea, cliente
+
+Mensaje: {text}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content.strip().lower()
 
 def extract_data_with_gpt(text):
     today = datetime.now().strftime("%d/%m/%Y")
@@ -106,9 +116,81 @@ El mensaje es: {text}"""
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
-
     raw = response.choices[0].message.content
     raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_tarea(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    prompt = f"""Extraé los datos de esta tarea y respondé SOLO con JSON puro:
+{{
+  "fecha": "{today}",
+  "tarea": "descripción clara de la tarea",
+  "persona": "nombre de la persona involucrada si menciona, sino null",
+  "prioridad": "Alta, Media o Baja según la urgencia que transmite el mensaje. Si no se menciona, usá Media",
+  "estado": "Pendiente"
+}}
+Mensaje: {text}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_compra(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    prompt = f"""Extraé los datos de esta compra y respondé SOLO con JSON puro:
+{{
+  "fecha": "{today}",
+  "producto": "nombre del producto a comprar",
+  "cantidad": "cantidad si menciona, sino null",
+  "estado": "Pendiente"
+}}
+Mensaje: {text}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_idea(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    prompt = f"""Extraé los datos de esta idea y respondé SOLO con JSON puro:
+{{
+  "fecha": "{today}",
+  "idea": "descripción de la idea",
+  "categoria": "una categoría corta: post, proyecto, producto, proceso u otra"
+}}
+Mensaje: {text}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def extract_cliente(text):
+    today = datetime.now().strftime("%d/%m/%Y")
+    prompt = f"""Extraé los datos de este mensaje de cliente y respondé SOLO con JSON puro:
+{{
+  "fecha": "{today}",
+  "cliente": "nombre del cliente o empresa",
+  "tema": "de qué se trata, qué quiere o necesita",
+  "prioridad": "Alta, Media o Baja según la urgencia. Si no se menciona, usá Media",
+  "estado": "Pendiente"
+}}
+Mensaje: {text}"""
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def calcular_consumo(dosis, superficie):
@@ -123,7 +205,6 @@ def save_to_sheet(worksheet, data, receta_num):
         superficie = data.get("superficie", "")
         dosis = producto.get("dosis", "")
         consumo = calcular_consumo(dosis, superficie)
-
         row = [
             data.get("fecha", ""),
             data.get("campo", ""),
@@ -140,10 +221,8 @@ def save_to_sheet(worksheet, data, receta_num):
             consumo
         ]
         rows.append(row)
-
     for row in rows:
         worksheet.append_row(row)
-
     return rows
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,9 +234,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if message.voice:
             await context.bot.send_message(chat_id=chat_id, text="🎙️ Transcribiendo audio...")
-
             file = await context.bot.get_file(message.voice.file_id)
-
             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
                 await file.download_to_drive(tmp.name)
                 text = transcribe_audio(tmp.name)
@@ -170,32 +247,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=chat_id, text="❌ Solo puedo procesar mensajes de texto o audio.")
             return
 
-        await context.bot.send_message(chat_id=chat_id, text="🔄 Procesando datos...")
+        await context.bot.send_message(chat_id=chat_id, text="🔄 Procesando...")
 
-        data = extract_data_with_gpt(text)
+        categoria = clasificar_mensaje(text)
+        sh = get_google_sheet()
 
-        # Forzar minúsculas en Python, no depender de GPT
-        data["campo"] = data.get("campo", "").lower()
-        data["lote"] = data.get("lote", "").lower()
-        data["cultivo"] = data.get("cultivo", "").lower()
+        if categoria == "receta":
+            data = extract_data_with_gpt(text)
+            data["campo"] = data.get("campo", "").lower()
+            data["lote"] = data.get("lote", "").lower()
+            data["cultivo"] = data.get("cultivo", "").lower()
 
-        superficie_desde_hoja2 = False
-        if not data.get("superficie") or data.get("superficie") == "null":
-            sup = get_superficie_from_hoja2(data.get("lote", ""))
-            if sup:
-                data["superficie"] = sup
-                superficie_desde_hoja2 = True
+            superficie_desde_hoja2 = False
+            if not data.get("superficie") or data.get("superficie") == "null":
+                sup = get_superficie_from_hoja2(data.get("lote", ""))
+                if sup:
+                    data["superficie"] = sup
+                    superficie_desde_hoja2 = True
 
-        worksheet = get_sheet()
-        receta_num = get_next_receta_number(worksheet)
-        rows = save_to_sheet(worksheet, data, receta_num)
+            worksheet = sh.worksheet("Hoja 1")
+            receta_num = get_next_receta_number(worksheet)
+            rows = save_to_sheet(worksheet, data, receta_num)
 
-        productos_texto = "\n".join([
-            f"  • {r[6]}: {r[7]} {r[8]} | orden: {r[9]} | consumo: {r[12]}"
-            for r in rows
-        ])
-        sup_label = f"{data.get('superficie')} ha _(desde registro de lotes)_" if superficie_desde_hoja2 else f"{data.get('superficie')} ha"
-        respuesta = f"""✅ *Receta #{receta_num} guardada!*
+            productos_texto = "\n".join([
+                f"  • {r[6]}: {r[7]} {r[8]} | orden: {r[9]} | consumo: {r[12]}"
+                for r in rows
+            ])
+            sup_label = f"{data.get('superficie')} ha _(desde registro de lotes)_" if superficie_desde_hoja2 else f"{data.get('superficie')} ha"
+            respuesta = f"""✅ *Receta #{receta_num} guardada!*
 
 📅 Fecha: {data.get('fecha')}
 🌾 Campo: {data.get('campo')}
@@ -205,6 +284,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 🧪 Productos:
 {productos_texto}"""
+
+        elif categoria == "tarea":
+            data = extract_tarea(text)
+            sh.worksheet("Hoja 3").append_row([
+                data.get("fecha", ""),
+                data.get("tarea", ""),
+                data.get("persona", ""),
+                data.get("prioridad", ""),
+                data.get("estado", "Pendiente")
+            ])
+            respuesta = f"""✅ *Tarea guardada!*
+
+📋 {data.get('tarea')}
+👤 Persona: {data.get('persona') or '-'}
+🔥 Prioridad: {data.get('prioridad')}
+📌 Estado: {data.get('estado')}"""
+
+        elif categoria == "compra":
+            data = extract_compra(text)
+            sh.worksheet("Hoja 4").append_row([
+                data.get("fecha", ""),
+                data.get("producto", ""),
+                data.get("cantidad", ""),
+                data.get("estado", "Pendiente")
+            ])
+            respuesta = f"""🛒 *Compra guardada!*
+
+📦 {data.get('producto')}
+🔢 Cantidad: {data.get('cantidad') or '-'}
+📌 Estado: {data.get('estado')}"""
+
+        elif categoria == "idea":
+            data = extract_idea(text)
+            sh.worksheet("Hoja 5").append_row([
+                data.get("fecha", ""),
+                data.get("idea", ""),
+                data.get("categoria", "")
+            ])
+            respuesta = f"""💡 *Idea guardada!*
+
+📝 {data.get('idea')}
+🏷️ Categoría: {data.get('categoria')}"""
+
+        elif categoria == "cliente":
+            data = extract_cliente(text)
+            sh.worksheet("Hoja 6").append_row([
+                data.get("fecha", ""),
+                data.get("cliente", ""),
+                data.get("tema", ""),
+                data.get("prioridad", ""),
+                data.get("estado", "Pendiente")
+            ])
+            respuesta = f"""👤 *Cliente guardado!*
+
+🏢 {data.get('cliente')}
+📋 Tema: {data.get('tema')}
+🔥 Prioridad: {data.get('prioridad')}
+📌 Estado: {data.get('estado')}"""
+
+        else:
+            respuesta = "❓ No pude clasificar el mensaje. Intentá ser más específico."
 
         await context.bot.send_message(chat_id=chat_id, text=respuesta, parse_mode="Markdown")
 
