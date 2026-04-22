@@ -10,7 +10,8 @@ from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+import io
 from datetime import datetime, timedelta
 from pdf2image import convert_from_path
 
@@ -32,8 +33,7 @@ recorridas_activas = {}
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/documents"
+    "https://www.googleapis.com/auth/drive"
 ]
 
 def get_google_creds():
@@ -44,9 +44,6 @@ def get_google_sheet():
     creds = get_google_creds()
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
-
-def get_docs_service():
-    return build("docs", "v1", credentials=get_google_creds())
 
 def get_drive_service():
     return build("drive", "v3", credentials=get_google_creds())
@@ -501,68 +498,70 @@ def subir_foto_a_drive(foto_path, folder_id, nombre):
     return file.get("webViewLink")
 
 def crear_google_doc_recorrida(campo, fecha_str, resumen_data, items, folder_id):
-    """Crea un Google Doc en la carpeta indicada con el informe completo."""
-    docs = get_docs_service()
+    """Crea un Google Doc usando SOLO Drive API (sube texto y Drive lo convierte)."""
     drive = get_drive_service()
 
     titulo = f"Recorrida {campo} - {fecha_str}"
 
-    # Crear el doc (se crea en raiz de la cuenta de servicio)
-    doc = docs.documents().create(body={"title": titulo}).execute()
-    doc_id = doc["documentId"]
-
-    # Moverlo a la carpeta del usuario
-    drive.files().update(
-        fileId=doc_id,
-        addParents=folder_id,
-        removeParents="root",
-        fields="id, parents"
-    ).execute()
-
-    # Armar contenido
+    # Armar contenido del documento
     lineas = []
-    lineas.append(f"RECORRIDA DE CAMPO\n")
-    lineas.append(f"Campo: {campo}\n")
-    lineas.append(f"Fecha: {fecha_str}\n")
-    lineas.append(f"Urgencia: {resumen_data.get('urgencia', 'media')}\n\n")
-
-    lineas.append("RESUMEN\n")
-    lineas.append(f"{resumen_data.get('resumen', '')}\n\n")
+    lineas.append("RECORRIDA DE CAMPO")
+    lineas.append("")
+    lineas.append(f"Campo: {campo}")
+    lineas.append(f"Fecha: {fecha_str}")
+    lineas.append(f"Urgencia: {resumen_data.get('urgencia', 'media')}")
+    lineas.append("")
+    lineas.append("")
+    lineas.append("RESUMEN")
+    lineas.append("")
+    lineas.append(resumen_data.get("resumen", ""))
+    lineas.append("")
+    lineas.append("")
 
     problemas = resumen_data.get("problemas", [])
-    lineas.append("PROBLEMAS DETECTADOS\n")
+    lineas.append("PROBLEMAS DETECTADOS")
+    lineas.append("")
     if problemas:
         for p in problemas:
-            lineas.append(f"- {p}\n")
+            lineas.append(f"- {p}")
     else:
-        lineas.append("- Sin problemas destacados\n")
-    lineas.append("\n")
+        lineas.append("- Sin problemas destacados")
+    lineas.append("")
+    lineas.append("")
 
     recomendaciones = resumen_data.get("recomendaciones", [])
-    lineas.append("RECOMENDACIONES\n")
+    lineas.append("RECOMENDACIONES")
+    lineas.append("")
     if recomendaciones:
         for r in recomendaciones:
-            lineas.append(f"- {r}\n")
+            lineas.append(f"- {r}")
     else:
-        lineas.append("- Sin recomendaciones\n")
-    lineas.append("\n")
+        lineas.append("- Sin recomendaciones")
+    lineas.append("")
+    lineas.append("")
 
     # Notas y audios originales
-    lineas.append("NOTAS Y AUDIOS\n")
+    lineas.append("NOTAS Y AUDIOS")
+    lineas.append("")
     hay_notas = False
     for i, item in enumerate(items, 1):
         if item["tipo"] == "texto":
-            lineas.append(f"[Nota {i}] {item['texto']}\n\n")
+            lineas.append(f"[Nota {i}] {item['texto']}")
+            lineas.append("")
             hay_notas = True
         elif item["tipo"] == "audio":
-            lineas.append(f"[Audio {i}] {item['texto']}\n\n")
+            lineas.append(f"[Audio {i}] {item['texto']}")
+            lineas.append("")
             hay_notas = True
     if not hay_notas:
-        lineas.append("(Sin notas de texto ni audios)\n\n")
+        lineas.append("(Sin notas de texto ni audios)")
+        lineas.append("")
+    lineas.append("")
 
-    # Fotos: subimos a Drive y ponemos links
+    # Fotos: subimos a Drive primero y ponemos los links
     fotos = [it for it in items if it["tipo"] == "foto"]
-    lineas.append("FOTOS\n")
+    lineas.append("FOTOS")
+    lineas.append("")
     if fotos:
         for i, foto in enumerate(fotos, 1):
             link = ""
@@ -571,27 +570,35 @@ def crear_google_doc_recorrida(campo, fecha_str, resumen_data, items, folder_id)
                 link = subir_foto_a_drive(foto["foto_path"], folder_id, nombre_foto)
             except Exception as e:
                 logger.error(f"Error subiendo foto: {e}")
-            lineas.append(f"Foto {i}: {foto.get('texto', '')}\n")
+            lineas.append(f"Foto {i}: {foto.get('texto', '')}")
             if link:
-                lineas.append(f"Ver foto: {link}\n")
-            lineas.append("\n")
+                lineas.append(f"Ver foto: {link}")
+            lineas.append("")
     else:
-        lineas.append("(Sin fotos)\n")
+        lineas.append("(Sin fotos)")
 
-    texto_completo = "".join(lineas)
+    texto_completo = "\n".join(lineas)
 
-    # Insertar todo el texto en el doc
-    docs.documents().batchUpdate(
-        documentId=doc_id,
-        body={
-            "requests": [
-                {"insertText": {"location": {"index": 1}, "text": texto_completo}}
-            ]
-        }
+    # Crear Google Doc subiendo texto plano que Drive convierte automaticamente
+    file_metadata = {
+        "name": titulo,
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [folder_id]
+    }
+    media = MediaIoBaseUpload(
+        io.BytesIO(texto_completo.encode("utf-8")),
+        mimetype="text/plain",
+        resumable=False
+    )
+    file = drive.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink"
     ).execute()
 
-    # Link publico del doc (solo lectura para quien tenga link - opcional)
-    # Si preferis NO hacerlo publico, comenta este bloque.
+    doc_id = file["id"]
+
+    # Opcional: hacer el doc accesible por link
     try:
         drive.permissions().create(
             fileId=doc_id,
@@ -600,7 +607,7 @@ def crear_google_doc_recorrida(campo, fecha_str, resumen_data, items, folder_id)
     except Exception as e:
         logger.warning(f"No se pudo hacer publico el doc: {e}")
 
-    return f"https://docs.google.com/document/d/{doc_id}/edit"
+    return file.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}/edit"
 
 # ============================================================
 # Recordatorios
