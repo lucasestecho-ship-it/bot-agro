@@ -5,10 +5,12 @@ import tempfile
 import base64
 import requests
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from datetime import datetime, timedelta
 from pdf2image import convert_from_path
 
@@ -19,19 +21,35 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
 MY_CHAT_ID = 1144480769
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-def get_google_sheet():
+# Estado en memoria de recorridas activas por chat_id
+# { chat_id: {"campo": str, "inicio": datetime, "items": [ {tipo, texto, foto_path} ]} }
+recorridas_activas = {}
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents"
+]
+
+def get_google_creds():
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+
+def get_google_sheet():
+    creds = get_google_creds()
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
+
+def get_docs_service():
+    return build("docs", "v1", credentials=get_google_creds())
+
+def get_drive_service():
+    return build("drive", "v3", credentials=get_google_creds())
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -104,6 +122,36 @@ def transcribe_image_base64(image_base64):
 def transcribe_image(image_path):
     image_base64 = image_to_base64(image_path)
     return transcribe_image_base64(image_base64)
+
+def describir_imagen_recorrida(image_path):
+    """Describe una foto de campo en contexto de recorrida tecnica."""
+    image_base64 = image_to_base64(image_path)
+    response = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Sos un asesor agronomo. Describi brevemente (2-4 oraciones) lo que ves en esta foto "
+                            "tomada durante una recorrida de campo: cultivo, estado fenologico, malezas, plagas, "
+                            "enfermedades, suelo, infraestructura o lo que sea relevante. Se conciso y tecnico."
+                        )
+                    }
+                ]
+            }
+        ],
+        max_tokens=400
+    )
+    return response.choices[0].message.content.strip()
 
 def transcribe_pdf(pdf_path):
     pages = convert_from_path(pdf_path, dpi=150)
@@ -400,6 +448,164 @@ def save_receta(worksheet, data, receta_num):
         worksheet.append_row(row)
     return rows
 
+# ============================================================
+# RECORRIDAS: resumen con GPT y generacion de Google Doc
+# ============================================================
+
+def generar_resumen_recorrida(campo, items):
+    """Usa GPT para generar resumen, problemas y recomendaciones."""
+    bloques = []
+    for i, item in enumerate(items, 1):
+        if item["tipo"] == "texto":
+            bloques.append(f"[Nota {i}] {item['texto']}")
+        elif item["tipo"] == "audio":
+            bloques.append(f"[Audio {i} transcripto] {item['texto']}")
+        elif item["tipo"] == "foto":
+            bloques.append(f"[Foto {i}] {item['texto']}")
+    contenido = "\n\n".join(bloques)
+
+    prompt = (
+        "Sos un asesor agronomo. Con las siguientes notas, audios y descripciones de fotos "
+        f"tomadas durante una recorrida en el campo '{campo}', generá un informe tecnico claro. "
+        "Responde SOLO JSON puro:\n"
+        "{\n"
+        '  "resumen": "parrafo narrativo con lo observado en la recorrida",\n'
+        '  "problemas": ["lista", "de problemas", "detectados"],\n'
+        '  "recomendaciones": ["lista", "de recomendaciones", "accionables"],\n'
+        '  "urgencia": "alta, media o baja"\n'
+        "}\n\n"
+        f"Notas:\n{contenido}"
+    )
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+def subir_foto_a_drive(foto_path, folder_id, nombre):
+    """Sube una foto a Drive y devuelve el link publico."""
+    drive = get_drive_service()
+    file_metadata = {"name": nombre, "parents": [folder_id]}
+    media = MediaFileUpload(foto_path, mimetype="image/jpeg")
+    file = drive.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, webViewLink"
+    ).execute()
+    # Hacer el archivo accesible para cualquiera con el link
+    drive.permissions().create(
+        fileId=file["id"],
+        body={"type": "anyone", "role": "reader"}
+    ).execute()
+    return file.get("webViewLink")
+
+def crear_google_doc_recorrida(campo, fecha_str, resumen_data, items, folder_id):
+    """Crea un Google Doc en la carpeta indicada con el informe completo."""
+    docs = get_docs_service()
+    drive = get_drive_service()
+
+    titulo = f"Recorrida {campo} - {fecha_str}"
+
+    # Crear el doc (se crea en raiz de la cuenta de servicio)
+    doc = docs.documents().create(body={"title": titulo}).execute()
+    doc_id = doc["documentId"]
+
+    # Moverlo a la carpeta del usuario
+    drive.files().update(
+        fileId=doc_id,
+        addParents=folder_id,
+        removeParents="root",
+        fields="id, parents"
+    ).execute()
+
+    # Armar contenido
+    lineas = []
+    lineas.append(f"RECORRIDA DE CAMPO\n")
+    lineas.append(f"Campo: {campo}\n")
+    lineas.append(f"Fecha: {fecha_str}\n")
+    lineas.append(f"Urgencia: {resumen_data.get('urgencia', 'media')}\n\n")
+
+    lineas.append("RESUMEN\n")
+    lineas.append(f"{resumen_data.get('resumen', '')}\n\n")
+
+    problemas = resumen_data.get("problemas", [])
+    lineas.append("PROBLEMAS DETECTADOS\n")
+    if problemas:
+        for p in problemas:
+            lineas.append(f"- {p}\n")
+    else:
+        lineas.append("- Sin problemas destacados\n")
+    lineas.append("\n")
+
+    recomendaciones = resumen_data.get("recomendaciones", [])
+    lineas.append("RECOMENDACIONES\n")
+    if recomendaciones:
+        for r in recomendaciones:
+            lineas.append(f"- {r}\n")
+    else:
+        lineas.append("- Sin recomendaciones\n")
+    lineas.append("\n")
+
+    # Notas y audios originales
+    lineas.append("NOTAS Y AUDIOS\n")
+    hay_notas = False
+    for i, item in enumerate(items, 1):
+        if item["tipo"] == "texto":
+            lineas.append(f"[Nota {i}] {item['texto']}\n\n")
+            hay_notas = True
+        elif item["tipo"] == "audio":
+            lineas.append(f"[Audio {i}] {item['texto']}\n\n")
+            hay_notas = True
+    if not hay_notas:
+        lineas.append("(Sin notas de texto ni audios)\n\n")
+
+    # Fotos: subimos a Drive y ponemos links
+    fotos = [it for it in items if it["tipo"] == "foto"]
+    lineas.append("FOTOS\n")
+    if fotos:
+        for i, foto in enumerate(fotos, 1):
+            link = ""
+            try:
+                nombre_foto = f"{campo}_{fecha_str.replace('/', '-')}_foto{i}.jpg"
+                link = subir_foto_a_drive(foto["foto_path"], folder_id, nombre_foto)
+            except Exception as e:
+                logger.error(f"Error subiendo foto: {e}")
+            lineas.append(f"Foto {i}: {foto.get('texto', '')}\n")
+            if link:
+                lineas.append(f"Ver foto: {link}\n")
+            lineas.append("\n")
+    else:
+        lineas.append("(Sin fotos)\n")
+
+    texto_completo = "".join(lineas)
+
+    # Insertar todo el texto en el doc
+    docs.documents().batchUpdate(
+        documentId=doc_id,
+        body={
+            "requests": [
+                {"insertText": {"location": {"index": 1}, "text": texto_completo}}
+            ]
+        }
+    ).execute()
+
+    # Link publico del doc (solo lectura para quien tenga link - opcional)
+    # Si preferis NO hacerlo publico, comenta este bloque.
+    try:
+        drive.permissions().create(
+            fileId=doc_id,
+            body={"type": "anyone", "role": "reader"}
+        ).execute()
+    except Exception as e:
+        logger.warning(f"No se pudo hacer publico el doc: {e}")
+
+    return f"https://docs.google.com/document/d/{doc_id}/edit"
+
+# ============================================================
+# Recordatorios
+# ============================================================
+
 async def enviar_recordatorios(context):
     try:
         today = datetime.now().date()
@@ -439,10 +645,184 @@ async def enviar_recordatorios(context):
     except Exception as e:
         logger.error(f"Error en recordatorios: {e}")
 
+# ============================================================
+# Comandos de recorrida
+# ============================================================
+
+async def cmd_recorrida_inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    args = context.args
+    if not args:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Usa: /recorrida_inicio <nombre del campo>\nEjemplo: /recorrida_inicio La Esperanza"
+        )
+        return
+    campo = " ".join(args).strip()
+    recorridas_activas[chat_id] = {
+        "campo": campo,
+        "inicio": datetime.now(),
+        "items": []
+    }
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"Recorrida iniciada en: {campo}\n\n"
+            "Mandame notas, audios o fotos durante la recorrida. "
+            "Cuando termines enviá /cerrar_recorrida y te armo el Google Doc."
+        )
+    )
+
+async def cmd_recorrida_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id in recorridas_activas:
+        del recorridas_activas[chat_id]
+        await context.bot.send_message(chat_id=chat_id, text="Recorrida cancelada. No se guardo nada.")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="No hay recorrida activa.")
+
+async def cmd_cerrar_recorrida(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id not in recorridas_activas:
+        await context.bot.send_message(chat_id=chat_id, text="No hay recorrida activa. Iniciá una con /recorrida_inicio <campo>")
+        return
+
+    sesion = recorridas_activas[chat_id]
+    campo = sesion["campo"]
+    items = sesion["items"]
+
+    if not items:
+        await context.bot.send_message(chat_id=chat_id, text="No hay items cargados en la recorrida. Cancelada.")
+        del recorridas_activas[chat_id]
+        return
+
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Falta configurar GOOGLE_DRIVE_FOLDER_ID en las variables de entorno."
+        )
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text="Generando informe y Google Doc...")
+
+    try:
+        fecha_str = sesion["inicio"].strftime("%d/%m/%Y")
+        resumen_data = generar_resumen_recorrida(campo, items)
+        doc_link = crear_google_doc_recorrida(campo, fecha_str, resumen_data, items, GOOGLE_DRIVE_FOLDER_ID)
+
+        # Guardar fila resumen en la hoja 'recorridas'
+        try:
+            sh = get_google_sheet()
+            sh.worksheet("recorridas").append_row([
+                fecha_str,
+                "",  # cliente (no lo pedimos al iniciar; se puede deducir si queres)
+                campo,
+                "",  # zona
+                resumen_data.get("resumen", ""),
+                " | ".join(resumen_data.get("problemas", []) or []),
+                " | ".join(resumen_data.get("recomendaciones", []) or []),
+                resumen_data.get("urgencia", ""),
+                "",  # proxima visita
+                doc_link
+            ])
+        except Exception as e:
+            logger.error(f"No se pudo guardar en hoja recorridas: {e}")
+
+        # Limpiar archivos temporales de fotos
+        for it in items:
+            if it["tipo"] == "foto" and it.get("foto_path") and os.path.exists(it["foto_path"]):
+                try:
+                    os.unlink(it["foto_path"])
+                except:
+                    pass
+
+        del recorridas_activas[chat_id]
+
+        problemas_txt = "\n".join([f"- {p}" for p in resumen_data.get("problemas", [])]) or "- Ninguno"
+        recos_txt = "\n".join([f"- {r}" for r in resumen_data.get("recomendaciones", [])]) or "- Ninguna"
+
+        respuesta = (
+            f"Recorrida cerrada!\n\n"
+            f"Campo: {campo}\n"
+            f"Fecha: {fecha_str}\n"
+            f"Items: {len(items)}\n"
+            f"Urgencia: {resumen_data.get('urgencia', 'media')}\n\n"
+            f"Problemas:\n{problemas_txt}\n\n"
+            f"Recomendaciones:\n{recos_txt}\n\n"
+            f"Doc: {doc_link}"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=respuesta)
+
+    except Exception as e:
+        logger.error(f"Error cerrando recorrida: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"Error al cerrar recorrida: {e}")
+
+# ============================================================
+# Handler principal
+# ============================================================
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     chat_id = message.chat_id
 
+    # Si hay recorrida activa para este chat -> acumular en vez de procesar normal
+    if chat_id in recorridas_activas:
+        try:
+            sesion = recorridas_activas[chat_id]
+
+            if message.voice:
+                await context.bot.send_message(chat_id=chat_id, text="Transcribiendo audio de recorrida...")
+                file = await context.bot.get_file(message.voice.file_id)
+                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                    await file.download_to_drive(tmp.name)
+                    texto = transcribe_audio(tmp.name)
+                    os.unlink(tmp.name)
+                sesion["items"].append({"tipo": "audio", "texto": texto})
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Audio agregado ({len(sesion['items'])} items). Seguí mandando o /cerrar_recorrida"
+                )
+                return
+
+            if message.photo:
+                await context.bot.send_message(chat_id=chat_id, text="Analizando foto de recorrida...")
+                photo = message.photo[-1]
+                file = await context.bot.get_file(photo.file_id)
+                # Guardamos la foto en disco para subirla a Drive despues
+                tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+                tmp.close()
+                await file.download_to_drive(tmp.name)
+                descripcion = describir_imagen_recorrida(tmp.name)
+                caption = message.caption or ""
+                texto_final = descripcion if not caption else f"{caption}. {descripcion}"
+                sesion["items"].append({"tipo": "foto", "texto": texto_final, "foto_path": tmp.name})
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Foto agregada ({len(sesion['items'])} items). Seguí mandando o /cerrar_recorrida"
+                )
+                return
+
+            if message.text:
+                sesion["items"].append({"tipo": "texto", "texto": message.text})
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"Nota agregada ({len(sesion['items'])} items). Seguí mandando o /cerrar_recorrida"
+                )
+                return
+
+            # Otros tipos: no los acumulamos en recorrida
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="En modo recorrida solo acepto texto, audio o fotos. Usa /cerrar_recorrida para terminar."
+            )
+            return
+
+        except Exception as e:
+            logger.error(f"Error en modo recorrida: {e}")
+            await context.bot.send_message(chat_id=chat_id, text=f"Error: {e}")
+            return
+
+    # --- Modo normal (sin recorrida activa) ---
     try:
         text = None
         es_archivo = False
@@ -496,7 +876,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(chat_id=chat_id, text="Procesando...")
 
-        # Si tiene caption, combinarlo con el texto extraido
         if es_archivo and message.caption:
             text = message.caption + "\n\n" + text
 
@@ -643,6 +1022,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Resumen: " + str(data.get("resumen", "")) + "\n"
                 "Urgencia: " + str(data.get("urgencia", "")) + "\n"
                 "Proxima visita: " + str(data.get("proxima_visita", ""))
+                + "\n\nTip: para recorridas con muchas notas/fotos usa /recorrida_inicio <campo>"
             )
 
         elif categoria == "presupuesto":
@@ -719,6 +1099,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Comandos de recorrida
+    app.add_handler(CommandHandler("recorrida_inicio", cmd_recorrida_inicio))
+    app.add_handler(CommandHandler("cerrar_recorrida", cmd_cerrar_recorrida))
+    app.add_handler(CommandHandler("recorrida_cancelar", cmd_recorrida_cancelar))
+
+    # Handler general
     app.add_handler(MessageHandler(
         filters.TEXT | filters.VOICE | filters.PHOTO | filters.Document.ALL,
         handle_message
