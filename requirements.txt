@@ -4,3 +4,4 @@ gspread
 google-auth
 pdf2image
 google-api-python-client
+python-docx
