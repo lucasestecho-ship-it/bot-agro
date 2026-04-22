@@ -9,11 +9,11 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
-import io
 from datetime import datetime, timedelta
 from pdf2image import convert_from_path
+from docx import Document as DocxDocument
+from docx.shared import Inches, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,7 +22,6 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
 MY_CHAT_ID = 1144480769
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -44,9 +43,6 @@ def get_google_sheet():
     creds = get_google_creds()
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
-
-def get_drive_service():
-    return build("drive", "v3", credentials=get_google_creds())
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -480,134 +476,104 @@ def generar_resumen_recorrida(campo, items):
     raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
-def subir_foto_a_drive(foto_path, folder_id, nombre):
-    """Sube una foto a Drive y devuelve el link publico."""
-    drive = get_drive_service()
-    file_metadata = {"name": nombre, "parents": [folder_id]}
-    media = MediaFileUpload(foto_path, mimetype="image/jpeg")
-    file = drive.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink"
-    ).execute()
-    # Hacer el archivo accesible para cualquiera con el link
-    drive.permissions().create(
-        fileId=file["id"],
-        body={"type": "anyone", "role": "reader"}
-    ).execute()
-    return file.get("webViewLink")
+def crear_docx_recorrida(campo, fecha_str, resumen_data, items, output_path):
+    """Crea un archivo .docx con el informe completo y fotos embebidas."""
+    doc = DocxDocument()
 
-def crear_google_doc_recorrida(campo, fecha_str, resumen_data, items, folder_id):
-    """Crea un Google Doc usando SOLO Drive API (sube texto y Drive lo convierte)."""
-    drive = get_drive_service()
+    # Titulo principal
+    h = doc.add_heading("RECORRIDA DE CAMPO", level=0)
+    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    titulo = f"Recorrida {campo} - {fecha_str}"
+    # Datos generales
+    p = doc.add_paragraph()
+    p.add_run("Campo: ").bold = True
+    p.add_run(campo)
 
-    # Armar contenido del documento
-    lineas = []
-    lineas.append("RECORRIDA DE CAMPO")
-    lineas.append("")
-    lineas.append(f"Campo: {campo}")
-    lineas.append(f"Fecha: {fecha_str}")
-    lineas.append(f"Urgencia: {resumen_data.get('urgencia', 'media')}")
-    lineas.append("")
-    lineas.append("")
-    lineas.append("RESUMEN")
-    lineas.append("")
-    lineas.append(resumen_data.get("resumen", ""))
-    lineas.append("")
-    lineas.append("")
+    p = doc.add_paragraph()
+    p.add_run("Fecha: ").bold = True
+    p.add_run(fecha_str)
 
-    problemas = resumen_data.get("problemas", [])
-    lineas.append("PROBLEMAS DETECTADOS")
-    lineas.append("")
+    p = doc.add_paragraph()
+    p.add_run("Urgencia: ").bold = True
+    p.add_run(str(resumen_data.get("urgencia", "media")).upper())
+
+    doc.add_paragraph()  # espacio
+
+    # Resumen
+    doc.add_heading("RESUMEN", level=1)
+    doc.add_paragraph(resumen_data.get("resumen", ""))
+
+    # Problemas
+    doc.add_heading("PROBLEMAS DETECTADOS", level=1)
+    problemas = resumen_data.get("problemas", []) or []
     if problemas:
-        for p in problemas:
-            lineas.append(f"- {p}")
+        for p_item in problemas:
+            doc.add_paragraph(str(p_item), style="List Bullet")
     else:
-        lineas.append("- Sin problemas destacados")
-    lineas.append("")
-    lineas.append("")
+        doc.add_paragraph("Sin problemas destacados", style="List Bullet")
 
-    recomendaciones = resumen_data.get("recomendaciones", [])
-    lineas.append("RECOMENDACIONES")
-    lineas.append("")
-    if recomendaciones:
-        for r in recomendaciones:
-            lineas.append(f"- {r}")
+    # Recomendaciones
+    doc.add_heading("RECOMENDACIONES", level=1)
+    recos = resumen_data.get("recomendaciones", []) or []
+    if recos:
+        for r in recos:
+            doc.add_paragraph(str(r), style="List Bullet")
     else:
-        lineas.append("- Sin recomendaciones")
-    lineas.append("")
-    lineas.append("")
+        doc.add_paragraph("Sin recomendaciones", style="List Bullet")
 
-    # Notas y audios originales
-    lineas.append("NOTAS Y AUDIOS")
-    lineas.append("")
+    # Notas y audios
+    doc.add_heading("NOTAS Y AUDIOS", level=1)
     hay_notas = False
     for i, item in enumerate(items, 1):
         if item["tipo"] == "texto":
-            lineas.append(f"[Nota {i}] {item['texto']}")
-            lineas.append("")
+            p = doc.add_paragraph()
+            p.add_run(f"Nota {i}: ").bold = True
+            p.add_run(item["texto"])
             hay_notas = True
         elif item["tipo"] == "audio":
-            lineas.append(f"[Audio {i}] {item['texto']}")
-            lineas.append("")
+            p = doc.add_paragraph()
+            p.add_run(f"Audio {i}: ").bold = True
+            p.add_run(item["texto"])
             hay_notas = True
     if not hay_notas:
-        lineas.append("(Sin notas de texto ni audios)")
-        lineas.append("")
-    lineas.append("")
+        doc.add_paragraph("(Sin notas ni audios)")
 
-    # Fotos: subimos a Drive primero y ponemos los links
+    # Fotos con descripcion
     fotos = [it for it in items if it["tipo"] == "foto"]
-    lineas.append("FOTOS")
-    lineas.append("")
+    doc.add_heading("FOTOS", level=1)
     if fotos:
         for i, foto in enumerate(fotos, 1):
-            link = ""
+            p = doc.add_paragraph()
+            p.add_run(f"Foto {i}: ").bold = True
+            p.add_run(foto.get("texto", ""))
             try:
-                nombre_foto = f"{campo}_{fecha_str.replace('/', '-')}_foto{i}.jpg"
-                link = subir_foto_a_drive(foto["foto_path"], folder_id, nombre_foto)
+                if foto.get("foto_path") and os.path.exists(foto["foto_path"]):
+                    doc.add_picture(foto["foto_path"], width=Inches(5.0))
             except Exception as e:
-                logger.error(f"Error subiendo foto: {e}")
-            lineas.append(f"Foto {i}: {foto.get('texto', '')}")
-            if link:
-                lineas.append(f"Ver foto: {link}")
-            lineas.append("")
+                logger.warning(f"No se pudo insertar foto {i}: {e}")
+            doc.add_paragraph()  # espacio entre fotos
     else:
-        lineas.append("(Sin fotos)")
+        doc.add_paragraph("(Sin fotos)")
 
-    texto_completo = "\n".join(lineas)
+    # Firma al pie del documento
+    doc.add_paragraph()
+    doc.add_paragraph()
+    firma1 = doc.add_paragraph()
+    firma1.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run1 = firma1.add_run("Informe preparado por")
+    run1.italic = True
 
-    # Crear Google Doc subiendo texto plano que Drive convierte automaticamente
-    file_metadata = {
-        "name": titulo,
-        "mimeType": "application/vnd.google-apps.document",
-        "parents": [folder_id]
-    }
-    media = MediaIoBaseUpload(
-        io.BytesIO(texto_completo.encode("utf-8")),
-        mimetype="text/plain",
-        resumable=False
-    )
-    file = drive.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id, webViewLink"
-    ).execute()
+    firma2 = doc.add_paragraph()
+    firma2.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run2 = firma2.add_run("Ing. Agr. Lucas Estecho")
+    run2.bold = True
 
-    doc_id = file["id"]
+    firma3 = doc.add_paragraph()
+    firma3.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    firma3.add_run("M.P. 2009")
 
-    # Opcional: hacer el doc accesible por link
-    try:
-        drive.permissions().create(
-            fileId=doc_id,
-            body={"type": "anyone", "role": "reader"}
-        ).execute()
-    except Exception as e:
-        logger.warning(f"No se pudo hacer publico el doc: {e}")
-
-    return file.get("webViewLink") or f"https://docs.google.com/document/d/{doc_id}/edit"
+    doc.save(output_path)
+    return output_path
 
 # ============================================================
 # Recordatorios
@@ -703,26 +669,27 @@ async def cmd_cerrar_recorrida(update: Update, context: ContextTypes.DEFAULT_TYP
         del recorridas_activas[chat_id]
         return
 
-    if not GOOGLE_DRIVE_FOLDER_ID:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Falta configurar GOOGLE_DRIVE_FOLDER_ID en las variables de entorno."
-        )
-        return
+    await context.bot.send_message(chat_id=chat_id, text="Generando informe...")
 
-    await context.bot.send_message(chat_id=chat_id, text="Generando informe y Google Doc...")
-
+    docx_path = None
     try:
         fecha_str = sesion["inicio"].strftime("%d/%m/%Y")
+        fecha_archivo = sesion["inicio"].strftime("%Y-%m-%d")
         resumen_data = generar_resumen_recorrida(campo, items)
-        doc_link = crear_google_doc_recorrida(campo, fecha_str, resumen_data, items, GOOGLE_DRIVE_FOLDER_ID)
+
+        # Crear el .docx en un archivo temporal
+        campo_safe = "".join(c if c.isalnum() or c in " _-" else "_" for c in campo).strip().replace(" ", "_")
+        nombre_archivo = f"Recorrida_{campo_safe}_{fecha_archivo}.docx"
+        tmp_dir = tempfile.gettempdir()
+        docx_path = os.path.join(tmp_dir, nombre_archivo)
+        crear_docx_recorrida(campo, fecha_str, resumen_data, items, docx_path)
 
         # Guardar fila resumen en la hoja 'recorridas'
         try:
             sh = get_google_sheet()
             sh.worksheet("recorridas").append_row([
                 fecha_str,
-                "",  # cliente (no lo pedimos al iniciar; se puede deducir si queres)
+                "",  # cliente
                 campo,
                 "",  # zona
                 resumen_data.get("resumen", ""),
@@ -730,39 +697,60 @@ async def cmd_cerrar_recorrida(update: Update, context: ContextTypes.DEFAULT_TYP
                 " | ".join(resumen_data.get("recomendaciones", []) or []),
                 resumen_data.get("urgencia", ""),
                 "",  # proxima visita
-                doc_link
+                nombre_archivo  # referencia al archivo generado
             ])
         except Exception as e:
             logger.error(f"No se pudo guardar en hoja recorridas: {e}")
 
-        # Limpiar archivos temporales de fotos
+        # Enviar el archivo docx por Telegram
+        with open(docx_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=nombre_archivo,
+                caption=f"Informe de recorrida: {campo} - {fecha_str}"
+            )
+
+        # Enviar el resumen formateado como mensaje
+        problemas_txt = "\n".join([f"• {p}" for p in resumen_data.get("problemas", [])]) or "• Ninguno"
+        recos_txt = "\n".join([f"• {r}" for r in resumen_data.get("recomendaciones", [])]) or "• Ninguna"
+
+        respuesta = (
+            f"✅ Recorrida cerrada!\n\n"
+            f"📍 Campo: {campo}\n"
+            f"📅 Fecha: {fecha_str}\n"
+            f"📝 Items: {len(items)}\n"
+            f"⚠️ Urgencia: {str(resumen_data.get('urgencia', 'media')).upper()}\n\n"
+            f"📋 RESUMEN\n{resumen_data.get('resumen', '')}\n\n"
+            f"❗ PROBLEMAS\n{problemas_txt}\n\n"
+            f"💡 RECOMENDACIONES\n{recos_txt}"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=respuesta)
+
+        # Limpiar archivos temporales (fotos + docx)
         for it in items:
             if it["tipo"] == "foto" and it.get("foto_path") and os.path.exists(it["foto_path"]):
                 try:
                     os.unlink(it["foto_path"])
                 except:
                     pass
+        if docx_path and os.path.exists(docx_path):
+            try:
+                os.unlink(docx_path)
+            except:
+                pass
 
         del recorridas_activas[chat_id]
-
-        problemas_txt = "\n".join([f"- {p}" for p in resumen_data.get("problemas", [])]) or "- Ninguno"
-        recos_txt = "\n".join([f"- {r}" for r in resumen_data.get("recomendaciones", [])]) or "- Ninguna"
-
-        respuesta = (
-            f"Recorrida cerrada!\n\n"
-            f"Campo: {campo}\n"
-            f"Fecha: {fecha_str}\n"
-            f"Items: {len(items)}\n"
-            f"Urgencia: {resumen_data.get('urgencia', 'media')}\n\n"
-            f"Problemas:\n{problemas_txt}\n\n"
-            f"Recomendaciones:\n{recos_txt}\n\n"
-            f"Doc: {doc_link}"
-        )
-        await context.bot.send_message(chat_id=chat_id, text=respuesta)
 
     except Exception as e:
         logger.error(f"Error cerrando recorrida: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"Error al cerrar recorrida: {e}")
+        # Limpiar el docx si quedo creado
+        if docx_path and os.path.exists(docx_path):
+            try:
+                os.unlink(docx_path)
+            except:
+                pass
 
 # ============================================================
 # Handler principal
