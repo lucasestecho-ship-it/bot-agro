@@ -5,10 +5,12 @@ const sectorInput = document.getElementById("sectorInput");
 const talkButton = document.getElementById("talkButton");
 const photoInput = document.getElementById("photoInput");
 const itemsList = document.getElementById("itemsList");
+const serverItemsList = document.getElementById("serverItemsList");
 const connectionStatus = document.getElementById("connectionStatus");
 const gpsStatus = document.getElementById("gpsStatus");
 const gpsButton = document.getElementById("gpsButton");
 const syncButton = document.getElementById("syncButton");
+const refreshServerButton = document.getElementById("refreshServerButton");
 
 let dbPromise;
 let recorder;
@@ -150,6 +152,53 @@ async function renderItems() {
   }
 }
 
+function formatServerDate(value) {
+  if (!value) return "sin fecha";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+async function renderServerItems() {
+  if (!serverItemsList) return;
+
+  serverItemsList.innerHTML = "";
+  try {
+    const response = await fetch("/api/field-items");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const items = data.items || [];
+
+    if (!items.length) {
+      const empty = document.createElement("li");
+      empty.textContent = "Sin items subidos en el servidor.";
+      serverItemsList.appendChild(empty);
+      return;
+    }
+
+    for (const item of items) {
+      const li = document.createElement("li");
+      const gps = item.latitud && item.longitud
+        ? `${Number(item.latitud).toFixed(5)}, ${Number(item.longitud).toFixed(5)}`
+        : "sin GPS";
+      const accuracy = item.precision_gps ? ` - precision ${Math.round(Number(item.precision_gps))} m` : "";
+      li.innerHTML = `
+        <div class="item-main">
+          <span>${item.tipo === "audio" ? "Audio" : "Foto"} - ${item.campo || "sin campo"}</span>
+          <span class="pill subido">${item.estado || "subido"}</span>
+        </div>
+        <div class="item-meta">${item.sector || "sin sector"} - ${formatServerDate(item.fecha_hora)} - ${gps}${accuracy}</div>
+        <div class="item-meta">${item.nombre_archivo || ""}</div>
+      `;
+      serverItemsList.appendChild(li);
+    }
+  } catch {
+    const error = document.createElement("li");
+    error.textContent = "No pude cargar los items subidos.";
+    serverItemsList.appendChild(error);
+  }
+}
+
 async function syncPending() {
   if (!navigator.onLine) return;
   const items = await getItems();
@@ -175,6 +224,7 @@ async function syncPending() {
     await storeItem(item);
   }
   await renderItems();
+  await renderServerItems();
 }
 
 async function startRecording() {
@@ -224,6 +274,7 @@ campoInput.addEventListener("input", persistInputs);
 sectorInput.addEventListener("input", persistInputs);
 gpsButton.addEventListener("click", refreshGps);
 syncButton.addEventListener("click", syncPending);
+refreshServerButton.addEventListener("click", renderServerItems);
 window.addEventListener("online", () => {
   setConnectionStatus();
   syncPending();
@@ -238,4 +289,5 @@ loadInputs();
 setConnectionStatus();
 refreshGps();
 renderItems();
+renderServerItems();
 syncPending();

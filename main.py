@@ -1180,6 +1180,35 @@ async def root():
 async def campo():
     return FileResponse(STATIC_DIR / "index.html")
 
+@fastapi_app.get("/api/field-items")
+async def list_field_items():
+    items = []
+    if FIELD_ITEMS_DIR.exists():
+        for metadata_path in FIELD_ITEMS_DIR.rglob("*.json"):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"No se pudo leer metadata de campo {metadata_path}: {e}")
+                continue
+
+            stored_file = metadata.get("stored_file") or ""
+            filename = Path(stored_file).name if stored_file else metadata_path.name.replace(".json", "")
+            items.append({
+                "id": metadata.get("id", ""),
+                "tipo": metadata.get("item_type", ""),
+                "campo": metadata.get("campo", ""),
+                "sector": metadata.get("sector", ""),
+                "fecha_hora": metadata.get("captured_at", ""),
+                "latitud": metadata.get("latitude", ""),
+                "longitud": metadata.get("longitude", ""),
+                "precision_gps": metadata.get("gps_accuracy", ""),
+                "nombre_archivo": filename,
+                "estado": "subido",
+            })
+
+    items.sort(key=lambda item: item.get("fecha_hora") or "", reverse=True)
+    return {"ok": True, "items": items}
+
 @fastapi_app.post("/api/field-items")
 async def create_field_item(
     item_type: str = Form(...),
