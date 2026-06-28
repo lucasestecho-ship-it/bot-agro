@@ -122,6 +122,12 @@ button,
   text-align: center;
 }
 
+.secondary-button {
+  width: 100%;
+  margin-top: 12px;
+  background: #6a5842;
+}
+
 .actions {
   display: grid;
   grid-template-columns: 1fr 132px;
@@ -192,9 +198,30 @@ button,
   color: #1f6b45;
 }
 
+.pill.subiendo {
+  background: #dce8ee;
+  color: #24546b;
+}
+
 .pill.error {
   background: #f4d9d5;
   color: #8d3025;
+}
+
+.debug-log {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  color: #4c5b51;
+  font-size: 0.84rem;
+}
+
+.debug-log li {
+  border-left: 3px solid #8aa18e;
+  padding: 6px 8px;
+  background: #f7f9f5;
 }
 
 @media (max-width: 520px) {

@@ -10,7 +10,9 @@ const connectionStatus = document.getElementById("connectionStatus");
 const gpsStatus = document.getElementById("gpsStatus");
 const gpsButton = document.getElementById("gpsButton");
 const syncButton = document.getElementById("syncButton");
+const forceSyncButton = document.getElementById("forceSyncButton");
 const refreshServerButton = document.getElementById("refreshServerButton");
+const debugLog = document.getElementById("debugLog");
 
 let dbPromise;
 let recorder;
@@ -45,9 +47,26 @@ async function getItems() {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_NAME, "readonly");
     const request = tx.objectStore(STORE_NAME).getAll();
-    request.onsuccess = () => resolve(request.result.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+    request.onsuccess = () => {
+      const items = request.result.map(normalizeLocalItem);
+      resolve(items.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
+    };
     request.onerror = () => reject(request.error);
   });
+}
+
+function normalizeLocalItem(item) {
+  if (item.status === "subido" && !item.serverConfirmed) {
+    return { ...item, status: "pendiente" };
+  }
+  return item;
+}
+
+function appendDebug(message) {
+  if (!debugLog) return;
+  const li = document.createElement("li");
+  li.textContent = `${new Date().toLocaleTimeString()} - ${message}`;
+  debugLog.prepend(li);
 }
 
 function persistInputs() {
@@ -123,7 +142,7 @@ async function addItem(type, blob, filename) {
   if (!item) return;
   await storeItem(item);
   await renderItems();
-  await syncPending();
+  appendDebug("Item local creado en estado pendiente.");
 }
 
 async function renderItems() {
@@ -141,12 +160,14 @@ async function renderItems() {
     const gps = item.latitude && item.longitude
       ? `${Number(item.latitude).toFixed(5)}, ${Number(item.longitude).toFixed(5)}`
       : "sin GPS";
+    const statusClass = item.status === "subido confirmado" ? "subido" : item.status;
     li.innerHTML = `
       <div class="item-main">
         <span>${item.type === "audio" ? "Audio" : "Foto"} - ${item.campo}</span>
-        <span class="pill ${item.status}">${item.status}</span>
+        <span class="pill ${statusClass}">${item.status}</span>
       </div>
       <div class="item-meta">${item.sector || "sin sector"} - ${new Date(item.createdAt).toLocaleString()} - ${gps}</div>
+      ${item.errorMessage ? `<div class="item-meta">Error: ${item.errorMessage}</div>` : ""}
     `;
     itemsList.appendChild(li);
   }
@@ -199,29 +220,67 @@ async function renderServerItems() {
   }
 }
 
-async function syncPending() {
-  if (!navigator.onLine) return;
-  const items = await getItems();
-  for (const item of items.filter((entry) => entry.status !== "subido")) {
-    const form = new FormData();
-    form.append("item_type", item.type);
-    form.append("campo", item.campo);
-    form.append("sector", item.sector);
-    form.append("captured_at", item.createdAt);
-    form.append("latitude", item.latitude);
-    form.append("longitude", item.longitude);
-    form.append("gps_accuracy", item.gpsAccuracy);
-    form.append("client_id", item.id);
-    form.append("file", item.blob, item.filename);
+async function uploadLocalItem(item) {
+  appendDebug(`Intentando subir item ${item.id}...`);
+  item.status = "subiendo";
+  item.errorMessage = "";
+  await storeItem(item);
+  await renderItems();
 
-    try {
-      const response = await fetch("/api/field-items", { method: "POST", body: form });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      item.status = "subido";
-    } catch (error) {
-      item.status = "error";
-    }
-    await storeItem(item);
+  const form = new FormData();
+  form.append("item_type", item.type);
+  form.append("campo", item.campo);
+  form.append("sector", item.sector);
+  form.append("captured_at", item.createdAt);
+  form.append("latitude", item.latitude);
+  form.append("longitude", item.longitude);
+  form.append("gps_accuracy", item.gpsAccuracy);
+  form.append("client_id", item.id);
+  form.append("file", item.blob, item.filename);
+
+  try {
+    appendDebug("POST /api/field-items enviado");
+    const response = await fetch("/api/field-items", { method: "POST", body: form });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.detail || "respuesta sin ok true");
+
+    appendDebug("Servidor respondió OK");
+    item.status = "subido confirmado";
+    item.serverConfirmed = true;
+    item.serverId = data.id || "";
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    appendDebug(`Error al subir: ${message}`);
+    item.status = "error";
+    item.serverConfirmed = false;
+    item.errorMessage = message;
+  }
+
+  await storeItem(item);
+  await renderItems();
+}
+
+async function syncPending(options = {}) {
+  if (!navigator.onLine) {
+    appendDebug("Error al subir: sin conexión");
+    return;
+  }
+  const items = await getItems();
+  const shouldForce = Boolean(options.force);
+  const uploadable = items.filter((entry) => {
+    if (entry.status === "subiendo") return false;
+    if (shouldForce) return true;
+    return entry.status !== "subido confirmado";
+  });
+
+  if (!uploadable.length) {
+    appendDebug("No hay items locales para subir.");
+  }
+
+  for (const item of uploadable) {
+    await uploadLocalItem(item);
   }
   await renderItems();
   await renderServerItems();
@@ -274,10 +333,15 @@ campoInput.addEventListener("input", persistInputs);
 sectorInput.addEventListener("input", persistInputs);
 gpsButton.addEventListener("click", refreshGps);
 syncButton.addEventListener("click", syncPending);
-refreshServerButton.addEventListener("click", renderServerItems);
+if (forceSyncButton) {
+  forceSyncButton.addEventListener("click", () => syncPending({ force: true }));
+}
+if (refreshServerButton) {
+  refreshServerButton.addEventListener("click", renderServerItems);
+}
 window.addEventListener("online", () => {
   setConnectionStatus();
-  syncPending();
+  appendDebug("Conexion online. Toca Sincronizar para subir pendientes.");
 });
 window.addEventListener("offline", setConnectionStatus);
 
@@ -290,4 +354,3 @@ setConnectionStatus();
 refreshGps();
 renderItems();
 renderServerItems();
-syncPending();
