@@ -3,7 +3,15 @@ import json
 import logging
 import tempfile
 import base64
+import mimetypes
+import shutil
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
 import requests
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from openai import OpenAI
@@ -22,9 +30,17 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-MY_CHAT_ID = 1144480769
+MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "1144480769"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/campo_bot")).resolve()
+FIELD_ITEMS_DIR = DATA_DIR / "field_items"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+def get_openai_client():
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY no configurado")
+    return openai_client
 
 # Estado en memoria de recorridas activas por chat_id
 # { chat_id: {"campo": str, "inicio": datetime, "items": [ {tipo, texto, foto_path} ]} }
@@ -73,7 +89,7 @@ def get_next_receta_number(worksheet):
 
 def transcribe_audio(file_path):
     with open(file_path, "rb") as audio_file:
-        transcript = openai_client.audio.transcriptions.create(
+        transcript = get_openai_client().audio.transcriptions.create(
             model="whisper-1",
             file=audio_file
         )
@@ -84,7 +100,7 @@ def image_to_base64(image_path):
         return base64.b64encode(f.read()).decode("utf-8")
 
 def transcribe_image_base64(image_base64):
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o",
         messages=[
             {
@@ -119,7 +135,7 @@ def transcribe_image(image_path):
 def describir_imagen_recorrida(image_path):
     """Describe una foto de campo en contexto de recorrida tecnica."""
     image_base64 = image_to_base64(image_path)
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o",
         messages=[
             {
@@ -172,7 +188,7 @@ def clasificar_mensaje(text):
         "Responde UNICAMENTE con una de estas palabras: receta, cliente_nuevo, cliente_consulta, cliente_update, tarea, recorrida, presupuesto, compra, idea\n\n"
         f"Mensaje: {text}"
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -196,7 +212,7 @@ def extract_receta(text):
         'REGLAS: orden de carga: primero=1, segundo=2, etc. Dosis solo numero. Solo JSON sin markdown.\n'
         f'Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -230,7 +246,7 @@ def extract_cliente_nuevo(text):
         '}\n'
         f'Hoy es {today}. Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -249,7 +265,7 @@ def extract_cliente_update(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -274,7 +290,7 @@ def extract_tarea(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -300,7 +316,7 @@ def extract_recorrida(text):
         '}\n'
         f'Hoy es {today}. Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -326,7 +342,7 @@ def extract_presupuesto(text):
         '}\n'
         f'Hoy es {today}. Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -351,7 +367,7 @@ def extract_compra(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -372,7 +388,7 @@ def extract_idea(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -469,7 +485,7 @@ def generar_resumen_recorrida(campo, items):
         "}\n\n"
         f"Notas:\n{contenido}"
     )
-    response = openai_client.chat.completions.create(
+    response = get_openai_client().chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
@@ -1092,7 +1108,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error: {e}")
         await context.bot.send_message(chat_id=chat_id, text="Error al procesar: " + str(e))
 
-def main():
+def build_telegram_application():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Comandos de recorrida
@@ -1112,8 +1128,110 @@ def main():
         time=datetime.strptime("11:00", "%H:%M").time()
     )
 
+    return app
+
+def main():
+    app = build_telegram_application()
     logger.info("Bot iniciado!")
     app.run_polling()
+
+def safe_field_extension(upload: UploadFile, item_type: str) -> str:
+    extension = Path(upload.filename or "").suffix.lower()
+    if extension:
+        return extension[:12]
+
+    guessed = mimetypes.guess_extension(upload.content_type or "")
+    if guessed:
+        return guessed
+
+    return ".webm" if item_type == "audio" else ".jpg"
+
+@asynccontextmanager
+async def fastapi_lifespan(app: FastAPI):
+    telegram_app = None
+    enable_bot = os.environ.get("ENABLE_TELEGRAM_BOT", "false").lower() in {"1", "true", "yes", "si"}
+
+    if enable_bot:
+        if not TELEGRAM_TOKEN:
+            logger.warning("ENABLE_TELEGRAM_BOT=true pero falta TELEGRAM_TOKEN. FastAPI inicia sin bot.")
+        else:
+            telegram_app = build_telegram_application()
+            await telegram_app.initialize()
+            await telegram_app.start()
+            await telegram_app.updater.start_polling()
+            logger.info("Bot de Telegram iniciado junto con FastAPI.")
+
+    try:
+        yield
+    finally:
+        if telegram_app:
+            await telegram_app.updater.stop()
+            await telegram_app.stop()
+            await telegram_app.shutdown()
+
+fastapi_app = FastAPI(title="Bot Agro Campo", lifespan=fastapi_lifespan)
+fastapi_app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+@fastapi_app.get("/")
+async def root():
+    return RedirectResponse(url="/campo")
+
+@fastapi_app.get("/campo")
+async def campo():
+    return FileResponse(STATIC_DIR / "index.html")
+
+@fastapi_app.post("/api/field-items")
+async def create_field_item(
+    item_type: str = Form(...),
+    campo: str = Form(...),
+    sector: str = Form(""),
+    captured_at: str = Form(...),
+    latitude: str = Form(""),
+    longitude: str = Form(""),
+    gps_accuracy: str = Form(""),
+    client_id: str = Form(""),
+    file: UploadFile = File(...),
+):
+    item_type = item_type.strip().lower()
+    if item_type not in {"audio", "foto"}:
+        raise HTTPException(status_code=400, detail="item_type debe ser audio o foto")
+    if not campo.strip():
+        raise HTTPException(status_code=400, detail="campo es obligatorio")
+
+    now = datetime.utcnow()
+    item_id = uuid.uuid4().hex
+    item_dir = FIELD_ITEMS_DIR / now.strftime("%Y-%m-%d")
+    item_dir.mkdir(parents=True, exist_ok=True)
+
+    extension = safe_field_extension(file, item_type)
+    stored_filename = f"{now.strftime('%H%M%S')}_{item_id}_{item_type}{extension}"
+    file_path = item_dir / stored_filename
+
+    with file_path.open("wb") as output:
+        shutil.copyfileobj(file.file, output)
+
+    metadata = {
+        "ok": True,
+        "id": item_id,
+        "client_id": client_id,
+        "item_type": item_type,
+        "campo": campo.strip(),
+        "sector": sector.strip(),
+        "captured_at": captured_at,
+        "latitude": latitude,
+        "longitude": longitude,
+        "gps_accuracy": gps_accuracy,
+        "original_filename": file.filename,
+        "content_type": file.content_type,
+        "stored_file": str(file_path),
+        "received_at": now.isoformat() + "Z",
+        "ai_processed": False,
+    }
+
+    metadata_path = file_path.with_suffix(file_path.suffix + ".json")
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {"ok": True, "id": item_id}
 
 if __name__ == "__main__":
     main()
