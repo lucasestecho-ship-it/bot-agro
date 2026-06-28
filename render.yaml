@@ -10,7 +10,11 @@ services:
         value: /tmp/campo_bot
       - key: FIELD_APP_TOKEN
         sync: false
-      - key: GOOGLE_DRIVE_FOLDER_ID
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
         sync: false
       - key: ENABLE_TELEGRAM_BOT
         value: "false"

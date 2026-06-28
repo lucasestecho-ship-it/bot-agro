@@ -28,11 +28,40 @@ uvicorn main:fastapi_app --host 0.0.0.0 --port $PORT
 ```bash
 DATA_DIR=/tmp/campo_bot
 FIELD_APP_TOKEN=un_token_largo
-GOOGLE_DRIVE_FOLDER_ID=id_de_la_carpeta_drive
 ENABLE_TELEGRAM_BOT=false
 ```
 
-Variables opcionales/necesarias si se habilita Telegram o las funciones del bot:
+## Supabase Storage para archivos persistentes
+
+Si `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` y `SUPABASE_BUCKET` estan configuradas, cada audio o foto recibido por `POST /api/field-items` se guarda primero en `DATA_DIR` y despues se sube a Supabase Storage.
+
+Pasos:
+
+1. Crear un proyecto en Supabase.
+2. Ir a **Storage** y crear un bucket, por ejemplo `campo-items`.
+3. Si queres que la app muestre links abribles directamente, crear el bucket como publico. Si el bucket es privado, igual se sube el archivo, pero el link publico puede no abrir.
+4. Copiar la URL del proyecto desde **Project Settings > API**.
+5. Copiar la **service_role key** desde **Project Settings > API**. No usar esta clave en frontend.
+6. En Render, agregar:
+
+   ```bash
+   SUPABASE_URL=https://TU_PROYECTO.supabase.co
+   SUPABASE_SERVICE_ROLE_KEY=...
+   SUPABASE_BUCKET=campo-items
+   ```
+
+Metadata guardada:
+
+- `storage_status=supabase_uploaded` si Supabase confirmo la subida
+- `storage_provider=supabase`
+- `storage_path`
+- `storage_public_url`
+- `storage_status=local_only` si faltan variables Supabase
+- `storage_status=supabase_error` y `storage_error` si falla, conservando el archivo local
+
+## Variables opcionales del bot
+
+Necesarias si se habilita Telegram o las funciones del bot:
 
 ```bash
 TELEGRAM_TOKEN=...
@@ -41,37 +70,6 @@ GOOGLE_SHEET_ID=...
 GOOGLE_CREDENTIALS_JSON=...
 MY_CHAT_ID=1144480769
 ```
-
-## Google Drive para archivos de campo
-
-Si `GOOGLE_DRIVE_FOLDER_ID` esta configurado, cada audio o foto recibido por `POST /api/field-items` se guarda primero en `DATA_DIR` y despues se sube a esa carpeta de Google Drive.
-
-Para configurarlo:
-
-1. Crear una carpeta en Google Drive para los archivos de campo.
-2. Abrir la carpeta y copiar el ID desde la URL. En una URL como:
-
-   ```text
-   https://drive.google.com/drive/folders/XXXXXXXXXXXX
-   ```
-
-   el valor `XXXXXXXXXXXX` es `GOOGLE_DRIVE_FOLDER_ID`.
-
-3. Buscar el email de la service account dentro de `GOOGLE_CREDENTIALS_JSON`, en el campo `client_email`.
-4. Compartir la carpeta de Drive con ese email como Editor.
-5. En Render, agregar:
-
-   ```bash
-   GOOGLE_DRIVE_FOLDER_ID=XXXXXXXXXXXX
-   ```
-
-Metadata guardada:
-
-- `storage_status=drive_uploaded` si Drive confirmo la subida
-- `drive_file_id`
-- `drive_web_link`
-- `storage_status=local_only` si no hay `GOOGLE_DRIVE_FOLDER_ID`
-- `storage_status=drive_error` si Drive fallo, conservando el archivo local
 
 Para esta primera prueba dejar:
 
@@ -88,7 +86,7 @@ Tambien se incluye `render.yaml` con:
 - build command `pip install -r requirements.txt`
 - start command `uvicorn main:fastapi_app --host 0.0.0.0 --port $PORT`
 - `DATA_DIR=/tmp/campo_bot`
-- `GOOGLE_DRIVE_FOLDER_ID` opcional para subir audios/fotos a Drive
+- variables opcionales para Supabase Storage
 - `ENABLE_TELEGRAM_BOT=false`
 
 ## Verificaciones
@@ -96,4 +94,5 @@ Tambien se incluye `render.yaml` con:
 - `main.py` expone `fastapi_app`.
 - `/campo` devuelve `static/index.html`.
 - `POST /api/field-items` guarda el archivo y un `.json` de metadata en `DATA_DIR/field_items/YYYY-MM-DD/`.
+- Si Supabase esta configurado, sube el archivo al bucket y guarda metadata de storage.
 - Las fotos se guardan solo como evidencia con metadata. No se procesan con IA desde `/campo`.

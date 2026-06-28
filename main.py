@@ -16,8 +16,6 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from openai import OpenAI
 import gspread
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from pdf2image import convert_from_path
@@ -32,7 +30,9 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
+SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "1144480769"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/campo_bot")).resolve()
 FIELD_ITEMS_DIR = DATA_DIR / "field_items"
@@ -63,27 +63,23 @@ def get_google_sheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
 
-def upload_field_file_to_drive(file_path, filename, content_type=None):
-    if not GOOGLE_DRIVE_FOLDER_ID:
+def upload_field_file_to_supabase(file_path, storage_path, content_type=None):
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET):
         return None
 
-    logger.info(f"Subiendo a Drive: {filename}")
-    creds = get_google_creds()
-    service = build("drive", "v3", credentials=creds)
-    media = MediaFileUpload(
-        str(file_path),
-        mimetype=content_type or "application/octet-stream",
-        resumable=False
-    )
-    body = {
-        "name": filename,
-        "parents": [GOOGLE_DRIVE_FOLDER_ID],
+    logger.info(f"Subiendo a Supabase Storage: {storage_path}")
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_path}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": content_type or "application/octet-stream",
+        "x-upsert": "false",
     }
-    return service.files().create(
-        body=body,
-        media_body=media,
-        fields="id, webViewLink, webContentLink"
-    ).execute()
+    with open(file_path, "rb") as f:
+        response = requests.post(upload_url, headers=headers, data=f, timeout=60)
+    response.raise_for_status()
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_path}"
+    return {"path": storage_path, "public_url": public_url}
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -1230,6 +1226,10 @@ async def list_field_items():
                 "nombre_archivo": filename,
                 "estado": "subido",
                 "storage_status": metadata.get("storage_status", ""),
+                "storage_provider": metadata.get("storage_provider", ""),
+                "storage_path": metadata.get("storage_path", ""),
+                "storage_public_url": metadata.get("storage_public_url", ""),
+                "storage_error": metadata.get("storage_error", ""),
                 "drive_file_id": metadata.get("drive_file_id", ""),
                 "drive_link": metadata.get("drive_web_link", ""),
             })
@@ -1285,23 +1285,28 @@ async def create_field_item(
         "received_at": now.isoformat() + "Z",
         "ai_processed": False,
         "storage_status": "local_only",
+        "storage_provider": "local",
     }
 
-    if GOOGLE_DRIVE_FOLDER_ID:
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET:
+        storage_path = f"{now.strftime('%Y-%m-%d')}/{stored_filename}"
         try:
-            drive_file = upload_field_file_to_drive(
+            supabase_file = upload_field_file_to_supabase(
                 file_path,
-                stored_filename,
+                storage_path,
                 content_type=file.content_type
             )
-            metadata["drive_file_id"] = drive_file.get("id", "")
-            metadata["drive_web_link"] = drive_file.get("webViewLink") or drive_file.get("webContentLink") or ""
-            metadata["storage_status"] = "drive_uploaded"
-            logger.info(f"Drive OK: {metadata['drive_file_id']}")
+            metadata["storage_status"] = "supabase_uploaded"
+            metadata["storage_provider"] = "supabase"
+            metadata["storage_path"] = supabase_file.get("path", "")
+            metadata["storage_public_url"] = supabase_file.get("public_url", "")
+            logger.info(f"Supabase OK: {metadata['storage_path']}")
         except Exception as e:
-            metadata["storage_status"] = "drive_error"
-            metadata["drive_error"] = str(e)
-            logger.error(f"Error Drive: {e}")
+            metadata["storage_status"] = "supabase_error"
+            metadata["storage_provider"] = "supabase"
+            metadata["storage_path"] = storage_path
+            metadata["storage_error"] = str(e)
+            logger.error(f"Error Supabase: {e}")
 
     metadata_path = file_path.with_suffix(file_path.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
