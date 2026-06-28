@@ -10,7 +10,7 @@ La app ASGI para despliegue es:
 main:fastapi_app
 ```
 
-El comando recomendado para Koyeb es:
+El comando local opcional es:
 
 ```bash
 sh start.sh
@@ -53,28 +53,31 @@ exec uvicorn main:fastapi_app --host 0.0.0.0 --port "${PORT:-8000}"
 
 Los items subidos se guardan en `DATA_DIR/field_items/YYYY-MM-DD/`. Si `DATA_DIR` no esta definido, usa `/tmp/campo_bot`.
 
-## Desplegar en Koyeb Free
+## Desplegar en Render Free
 
-1. Crear una app nueva en Koyeb y conectar el repo de GitHub.
-2. Elegir una instancia Free.
+1. Crear un Web Service nuevo en Render y conectar el repo de GitHub.
+2. Elegir plan Free.
 3. Configurar las variables de entorno:
 
-   - `TELEGRAM_TOKEN`
-   - `OPENAI_API_KEY`
-   - `GOOGLE_SHEET_ID`
-   - `GOOGLE_CREDENTIALS_JSON`
-   - `MY_CHAT_ID`
-   - `DATA_DIR` opcional, por defecto `/tmp/campo_bot`
-   - `FIELD_APP_TOKEN` opcional para una etapa futura
+   - `DATA_DIR=/tmp/campo_bot`
+   - `FIELD_APP_TOKEN=un_token_largo`
    - `ENABLE_TELEGRAM_BOT=false` para probar primero solo `/campo`
 
-4. Usar como Run command:
+4. Usar como Build Command:
 
    ```bash
-   sh start.sh
+   pip install -r requirements.txt
    ```
 
-5. Abrir la URL publica de Koyeb y probar `/campo`.
+5. Usar como Start Command:
+
+   ```bash
+   uvicorn main:fastapi_app --host 0.0.0.0 --port $PORT
+   ```
+
+6. Abrir la URL publica de Render y probar `/campo`.
+
+Tambien se incluye `render.yaml` y una guia especifica en `README_RENDER.md`.
 
 ## PWA de campo
 
@@ -102,7 +105,7 @@ El bot de Telegram puede arrancar junto con FastAPI si:
 ENABLE_TELEGRAM_BOT=true
 ```
 
-Para la primera prueba en Koyeb conviene dejar:
+Para la primera prueba en Render conviene dejar:
 
 ```bash
 ENABLE_TELEGRAM_BOT=false

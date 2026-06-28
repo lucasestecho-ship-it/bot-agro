@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: bot-agro-campo
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:fastapi_app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATA_DIR
+        value: /tmp/campo_bot
+      - key: FIELD_APP_TOKEN
+        sync: false
+      - key: ENABLE_TELEGRAM_BOT
+        value: "false"
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GOOGLE_SHEET_ID
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: MY_CHAT_ID
+        sync: false
