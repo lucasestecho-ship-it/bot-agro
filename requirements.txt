@@ -5,3 +5,6 @@ google-auth
 pdf2image
 google-api-python-client
 python-docx
+fastapi
+uvicorn[standard]
+python-multipart

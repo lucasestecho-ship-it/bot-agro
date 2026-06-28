@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1f7a4f">
+  <title>Campo</title>
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="stylesheet" href="/static/campo.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Campo</p>
+        <h1>Registro de recorrida</h1>
+      </div>
+      <span id="connectionStatus" class="status">offline</span>
+    </header>
+
+    <section class="panel">
+      <label>
+        Recorrida/campo activo
+        <input id="campoInput" autocomplete="off" placeholder="Ej: La Esperanza">
+      </label>
+      <label>
+        Sector opcional
+        <input id="sectorInput" autocomplete="off" placeholder="Ej: lote 4, manga, bajo">
+      </label>
+      <div class="gps-row">
+        <span id="gpsStatus">GPS pendiente</span>
+        <button id="gpsButton" type="button">Actualizar GPS</button>
+      </div>
+    </section>
+
+    <section class="actions">
+      <button id="talkButton" class="talk" type="button">Mantener para hablar</button>
+      <label class="photo-button">
+        Foto
+        <input id="photoInput" type="file" accept="image/*" capture="environment">
+      </label>
+    </section>
+
+    <section class="panel">
+      <div class="list-header">
+        <h2>Items</h2>
+        <button id="syncButton" type="button">Sincronizar</button>
+      </div>
+      <ul id="itemsList" class="items"></ul>
+    </section>
+  </main>
+
+  <script src="/static/campo.js"></script>
+</body>
+</html>

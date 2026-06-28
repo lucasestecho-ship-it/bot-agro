@@ -1,0 +1,208 @@
+:root {
+  color-scheme: light;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f0e8;
+  color: #17231c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #e8f1ea 0%, #f4f0e8 42%, #f7f5ef 100%);
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app {
+  width: min(720px, 100%);
+  margin: 0 auto;
+  padding: 18px 14px 32px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: #5c6b61;
+  font-size: 0.84rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+h1,
+h2 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+h1 {
+  font-size: 1.55rem;
+}
+
+h2 {
+  font-size: 1.05rem;
+}
+
+.status {
+  border-radius: 999px;
+  padding: 7px 11px;
+  background: #7b2f26;
+  color: white;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.status.online {
+  background: #1f7a4f;
+}
+
+.panel {
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid #d6ddd2;
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 14px;
+  box-shadow: 0 10px 28px rgba(29, 48, 35, 0.08);
+}
+
+label {
+  display: grid;
+  gap: 7px;
+  margin-bottom: 12px;
+  color: #39483f;
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+input {
+  width: 100%;
+  border: 1px solid #bac7bc;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
+  color: #17231c;
+}
+
+.gps-row,
+.list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.gps-row span {
+  min-width: 0;
+  color: #506156;
+  font-size: 0.9rem;
+}
+
+button,
+.photo-button {
+  border: 0;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #24493a;
+  color: white;
+  cursor: pointer;
+  font-weight: 800;
+  text-align: center;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 132px;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.talk {
+  min-height: 132px;
+  background: #1f7a4f;
+  font-size: clamp(1.25rem, 6vw, 2rem);
+}
+
+.talk.recording {
+  background: #a43b2f;
+}
+
+.photo-button {
+  display: grid;
+  place-items: center;
+  min-height: 132px;
+  background: #36566d;
+}
+
+.photo-button input {
+  display: none;
+}
+
+.items {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+  display: grid;
+  gap: 10px;
+}
+
+.items li {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #d8ded7;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fff;
+}
+
+.item-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-weight: 800;
+}
+
+.item-meta {
+  color: #647166;
+  font-size: 0.86rem;
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: #efe7d6;
+  color: #51442c;
+  font-size: 0.76rem;
+}
+
+.pill.subido {
+  background: #dceee3;
+  color: #1f6b45;
+}
+
+.pill.error {
+  background: #f4d9d5;
+  color: #8d3025;
+}
+
+@media (max-width: 520px) {
+  .actions {
+    grid-template-columns: 1fr;
+  }
+
+  .photo-button {
+    min-height: 72px;
+  }
+}

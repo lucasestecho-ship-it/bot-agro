@@ -1,0 +1,9 @@
+{
+  "name": "Bot Agro Campo",
+  "short_name": "Campo",
+  "start_url": "/campo",
+  "display": "standalone",
+  "background_color": "#f4f0e8",
+  "theme_color": "#1f7a4f",
+  "icons": []
+}
