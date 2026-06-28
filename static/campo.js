@@ -210,6 +210,7 @@ async function renderServerItems() {
         </div>
         <div class="item-meta">${item.sector || "sin sector"} - ${formatServerDate(item.fecha_hora)} - ${gps}${accuracy}</div>
         <div class="item-meta">${item.nombre_archivo || ""}</div>
+        <div class="item-meta">${item.storage_status || "local_only"}${item.drive_link ? ` - <a href="${item.drive_link}" target="_blank" rel="noopener">Drive</a>` : ""}</div>
       `;
       serverItemsList.appendChild(li);
     }

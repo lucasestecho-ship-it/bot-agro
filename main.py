@@ -16,6 +16,8 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from openai import OpenAI
 import gspread
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from pdf2image import convert_from_path
@@ -30,6 +32,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+GOOGLE_DRIVE_FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "1144480769"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/campo_bot")).resolve()
 FIELD_ITEMS_DIR = DATA_DIR / "field_items"
@@ -59,6 +62,28 @@ def get_google_sheet():
     creds = get_google_creds()
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
+
+def upload_field_file_to_drive(file_path, filename, content_type=None):
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        return None
+
+    logger.info(f"Subiendo a Drive: {filename}")
+    creds = get_google_creds()
+    service = build("drive", "v3", credentials=creds)
+    media = MediaFileUpload(
+        str(file_path),
+        mimetype=content_type or "application/octet-stream",
+        resumable=False
+    )
+    body = {
+        "name": filename,
+        "parents": [GOOGLE_DRIVE_FOLDER_ID],
+    }
+    return service.files().create(
+        body=body,
+        media_body=media,
+        fields="id, webViewLink, webContentLink"
+    ).execute()
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -1204,6 +1229,9 @@ async def list_field_items():
                 "precision_gps": metadata.get("gps_accuracy", ""),
                 "nombre_archivo": filename,
                 "estado": "subido",
+                "storage_status": metadata.get("storage_status", ""),
+                "drive_file_id": metadata.get("drive_file_id", ""),
+                "drive_link": metadata.get("drive_web_link", ""),
             })
 
     items.sort(key=lambda item: item.get("fecha_hora") or "", reverse=True)
@@ -1236,6 +1264,7 @@ async def create_field_item(
     stored_filename = f"{now.strftime('%H%M%S')}_{item_id}_{item_type}{extension}"
     file_path = item_dir / stored_filename
 
+    logger.info(f"Archivo recibido: {stored_filename}")
     with file_path.open("wb") as output:
         shutil.copyfileobj(file.file, output)
 
@@ -1255,7 +1284,24 @@ async def create_field_item(
         "stored_file": str(file_path),
         "received_at": now.isoformat() + "Z",
         "ai_processed": False,
+        "storage_status": "local_only",
     }
+
+    if GOOGLE_DRIVE_FOLDER_ID:
+        try:
+            drive_file = upload_field_file_to_drive(
+                file_path,
+                stored_filename,
+                content_type=file.content_type
+            )
+            metadata["drive_file_id"] = drive_file.get("id", "")
+            metadata["drive_web_link"] = drive_file.get("webViewLink") or drive_file.get("webContentLink") or ""
+            metadata["storage_status"] = "drive_uploaded"
+            logger.info(f"Drive OK: {metadata['drive_file_id']}")
+        except Exception as e:
+            metadata["storage_status"] = "drive_error"
+            metadata["drive_error"] = str(e)
+            logger.error(f"Error Drive: {e}")
 
     metadata_path = file_path.with_suffix(file_path.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
