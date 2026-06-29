@@ -22,7 +22,10 @@ from datetime import datetime, timedelta
 from pdf2image import convert_from_path
 from docx import Document as DocxDocument
 from docx.shared import Inches, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -556,6 +559,182 @@ def markdown_summary(markdown_text):
             return cleaned[:1000]
     return ""
 
+BRAND_DARK = "1F4A36"
+BRAND_MID = "4B8058"
+BRAND_BEIGE = "F1EBDD"
+BRAND_BROWN = "886844"
+BRAND_TEXT = "24342A"
+
+def logo_path():
+    return STATIC_DIR / "logo.png"
+
+def set_cell_shading(cell, fill):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shading = tc_pr.find(qn("w:shd"))
+    if shading is None:
+        shading = OxmlElement("w:shd")
+        tc_pr.append(shading)
+    shading.set(qn("w:fill"), fill)
+
+def set_cell_border(cell, color=BRAND_BROWN, size="8"):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = tc_pr.first_child_found_in("w:tcBorders")
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tc_pr.append(borders)
+    for edge in ("top", "left", "bottom", "right"):
+        tag = f"w:{edge}"
+        element = borders.find(qn(tag))
+        if element is None:
+            element = OxmlElement(tag)
+            borders.append(element)
+        element.set(qn("w:val"), "single")
+        element.set(qn("w:sz"), size)
+        element.set(qn("w:space"), "0")
+        element.set(qn("w:color"), color)
+
+def set_cell_text(cell, text, bold=False, color=BRAND_TEXT):
+    cell.text = ""
+    paragraph = cell.paragraphs[0]
+    run = paragraph.add_run(str(text))
+    run.font.name = "Arial"
+    run.font.size = Pt(9)
+    run.font.bold = bold
+    run.font.color.rgb = RGBColor.from_string(color)
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+
+def style_report_document(document):
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    section.left_margin = Inches(0.75)
+    section.right_margin = Inches(0.75)
+    section.different_first_page_header_footer = True
+
+    styles = document.styles
+    styles["Normal"].font.name = "Arial"
+    styles["Normal"].font.size = Pt(10)
+    styles["Normal"].font.color.rgb = RGBColor.from_string(BRAND_TEXT)
+    for style_name, color, size in [
+        ("Heading 1", BRAND_DARK, 18),
+        ("Heading 2", BRAND_MID, 14),
+        ("Heading 3", BRAND_BROWN, 11),
+    ]:
+        style = styles[style_name]
+        style.font.name = "Arial"
+        style.font.bold = True
+        style.font.size = Pt(size)
+        style.font.color.rgb = RGBColor.from_string(color)
+
+def add_logo_to_paragraph(paragraph, width):
+    path = logo_path()
+    if not path.exists():
+        logger.warning("logo no encontrado")
+        return False
+    paragraph.add_run().add_picture(str(path), width=width)
+    return True
+
+def add_report_header(document):
+    header = document.sections[0].header
+    table = header.add_table(rows=1, cols=2, width=Inches(6.7))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    left = table.rows[0].cells[0]
+    right = table.rows[0].cells[1]
+    paragraph = left.paragraphs[0]
+    add_logo_to_paragraph(paragraph, Inches(0.65))
+    right_paragraph = right.paragraphs[0]
+    right_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = right_paragraph.add_run("Lucas Estecho – Asesor Ganadero")
+    run.font.name = "Arial"
+    run.font.bold = True
+    run.font.size = Pt(9)
+    run.font.color.rgb = RGBColor.from_string(BRAND_DARK)
+
+def add_cover_page(document, session, title):
+    logo_paragraph = document.add_paragraph()
+    logo_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    add_logo_to_paragraph(logo_paragraph, Inches(2.4))
+
+    title_paragraph = document.add_paragraph()
+    title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_run = title_paragraph.add_run("Informe de recorrida")
+    title_run.font.name = "Arial"
+    title_run.font.bold = True
+    title_run.font.size = Pt(30)
+    title_run.font.color.rgb = RGBColor.from_string(BRAND_DARK)
+
+    subtitle = document.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle_run = subtitle.add_run(session.get("nombre") or title)
+    subtitle_run.font.name = "Arial"
+    subtitle_run.font.size = Pt(15)
+    subtitle_run.font.color.rgb = RGBColor.from_string(BRAND_MID)
+
+    info = document.add_table(rows=0, cols=2)
+    info.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for label, value in [
+        ("Campo", session.get("campo") or "No registrado en la recorrida"),
+        ("Sector", session.get("sector") or "No registrado en la recorrida"),
+        ("Fecha", (session.get("started_at") or "No registrado en la recorrida")[:10]),
+    ]:
+        row = info.add_row().cells
+        set_cell_shading(row[0], BRAND_BEIGE)
+        set_cell_text(row[0], label, bold=True, color=BRAND_DARK)
+        set_cell_text(row[1], value)
+        set_cell_border(row[0], color="D6C7A8", size="6")
+        set_cell_border(row[1], color="D6C7A8", size="6")
+
+    document.add_paragraph()
+    author = document.add_paragraph()
+    author.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = author.add_run("Ing. Agr. Lucas Estecho\nAsesor Ganadero")
+    run.font.name = "Arial"
+    run.font.bold = True
+    run.font.size = Pt(13)
+    run.font.color.rgb = RGBColor.from_string(BRAND_BROWN)
+
+    document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+
+def add_divider(document):
+    table = document.add_table(rows=1, cols=1)
+    cell = table.rows[0].cells[0]
+    set_cell_shading(cell, BRAND_BROWN)
+    cell.text = ""
+
+def extract_markdown_section(markdown_text, section_title):
+    lines = markdown_text.splitlines()
+    captured = []
+    capture = False
+    wanted = section_title.lower()
+    for line in lines:
+        stripped = line.strip().lstrip("#").strip()
+        if stripped.lower().startswith(wanted):
+            capture = True
+            continue
+        if capture and line.strip().startswith("#"):
+            break
+        if capture:
+            captured.append(line.strip())
+    text = "\n".join(line for line in captured if line).strip()
+    return text or markdown_summary(markdown_text) or "No registrado en la recorrida"
+
+def add_highlight_box(document, title, text):
+    table = document.add_table(rows=1, cols=1)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    cell = table.rows[0].cells[0]
+    set_cell_shading(cell, BRAND_BEIGE)
+    set_cell_border(cell, color="D6C7A8", size="8")
+    paragraph = cell.paragraphs[0]
+    title_run = paragraph.add_run(title + "\n")
+    title_run.font.name = "Arial"
+    title_run.font.bold = True
+    title_run.font.size = Pt(11)
+    title_run.font.color.rgb = RGBColor.from_string(BRAND_DARK)
+    body_run = paragraph.add_run(text)
+    body_run.font.name = "Arial"
+    body_run.font.size = Pt(10)
+    body_run.font.color.rgb = RGBColor.from_string(BRAND_TEXT)
+
 def add_markdown_to_doc(document, markdown_text):
     for line in markdown_text.splitlines():
         text = line.strip()
@@ -579,45 +758,75 @@ def add_photo_evidence_to_doc(document, photos, work_dir):
 
     for index, photo in enumerate(photos, start=1):
         document.add_heading(f"Foto {index}", level=3)
+        frame = document.add_table(rows=1, cols=1)
+        frame.alignment = WD_TABLE_ALIGNMENT.CENTER
+        frame_cell = frame.rows[0].cells[0]
+        set_cell_border(frame_cell, color="D6C7A8", size="10")
         try:
             photo_path = download_field_item_file(photo, work_dir, ".jpg")
-            document.add_picture(str(photo_path), width=Inches(5.8))
+            paragraph = frame_cell.paragraphs[0]
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.add_run().add_picture(str(photo_path), width=Inches(5.5))
         except Exception as e:
-            document.add_paragraph(f"No se pudo insertar la imagen: {e}")
-        table = document.add_table(rows=0, cols=2)
+            frame_cell.paragraphs[0].add_run(f"No se pudo insertar la imagen: {e}")
+
+        caption = document.add_paragraph()
+        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        caption_text = (
+            f"{photo.get('fecha_hora') or 'No registrado en la recorrida'} | "
+            f"Campo: {photo.get('campo') or 'No registrado en la recorrida'} | "
+            f"Sector: {photo.get('sector') or 'No registrado en la recorrida'} | "
+            f"Lat: {photo.get('latitud') or '-'} | Long: {photo.get('longitud') or '-'} | "
+            f"Precision GPS: {photo.get('precision_gps') or '-'}"
+        )
+        run = caption.add_run(caption_text)
+        run.font.name = "Arial"
+        run.font.size = Pt(8)
+        run.font.italic = True
+        run.font.color.rgb = RGBColor.from_string(BRAND_BROWN)
+
+        evidence = document.add_table(rows=0, cols=2)
         for label, value in [
-            ("fecha_hora", photo.get("fecha_hora") or "No registrado en la recorrida"),
-            ("campo", photo.get("campo") or "No registrado en la recorrida"),
-            ("sector", photo.get("sector") or "No registrado en la recorrida"),
-            ("latitud", photo.get("latitud") or "No registrado en la recorrida"),
-            ("longitud", photo.get("longitud") or "No registrado en la recorrida"),
-            ("precision GPS", photo.get("precision_gps") or "No registrado en la recorrida"),
-            ("archivo", photo.get("nombre_archivo") or "No registrado en la recorrida"),
-            ("link publico", photo.get("storage_public_url") or "No registrado en la recorrida"),
+            ("Archivo", photo.get("nombre_archivo") or "No registrado en la recorrida"),
+            ("Link publico", photo.get("storage_public_url") or "No registrado en la recorrida"),
         ]:
-            row = table.add_row().cells
-            row[0].text = label
-            row[1].text = str(value)
+            row = evidence.add_row().cells
+            set_cell_shading(row[0], BRAND_BEIGE)
+            set_cell_text(row[0], label, bold=True, color=BRAND_DARK)
+            set_cell_text(row[1], value)
+            set_cell_border(row[0], color="D6C7A8", size="4")
+            set_cell_border(row[1], color="D6C7A8", size="4")
 
 def create_report_docx(session, items, audios, photos, markdown_text, output_path, work_dir):
     logger.info("Creando DOCX")
     document = DocxDocument()
     title = f"Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or '')[:10]}"
-    document.add_heading(title, level=0)
+    style_report_document(document)
+    add_report_header(document)
+    add_cover_page(document, session, title)
+
     document.add_heading("Datos generales", level=1)
     table = document.add_table(rows=0, cols=2)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
     for label, value in [
         ("Campo", session.get("campo") or "No registrado en la recorrida"),
         ("Sector", session.get("sector") or "No registrado en la recorrida"),
+        ("Nombre de recorrida", session.get("nombre") or "No registrado en la recorrida"),
         ("Fecha de inicio", session.get("started_at") or "No registrado en la recorrida"),
         ("Fecha de cierre", session.get("closed_at") or "No registrado en la recorrida"),
         ("Cantidad de audios", len(audios)),
         ("Cantidad de fotos", len(photos)),
-        ("Coordenadas principales", f"{session.get('latitud_inicio') or '-'}, {session.get('longitud_inicio') or '-'}"),
     ]:
         row = table.add_row().cells
-        row[0].text = label
-        row[1].text = str(value)
+        set_cell_shading(row[0], BRAND_BEIGE)
+        set_cell_text(row[0], label, bold=True, color=BRAND_DARK)
+        set_cell_text(row[1], value)
+        set_cell_border(row[0], color="D6C7A8", size="6")
+        set_cell_border(row[1], color="D6C7A8", size="6")
+
+    add_divider(document)
+    document.add_heading("Resumen ejecutivo", level=1)
+    add_highlight_box(document, "Resumen ejecutivo", extract_markdown_section(markdown_text, "Resumen ejecutivo"))
 
     document.add_heading("Informe tecnico", level=1)
     add_markdown_to_doc(document, markdown_text)
@@ -628,17 +837,35 @@ def create_report_docx(session, items, audios, photos, markdown_text, output_pat
 
     document.add_heading("Anexo tecnico", level=1)
     item_table = document.add_table(rows=1, cols=6)
+    item_table.alignment = WD_TABLE_ALIGNMENT.CENTER
     headers = ["tipo", "fecha_hora", "campo", "sector", "GPS", "archivo/link"]
     for idx, header in enumerate(headers):
-        item_table.rows[0].cells[idx].text = header
+        cell = item_table.rows[0].cells[idx]
+        set_cell_shading(cell, BRAND_DARK)
+        set_cell_text(cell, header, bold=True, color="FFFFFF")
+        set_cell_border(cell, color=BRAND_DARK, size="6")
     for item in items:
         row = item_table.add_row().cells
-        row[0].text = str(item.get("tipo") or "")
-        row[1].text = str(item.get("fecha_hora") or "")
-        row[2].text = str(item.get("campo") or "")
-        row[3].text = str(item.get("sector") or "")
-        row[4].text = f"{item.get('latitud') or '-'}, {item.get('longitud') or '-'} +/- {item.get('precision_gps') or '-'}"
-        row[5].text = str(item.get("storage_public_url") or item.get("nombre_archivo") or "")
+        values = [
+            item.get("tipo") or "",
+            item.get("fecha_hora") or "",
+            item.get("campo") or "",
+            item.get("sector") or "",
+            f"{item.get('latitud') or '-'}, {item.get('longitud') or '-'} +/- {item.get('precision_gps') or '-'}",
+            item.get("storage_public_url") or item.get("nombre_archivo") or "",
+        ]
+        for idx, value in enumerate(values):
+            set_cell_text(row[idx], value)
+            set_cell_border(row[idx], color="D6C7A8", size="4")
+
+    document.add_paragraph()
+    closing = document.add_paragraph()
+    closing.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = closing.add_run("Elaborado por Ing. Agr. Lucas Estecho\nAsesor Ganadero")
+    run.font.name = "Arial"
+    run.font.bold = True
+    run.font.size = Pt(11)
+    run.font.color.rgb = RGBColor.from_string(BRAND_DARK)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     document.save(output_path)
