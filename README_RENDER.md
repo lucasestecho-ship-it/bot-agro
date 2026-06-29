@@ -105,11 +105,53 @@ create table if not exists public.field_sessions (
 alter table public.field_items
 add column if not exists session_id text;
 
+alter table public.field_items
+add column if not exists transcript_status text,
+add column if not exists transcript_text text,
+add column if not exists transcript_error text,
+add column if not exists transcript_model text,
+add column if not exists transcript_at timestamptz;
+
 create index if not exists idx_field_items_session_id
 on public.field_items (session_id);
+
+create table if not exists public.field_reports (
+  id text primary key,
+  session_id text,
+  estado text,
+  titulo text,
+  resumen text,
+  informe_markdown text,
+  docx_storage_path text,
+  docx_public_url text,
+  error text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
 ```
 
 Los items viejos pueden quedar con `session_id` en `null`. La app sigue listandolos igual.
+
+### Informes de recorrida
+
+La app agrega un boton **Generar informe** en cada recorrida. El backend:
+
+- lee la recorrida y sus items desde Supabase Database
+- transcribe audios con OpenAI si todavia no tienen `transcript_text`
+- guarda la transcripcion en `public.field_items`
+- genera un informe tecnico en Markdown
+- crea un DOCX con `python-docx`
+- sube el DOCX a Supabase Storage en `reports/<campo>/<session_id>/...`
+- guarda el resultado en `public.field_reports`
+
+Endpoints:
+
+- `POST /api/field-sessions/{session_id}/generate-report`
+- `GET /api/field-sessions/{session_id}/report`
+
+Las fotos no se interpretan con IA. Solo se insertan en el DOCX como evidencia junto con fecha, campo, sector, GPS, precision, archivo y link publico si existe.
+
+Para generar informes se necesita `OPENAI_API_KEY`. Opcionalmente se puede configurar `FIELD_REPORT_MODEL`; si no esta definido, usa `gpt-4o-mini`.
 
 ## Variables opcionales del bot
 

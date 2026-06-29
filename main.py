@@ -83,6 +83,21 @@ def upload_field_file_to_supabase(file_path, storage_path, content_type=None):
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_path}"
     return {"path": storage_path, "public_url": public_url}
 
+def download_supabase_storage_file(storage_path, destination_path):
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET):
+        raise RuntimeError("Supabase Storage no configurado")
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{storage_path}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+    response = requests.get(url, headers=headers, timeout=60)
+    response.raise_for_status()
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    destination_path.write_bytes(response.content)
+    return destination_path
+
 def safe_storage_segment(value, fallback):
     text = (value or "").strip().lower()
     text = re.sub(r"[^a-z0-9._-]+", "-", text)
@@ -110,6 +125,11 @@ def field_metadata_to_item(metadata):
         "storage_error": metadata.get("storage_error", ""),
         "session_id": metadata.get("session_id", ""),
         "session_nombre": metadata.get("session_nombre", ""),
+        "transcript_status": metadata.get("transcript_status", ""),
+        "transcript_text": metadata.get("transcript_text", ""),
+        "transcript_error": metadata.get("transcript_error", ""),
+        "transcript_model": metadata.get("transcript_model", ""),
+        "transcript_at": metadata.get("transcript_at", ""),
         "drive_file_id": metadata.get("drive_file_id", ""),
         "drive_link": metadata.get("drive_web_link", ""),
         "drive_error": metadata.get("drive_error", ""),
@@ -222,6 +242,11 @@ def upsert_field_item_metadata(metadata):
         "storage_public_url": item["storage_public_url"],
         "storage_error": item["storage_error"],
         "session_id": clean_db_value(item.get("session_id")),
+        "transcript_status": clean_db_value(item.get("transcript_status")),
+        "transcript_text": clean_db_value(item.get("transcript_text")),
+        "transcript_error": clean_db_value(item.get("transcript_error")),
+        "transcript_model": clean_db_value(item.get("transcript_model")),
+        "transcript_at": clean_db_value(item.get("transcript_at")),
         "created_at": clean_db_value(metadata.get("received_at")),
     }
     url = f"{SUPABASE_URL}/rest/v1/field_items?on_conflict=id"
@@ -245,7 +270,8 @@ def list_field_items_from_supabase():
         f"{SUPABASE_URL}/rest/v1/field_items"
         "?select=id,tipo,campo,sector,fecha_hora,latitud,longitud,precision_gps,"
         "nombre_archivo,estado,storage_status,storage_provider,storage_path,"
-        "storage_public_url,storage_error,session_id,created_at"
+        "storage_public_url,storage_error,session_id,transcript_status,transcript_text,"
+        "transcript_error,transcript_model,transcript_at,created_at"
         "&order=fecha_hora.desc.nullslast"
     )
     response = requests.get(url, headers=supabase_headers(), timeout=30)
@@ -260,6 +286,53 @@ def list_field_items_from_supabase():
         item.setdefault("session_id", "")
         item["session_nombre"] = session_names.get(item.get("session_id") or "", "")
     return items
+
+def patch_field_item_transcript(item_id, payload):
+    if not supabase_database_configured():
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/field_items?id=eq.{item_id}"
+    response = requests.patch(
+        url,
+        headers=supabase_headers("return=minimal"),
+        json=payload,
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(response.text)
+    return True
+
+def upsert_field_report(report):
+    if not supabase_database_configured():
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/field_reports?on_conflict=id"
+    response = requests.post(
+        url,
+        headers=supabase_headers("resolution=merge-duplicates,return=minimal"),
+        json=report,
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(response.text)
+    return True
+
+def get_field_report_from_supabase(session_id):
+    if not supabase_database_configured():
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/field_reports"
+        f"?session_id=eq.{session_id}"
+        "&select=id,session_id,estado,titulo,resumen,informe_markdown,"
+        "docx_storage_path,docx_public_url,error,created_at,updated_at"
+        "&order=created_at.desc.nullslast&limit=1"
+    )
+    response = requests.get(url, headers=supabase_headers(), timeout=30)
+    if not response.ok:
+        raise RuntimeError(response.text)
+    rows = response.json()
+    return rows[0] if rows else None
 
 def get_session_name_map_from_supabase():
     if not supabase_database_configured():
@@ -355,6 +428,303 @@ def get_field_session_from_supabase(session_id):
         raise RuntimeError(response.text)
     rows = response.json()
     return rows[0] if rows else None
+
+def item_file_extension(item, fallback):
+    filename = item.get("nombre_archivo") or ""
+    suffix = Path(filename).suffix
+    return suffix or fallback
+
+def download_field_item_file(item, work_dir, fallback_extension):
+    item_id = item.get("id") or uuid.uuid4().hex
+    destination = work_dir / f"{item_id}{item_file_extension(item, fallback_extension)}"
+    public_url = item.get("storage_public_url") or ""
+    if public_url:
+        try:
+            response = requests.get(public_url, timeout=60)
+            response.raise_for_status()
+            destination.write_bytes(response.content)
+            return destination
+        except Exception:
+            if not item.get("storage_path"):
+                raise
+
+    storage_path = item.get("storage_path") or ""
+    if storage_path:
+        return download_supabase_storage_file(storage_path, destination)
+
+    raise RuntimeError(f"Item {item_id} no tiene storage_public_url ni storage_path")
+
+def transcribe_field_audio(item, work_dir):
+    if item.get("transcript_status") == "done" and item.get("transcript_text"):
+        return item["transcript_text"]
+
+    item_id = item.get("id", "")
+    logger.info(f"Transcribiendo audio: {item_id}")
+    try:
+        audio_path = download_field_item_file(item, work_dir, ".webm")
+        transcript_text = transcribe_audio(audio_path)
+        transcript_payload = {
+            "transcript_status": "done",
+            "transcript_text": transcript_text,
+            "transcript_model": "whisper-1",
+            "transcript_at": datetime.utcnow().isoformat() + "Z",
+            "transcript_error": None,
+        }
+        patch_field_item_transcript(item_id, transcript_payload)
+        item.update(transcript_payload)
+        logger.info(f"Audio transcripto OK: {item_id}")
+        return transcript_text
+    except Exception as e:
+        error_payload = {
+            "transcript_status": "error",
+            "transcript_error": str(e),
+            "transcript_at": datetime.utcnow().isoformat() + "Z",
+        }
+        try:
+            patch_field_item_transcript(item_id, error_payload)
+        except Exception:
+            pass
+        item.update(error_payload)
+        raise
+
+def format_item_line(item):
+    return (
+        f"- {item.get('fecha_hora') or 'sin fecha'} | {item.get('tipo')} | "
+        f"{item.get('campo') or 'sin campo'} | {item.get('sector') or 'sin sector'} | "
+        f"GPS {item.get('latitud') or '-'}, {item.get('longitud') or '-'} "
+        f"+/- {item.get('precision_gps') or '-'} m | archivo: {item.get('nombre_archivo') or '-'}"
+    )
+
+def build_report_markdown(session, audios, photos, items):
+    logger.info("Generando texto del informe")
+    transcript_blocks = []
+    for audio in audios:
+        transcript_blocks.append(
+            "Audio {id} ({fecha}):\n{texto}".format(
+                id=audio.get("id", ""),
+                fecha=audio.get("fecha_hora") or "sin fecha",
+                texto=audio.get("transcript_text") or "Sin transcripcion disponible",
+            )
+        )
+
+    photo_lines = [
+        format_item_line(photo) + f" | link: {photo.get('storage_public_url') or 'sin link publico'}"
+        for photo in photos
+    ]
+    prompt = f"""
+Redacta un informe tecnico/profesional de consultoria agronomica para cliente.
+No inventes datos. Si falta informacion, escribir "No registrado en la recorrida".
+No interpretes fotos ni describas su contenido visual; las fotos son solo evidencia documental.
+Las recomendaciones deben basarse solo en lo dicho en los audios transcriptos.
+
+Estructura requerida:
+1. Titulo
+2. Datos generales
+3. Resumen ejecutivo
+4. Observaciones relevadas
+5. Evidencias fotograficas
+6. Audios transcriptos
+7. Recomendaciones / proximos pasos
+8. Anexo tecnico
+
+Recorrida:
+{json.dumps(session, ensure_ascii=False, indent=2)}
+
+Audios transcriptos:
+{chr(10).join(transcript_blocks) or "No registrado en la recorrida"}
+
+Fotos como evidencia, sin interpretacion:
+{chr(10).join(photo_lines) or "No registrado en la recorrida"}
+
+Listado completo de items:
+{chr(10).join(format_item_line(item) for item in items) or "No registrado en la recorrida"}
+"""
+    response = get_openai_client().chat.completions.create(
+        model=os.environ.get("FIELD_REPORT_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": "Sos un consultor agronomico profesional. Escribis claro, util y sin inventar datos."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return response.choices[0].message.content.strip()
+
+def markdown_summary(markdown_text):
+    for line in markdown_text.splitlines():
+        cleaned = line.strip().lstrip("#").strip()
+        if cleaned and not cleaned.lower().startswith("informe de recorrida"):
+            return cleaned[:1000]
+    return ""
+
+def add_markdown_to_doc(document, markdown_text):
+    for line in markdown_text.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("# "):
+            document.add_heading(text[2:].strip(), level=1)
+        elif text.startswith("## "):
+            document.add_heading(text[3:].strip(), level=2)
+        elif text.startswith("### "):
+            document.add_heading(text[4:].strip(), level=3)
+        elif text.startswith(("- ", "* ")):
+            document.add_paragraph(text[2:].strip(), style="List Bullet")
+        else:
+            document.add_paragraph(text)
+
+def add_photo_evidence_to_doc(document, photos, work_dir):
+    if not photos:
+        document.add_paragraph("No registrado en la recorrida.")
+        return
+
+    for index, photo in enumerate(photos, start=1):
+        document.add_heading(f"Foto {index}", level=3)
+        try:
+            photo_path = download_field_item_file(photo, work_dir, ".jpg")
+            document.add_picture(str(photo_path), width=Inches(5.8))
+        except Exception as e:
+            document.add_paragraph(f"No se pudo insertar la imagen: {e}")
+        table = document.add_table(rows=0, cols=2)
+        for label, value in [
+            ("fecha_hora", photo.get("fecha_hora") or "No registrado en la recorrida"),
+            ("campo", photo.get("campo") or "No registrado en la recorrida"),
+            ("sector", photo.get("sector") or "No registrado en la recorrida"),
+            ("latitud", photo.get("latitud") or "No registrado en la recorrida"),
+            ("longitud", photo.get("longitud") or "No registrado en la recorrida"),
+            ("precision GPS", photo.get("precision_gps") or "No registrado en la recorrida"),
+            ("archivo", photo.get("nombre_archivo") or "No registrado en la recorrida"),
+            ("link publico", photo.get("storage_public_url") or "No registrado en la recorrida"),
+        ]:
+            row = table.add_row().cells
+            row[0].text = label
+            row[1].text = str(value)
+
+def create_report_docx(session, items, audios, photos, markdown_text, output_path, work_dir):
+    logger.info("Creando DOCX")
+    document = DocxDocument()
+    title = f"Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or '')[:10]}"
+    document.add_heading(title, level=0)
+    document.add_heading("Datos generales", level=1)
+    table = document.add_table(rows=0, cols=2)
+    for label, value in [
+        ("Campo", session.get("campo") or "No registrado en la recorrida"),
+        ("Sector", session.get("sector") or "No registrado en la recorrida"),
+        ("Fecha de inicio", session.get("started_at") or "No registrado en la recorrida"),
+        ("Fecha de cierre", session.get("closed_at") or "No registrado en la recorrida"),
+        ("Cantidad de audios", len(audios)),
+        ("Cantidad de fotos", len(photos)),
+        ("Coordenadas principales", f"{session.get('latitud_inicio') or '-'}, {session.get('longitud_inicio') or '-'}"),
+    ]:
+        row = table.add_row().cells
+        row[0].text = label
+        row[1].text = str(value)
+
+    document.add_heading("Informe tecnico", level=1)
+    add_markdown_to_doc(document, markdown_text)
+
+    document.add_heading("Evidencias fotograficas", level=1)
+    document.add_paragraph("Las fotos se incluyen solo como evidencia. No fueron interpretadas por IA.")
+    add_photo_evidence_to_doc(document, photos, work_dir)
+
+    document.add_heading("Anexo tecnico", level=1)
+    item_table = document.add_table(rows=1, cols=6)
+    headers = ["tipo", "fecha_hora", "campo", "sector", "GPS", "archivo/link"]
+    for idx, header in enumerate(headers):
+        item_table.rows[0].cells[idx].text = header
+    for item in items:
+        row = item_table.add_row().cells
+        row[0].text = str(item.get("tipo") or "")
+        row[1].text = str(item.get("fecha_hora") or "")
+        row[2].text = str(item.get("campo") or "")
+        row[3].text = str(item.get("sector") or "")
+        row[4].text = f"{item.get('latitud') or '-'}, {item.get('longitud') or '-'} +/- {item.get('precision_gps') or '-'}"
+        row[5].text = str(item.get("storage_public_url") or item.get("nombre_archivo") or "")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    document.save(output_path)
+    return output_path
+
+def generate_field_report(session_id):
+    if not supabase_database_configured():
+        raise RuntimeError("Supabase Database no configurado")
+
+    logger.info(f"Iniciando generacion de informe: {session_id}")
+    session = get_field_session_from_supabase(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="recorrida no encontrada")
+
+    items = [item for item in (list_field_items_from_supabase() or []) if item.get("session_id") == session_id]
+    items.sort(key=lambda item: item.get("fecha_hora") or "")
+    audios = [item for item in items if item.get("tipo") == "audio"]
+    photos = [item for item in items if item.get("tipo") == "foto"]
+    logger.info(f"Audios encontrados: {len(audios)}")
+    logger.info(f"Fotos encontradas: {len(photos)}")
+
+    report_id = uuid.uuid4().hex
+    now = datetime.utcnow().isoformat() + "Z"
+    title = f"Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or now)[:10]}"
+    work_dir = DATA_DIR / "field_reports" / session_id / report_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        upsert_field_report({
+            "id": report_id,
+            "session_id": session_id,
+            "estado": "generando",
+            "titulo": title,
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        for audio in audios:
+            transcribe_field_audio(audio, work_dir)
+
+        markdown_text = build_report_markdown(session, audios, photos, items)
+        summary = markdown_summary(markdown_text)
+        docx_name = f"informe_recorrida_{(session.get('started_at') or now)[:10]}_{report_id}.docx"
+        docx_path = work_dir / docx_name
+        create_report_docx(session, items, audios, photos, markdown_text, docx_path, work_dir)
+
+        campo_segment = safe_storage_segment(session.get("campo"), "sin-campo")
+        storage_path = f"reports/{campo_segment}/{session_id}/{docx_name}"
+        logger.info(f"Subiendo DOCX a Supabase: {storage_path}")
+        supabase_file = upload_field_file_to_supabase(
+            docx_path,
+            storage_path,
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        report = {
+            "id": report_id,
+            "session_id": session_id,
+            "estado": "done",
+            "titulo": title,
+            "resumen": summary,
+            "informe_markdown": markdown_text,
+            "docx_storage_path": supabase_file.get("path", ""),
+            "docx_public_url": supabase_file.get("public_url", ""),
+            "error": None,
+            "created_at": now,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        upsert_field_report(report)
+        logger.info(f"Informe OK: {report_id}")
+        return report
+    except Exception as e:
+        error_report = {
+            "id": report_id,
+            "session_id": session_id,
+            "estado": "error",
+            "titulo": title,
+            "error": str(e),
+            "created_at": now,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        }
+        try:
+            upsert_field_report(error_report)
+        except Exception:
+            pass
+        logger.error(f"Informe ERROR: {e}")
+        raise
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -1531,6 +1901,48 @@ async def list_field_sessions():
     for session in sessions:
         session["items_count"] = item_counts.get(session.get("id"), 0)
     return {"ok": True, "sessions": sessions, "source": "local"}
+
+@fastapi_app.post("/api/field-sessions/{session_id}/generate-report")
+async def generate_field_session_report(session_id: str):
+    try:
+        report = generate_field_report(session_id)
+        return {"ok": True, "report": report}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Informe ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+
+@fastapi_app.get("/api/field-sessions/{session_id}/report")
+async def get_field_session_report(session_id: str):
+    session = None
+    try:
+        session = get_field_session_from_supabase(session_id)
+        report = get_field_report_from_supabase(session_id)
+        return {
+            "ok": True,
+            "session": session,
+            "report": report,
+            "docx_public_url": report.get("docx_public_url") if report else "",
+            "informe_markdown": report.get("informe_markdown") if report else "",
+            "estado": report.get("estado") if report else "sin informe",
+            "error": report.get("error") if report else "",
+            "source": "supabase" if supabase_database_configured() else "local",
+        }
+    except Exception as e:
+        logger.error(f"Informe ERROR: {e}")
+
+    session = session or load_local_session(session_id)
+    return {
+        "ok": True,
+        "session": session,
+        "report": None,
+        "docx_public_url": "",
+        "informe_markdown": "",
+        "estado": "sin informe",
+        "error": "",
+        "source": "local",
+    }
 
 @fastapi_app.get("/api/field-sessions/{session_id}")
 async def get_field_session(session_id: str):

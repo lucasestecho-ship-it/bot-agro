@@ -372,6 +372,9 @@ async function renderSessions() {
 
     for (const session of sessions) {
       const li = document.createElement("li");
+      const report = await fetchSessionReport(session.id);
+      const reportState = report.estado || "sin informe";
+      const reportMarkdown = report.informe_markdown || "";
       li.innerHTML = `
         <div class="item-main">
           <span>${session.nombre || "Recorrida sin nombre"}</span>
@@ -380,14 +383,62 @@ async function renderSessions() {
         <div class="item-meta">${session.campo || "sin campo"} - ${session.sector || "sin sector"}</div>
         <div class="item-meta">Inicio: ${formatServerDate(session.started_at)}${session.closed_at ? ` - Cierre: ${formatServerDate(session.closed_at)}` : ""}</div>
         <div class="item-meta">Items: ${session.items_count ?? 0}</div>
+        <div class="item-meta">Informe: ${reportState}${report.error ? ` - ${report.error}` : ""}</div>
+        <div class="session-actions">
+          <button class="generate-report-button" type="button" data-session-id="${session.id}">Generar informe</button>
+          ${report.docx_public_url ? `<a class="button-link" href="${report.docx_public_url}" target="_blank" rel="noopener">Abrir informe DOCX</a>` : ""}
+        </div>
+        ${reportMarkdown ? `<pre class="report-preview">${reportMarkdown.slice(0, 1200)}</pre>` : ""}
       `;
       sessionsList.appendChild(li);
+      const button = li.querySelector(".generate-report-button");
+      if (button) {
+        button.addEventListener("click", () => generateReportForSession(session.id, button));
+      }
     }
   } catch {
     const error = document.createElement("li");
     error.textContent = "No pude cargar las recorridas.";
     sessionsList.appendChild(error);
   }
+}
+
+async function fetchSessionReport(sessionId) {
+  try {
+    const response = await fetch(`/api/field-sessions/${encodeURIComponent(sessionId)}/report`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    return {
+      estado: data.estado || "sin informe",
+      docx_public_url: data.docx_public_url || "",
+      informe_markdown: data.informe_markdown || "",
+      error: data.error || "",
+    };
+  } catch {
+    return { estado: "sin informe", docx_public_url: "", informe_markdown: "", error: "" };
+  }
+}
+
+async function generateReportForSession(sessionId, button) {
+  if (!navigator.onLine) {
+    appendDebug("No se puede generar informe sin conexion.");
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "Generando...";
+  appendDebug(`Generando informe de recorrida ${sessionId}...`);
+  try {
+    const response = await fetch(`/api/field-sessions/${encodeURIComponent(sessionId)}/generate-report`, {
+      method: "POST",
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || data.detail || `HTTP ${response.status}`);
+    appendDebug("Informe listo.");
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    appendDebug(`Informe ERROR: ${message}`);
+  }
+  await renderSessions();
 }
 
 async function uploadLocalItem(item) {
