@@ -88,6 +88,103 @@ def safe_storage_segment(value, fallback):
     text = text.strip("-._")
     return text or fallback
 
+def field_metadata_to_item(metadata):
+    stored_file = metadata.get("stored_file") or ""
+    filename = Path(stored_file).name if stored_file else metadata.get("nombre_archivo", "")
+    return {
+        "id": metadata.get("id", ""),
+        "tipo": metadata.get("item_type") or metadata.get("tipo", ""),
+        "campo": metadata.get("campo", ""),
+        "sector": metadata.get("sector", ""),
+        "fecha_hora": metadata.get("captured_at") or metadata.get("fecha_hora", ""),
+        "latitud": metadata.get("latitude") or metadata.get("latitud", ""),
+        "longitud": metadata.get("longitude") or metadata.get("longitud", ""),
+        "precision_gps": metadata.get("gps_accuracy") or metadata.get("precision_gps", ""),
+        "nombre_archivo": filename,
+        "estado": metadata.get("estado", "subido"),
+        "storage_status": metadata.get("storage_status", ""),
+        "storage_provider": metadata.get("storage_provider", ""),
+        "storage_path": metadata.get("storage_path", ""),
+        "storage_public_url": metadata.get("storage_public_url", ""),
+        "storage_error": metadata.get("storage_error", ""),
+        "drive_file_id": metadata.get("drive_file_id", ""),
+        "drive_link": metadata.get("drive_web_link", ""),
+        "drive_error": metadata.get("drive_error", ""),
+    }
+
+def supabase_database_configured():
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+def supabase_headers(prefer=None):
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+def clean_db_value(value):
+    return value if value not in ("", None) else None
+
+def upsert_field_item_metadata(metadata):
+    if not supabase_database_configured():
+        return False
+
+    item = field_metadata_to_item(metadata)
+    payload = {
+        "id": item["id"],
+        "tipo": item["tipo"],
+        "campo": item["campo"],
+        "sector": item["sector"],
+        "fecha_hora": clean_db_value(item["fecha_hora"]),
+        "latitud": clean_db_value(item["latitud"]),
+        "longitud": clean_db_value(item["longitud"]),
+        "precision_gps": clean_db_value(item["precision_gps"]),
+        "nombre_archivo": item["nombre_archivo"],
+        "estado": item["estado"],
+        "storage_status": item["storage_status"],
+        "storage_provider": item["storage_provider"],
+        "storage_path": item["storage_path"],
+        "storage_public_url": item["storage_public_url"],
+        "storage_error": item["storage_error"],
+        "created_at": clean_db_value(metadata.get("received_at")),
+    }
+    url = f"{SUPABASE_URL}/rest/v1/field_items?on_conflict=id"
+    logger.info("Guardando metadata en Supabase")
+    response = requests.post(
+        url,
+        headers=supabase_headers("resolution=merge-duplicates,return=minimal"),
+        json=payload,
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(response.text)
+    logger.info(f"Metadata OK: {item['id']}")
+    return True
+
+def list_field_items_from_supabase():
+    if not supabase_database_configured():
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/field_items"
+        "?select=id,tipo,campo,sector,fecha_hora,latitud,longitud,precision_gps,"
+        "nombre_archivo,estado,storage_status,storage_provider,storage_path,"
+        "storage_public_url,storage_error,created_at"
+        "&order=fecha_hora.desc.nullslast"
+    )
+    response = requests.get(url, headers=supabase_headers(), timeout=30)
+    if not response.ok:
+        raise RuntimeError(response.text)
+    items = response.json()
+    for item in items:
+        item.setdefault("drive_file_id", "")
+        item.setdefault("drive_link", "")
+        item.setdefault("drive_error", "")
+    return items
+
 def get_superficie_from_hoja2(lote):
     try:
         hoja2 = get_google_sheet().worksheet("Hoja 2")
@@ -1210,6 +1307,13 @@ async def campo():
 
 @fastapi_app.get("/api/field-items")
 async def list_field_items():
+    try:
+        supabase_items = list_field_items_from_supabase()
+        if supabase_items is not None:
+            return {"ok": True, "items": supabase_items, "source": "supabase"}
+    except Exception as e:
+        logger.error(f"Metadata ERROR: {e}")
+
     items = []
     if FIELD_ITEMS_DIR.exists():
         for metadata_path in FIELD_ITEMS_DIR.rglob("*.json"):
@@ -1219,31 +1323,13 @@ async def list_field_items():
                 logger.warning(f"No se pudo leer metadata de campo {metadata_path}: {e}")
                 continue
 
-            stored_file = metadata.get("stored_file") or ""
-            filename = Path(stored_file).name if stored_file else metadata_path.name.replace(".json", "")
-            items.append({
-                "id": metadata.get("id", ""),
-                "tipo": metadata.get("item_type", ""),
-                "campo": metadata.get("campo", ""),
-                "sector": metadata.get("sector", ""),
-                "fecha_hora": metadata.get("captured_at", ""),
-                "latitud": metadata.get("latitude", ""),
-                "longitud": metadata.get("longitude", ""),
-                "precision_gps": metadata.get("gps_accuracy", ""),
-                "nombre_archivo": filename,
-                "estado": "subido",
-                "storage_status": metadata.get("storage_status", ""),
-                "storage_provider": metadata.get("storage_provider", ""),
-                "storage_path": metadata.get("storage_path", ""),
-                "storage_public_url": metadata.get("storage_public_url", ""),
-                "storage_error": metadata.get("storage_error", ""),
-                "drive_file_id": metadata.get("drive_file_id", ""),
-                "drive_link": metadata.get("drive_web_link", ""),
-                "drive_error": metadata.get("drive_error", ""),
-            })
+            item = field_metadata_to_item(metadata)
+            if not item["nombre_archivo"]:
+                item["nombre_archivo"] = metadata_path.name.replace(".json", "")
+            items.append(item)
 
     items.sort(key=lambda item: item.get("fecha_hora") or "", reverse=True)
-    return {"ok": True, "items": items}
+    return {"ok": True, "items": items, "source": "local"}
 
 @fastapi_app.post("/api/field-items")
 async def create_field_item(
@@ -1320,6 +1406,11 @@ async def create_field_item(
 
     metadata_path = file_path.with_suffix(file_path.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    try:
+        upsert_field_item_metadata(metadata)
+    except Exception as e:
+        logger.error(f"Metadata ERROR: {e}")
 
     return {"ok": True, "id": item_id}
 

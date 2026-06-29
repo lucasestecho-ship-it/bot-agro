@@ -67,6 +67,20 @@ Metadata guardada:
 
 `SUPABASE_SERVICE_ROLE_KEY` nunca debe exponerse en frontend; solo va como variable de entorno del backend en Render.
 
+## Supabase Database para metadata
+
+Para que la metadata no dependa de `/tmp` en Render, crear la tabla `public.field_items` en Supabase con estas columnas:
+
+```text
+id, tipo, campo, sector, fecha_hora, latitud, longitud, precision_gps,
+nombre_archivo, estado, storage_status, storage_provider, storage_path,
+storage_public_url, storage_error, created_at
+```
+
+El backend usa las mismas variables `SUPABASE_URL` y `SUPABASE_SERVICE_ROLE_KEY`. Despues de recibir el archivo y subirlo a Storage, hace upsert en `public.field_items` usando `id` como primary key.
+
+`GET /api/field-items` lee primero desde Supabase Database. Si la DB falla o no esta configurada, vuelve al fallback local en `DATA_DIR/field_items`.
+
 ## Variables opcionales del bot
 
 Necesarias si se habilita Telegram o las funciones del bot:
@@ -103,4 +117,5 @@ Tambien se incluye `render.yaml` con:
 - `/campo` devuelve `static/index.html`.
 - `POST /api/field-items` guarda el archivo y un `.json` de metadata en `DATA_DIR/field_items/YYYY-MM-DD/`.
 - Si Supabase esta configurado, sube el archivo al bucket y guarda metadata de storage.
+- Si Supabase Database esta configurado, guarda o actualiza la metadata en `public.field_items`.
 - Las fotos se guardan solo como evidencia con metadata. No se procesan con IA desde `/campo`.
