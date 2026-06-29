@@ -6,6 +6,7 @@ import base64
 import mimetypes
 import shutil
 import uuid
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 import requests
@@ -80,6 +81,12 @@ def upload_field_file_to_supabase(file_path, storage_path, content_type=None):
     response.raise_for_status()
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_path}"
     return {"path": storage_path, "public_url": public_url}
+
+def safe_storage_segment(value, fallback):
+    text = (value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9._-]+", "-", text)
+    text = text.strip("-._")
+    return text or fallback
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -1232,6 +1239,7 @@ async def list_field_items():
                 "storage_error": metadata.get("storage_error", ""),
                 "drive_file_id": metadata.get("drive_file_id", ""),
                 "drive_link": metadata.get("drive_web_link", ""),
+                "drive_error": metadata.get("drive_error", ""),
             })
 
     items.sort(key=lambda item: item.get("fecha_hora") or "", reverse=True)
@@ -1289,7 +1297,9 @@ async def create_field_item(
     }
 
     if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET:
-        storage_path = f"{now.strftime('%Y-%m-%d')}/{stored_filename}"
+        campo_segment = safe_storage_segment(campo, "sin-campo")
+        sector_segment = safe_storage_segment(sector, "sin-sector")
+        storage_path = f"{campo_segment}/{sector_segment}/{now.strftime('%Y-%m-%d')}/{stored_filename}"
         try:
             supabase_file = upload_field_file_to_supabase(
                 file_path,
@@ -1306,7 +1316,7 @@ async def create_field_item(
             metadata["storage_provider"] = "supabase"
             metadata["storage_path"] = storage_path
             metadata["storage_error"] = str(e)
-            logger.error(f"Error Supabase: {e}")
+            logger.error(f"Supabase ERROR: {e}")
 
     metadata_path = file_path.with_suffix(file_path.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")

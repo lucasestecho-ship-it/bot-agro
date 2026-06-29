@@ -204,6 +204,8 @@ async function renderServerItems() {
         : "sin GPS";
       const accuracy = item.precision_gps ? ` - precision ${Math.round(Number(item.precision_gps))} m` : "";
       const storageLink = item.storage_public_url || item.drive_link || "";
+      const storageStatus = item.storage_status || "local_only";
+      const storageProvider = item.storage_provider ? ` (${item.storage_provider})` : "";
       li.innerHTML = `
         <div class="item-main">
           <span>${item.tipo === "audio" ? "Audio" : "Foto"} - ${item.campo || "sin campo"}</span>
@@ -211,7 +213,7 @@ async function renderServerItems() {
         </div>
         <div class="item-meta">${item.sector || "sin sector"} - ${formatServerDate(item.fecha_hora)} - ${gps}${accuracy}</div>
         <div class="item-meta">${item.nombre_archivo || ""}</div>
-        <div class="item-meta">${item.storage_status || "local_only"}${storageLink ? ` - <a href="${storageLink}" target="_blank" rel="noopener">archivo</a>` : ""}</div>
+        <div class="item-meta">${storageStatus}${storageProvider}${storageLink ? ` - <a href="${storageLink}" target="_blank" rel="noopener">archivo</a>` : ""}</div>
         ${item.storage_error ? `<div class="item-meta">Storage error: ${item.storage_error}</div>` : ""}
       `;
       serverItemsList.appendChild(li);

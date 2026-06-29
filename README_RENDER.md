@@ -35,6 +35,12 @@ ENABLE_TELEGRAM_BOT=false
 
 Si `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` y `SUPABASE_BUCKET` estan configuradas, cada audio o foto recibido por `POST /api/field-items` se guarda primero en `DATA_DIR` y despues se sube a Supabase Storage.
 
+La ruta dentro del bucket usa campo y sector sanitizados:
+
+```text
+campo/sector/YYYY-MM-DD/nombre_archivo
+```
+
 Pasos:
 
 1. Crear un proyecto en Supabase.
@@ -58,6 +64,8 @@ Metadata guardada:
 - `storage_public_url`
 - `storage_status=local_only` si faltan variables Supabase
 - `storage_status=supabase_error` y `storage_error` si falla, conservando el archivo local
+
+`SUPABASE_SERVICE_ROLE_KEY` nunca debe exponerse en frontend; solo va como variable de entorno del backend en Render.
 
 ## Variables opcionales del bot
 

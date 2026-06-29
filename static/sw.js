@@ -1,4 +1,4 @@
-const CACHE_NAME = "campo-pwa-v5";
+const CACHE_NAME = "campo-pwa-v6";
 const ASSETS = [
   "/campo",
   "/static/campo.css",
