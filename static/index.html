@@ -27,9 +27,24 @@
         Sector opcional
         <input id="sectorInput" autocomplete="off" placeholder="Ej: lote 4, manga, bajo">
       </label>
+      <label>
+        Nombre de recorrida
+        <input id="sessionNameInput" autocomplete="off" placeholder="Ej: recorrida tarde, control aguadas">
+      </label>
       <div class="gps-row">
         <span id="gpsStatus">GPS pendiente</span>
         <button id="gpsButton" type="button">Actualizar GPS</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="list-header">
+        <h2>Recorrida activa</h2>
+        <span id="activeSessionStatus" class="item-meta">Sin recorrida activa</span>
+      </div>
+      <div class="session-actions">
+        <button id="startSessionButton" type="button">Iniciar recorrida</button>
+        <button id="closeSessionButton" class="secondary-button" type="button">Cerrar recorrida</button>
       </div>
     </section>
 
@@ -63,6 +78,14 @@
         <button id="refreshServerButton" type="button">Actualizar</button>
       </div>
       <ul id="serverItemsList" class="items"></ul>
+    </section>
+
+    <section class="panel">
+      <div class="list-header">
+        <h2>Recorridas</h2>
+        <button id="refreshSessionsButton" type="button">Actualizar</button>
+      </div>
+      <ul id="sessionsList" class="items"></ul>
     </section>
   </main>
 

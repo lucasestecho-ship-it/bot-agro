@@ -1,17 +1,25 @@
 const DB_NAME = "campo-pwa";
 const STORE_NAME = "items";
+const ACTIVE_SESSION_KEY = "campo.activeSession";
+const SESSIONS_KEY = "campo.sessions";
 const campoInput = document.getElementById("campoInput");
 const sectorInput = document.getElementById("sectorInput");
+const sessionNameInput = document.getElementById("sessionNameInput");
 const talkButton = document.getElementById("talkButton");
 const photoInput = document.getElementById("photoInput");
 const itemsList = document.getElementById("itemsList");
 const serverItemsList = document.getElementById("serverItemsList");
+const sessionsList = document.getElementById("sessionsList");
 const connectionStatus = document.getElementById("connectionStatus");
 const gpsStatus = document.getElementById("gpsStatus");
 const gpsButton = document.getElementById("gpsButton");
 const syncButton = document.getElementById("syncButton");
 const forceSyncButton = document.getElementById("forceSyncButton");
 const refreshServerButton = document.getElementById("refreshServerButton");
+const refreshSessionsButton = document.getElementById("refreshSessionsButton");
+const startSessionButton = document.getElementById("startSessionButton");
+const closeSessionButton = document.getElementById("closeSessionButton");
+const activeSessionStatus = document.getElementById("activeSessionStatus");
 const debugLog = document.getElementById("debugLog");
 
 let dbPromise;
@@ -62,6 +70,111 @@ function normalizeLocalItem(item) {
   return item;
 }
 
+function readJsonStorage(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function getLocalSessions() {
+  return readJsonStorage(SESSIONS_KEY, []);
+}
+
+function saveLocalSessions(sessions) {
+  localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+}
+
+function getActiveSession() {
+  return readJsonStorage(ACTIVE_SESSION_KEY, null);
+}
+
+function saveActiveSession(session) {
+  if (session) {
+    localStorage.setItem(ACTIVE_SESSION_KEY, JSON.stringify(session));
+  } else {
+    localStorage.removeItem(ACTIVE_SESSION_KEY);
+  }
+}
+
+function upsertLocalSession(session) {
+  const sessions = getLocalSessions();
+  const index = sessions.findIndex((entry) => entry.id === session.id);
+  if (index >= 0) {
+    sessions[index] = { ...sessions[index], ...session };
+  } else {
+    sessions.push(session);
+  }
+  saveLocalSessions(sessions);
+}
+
+function currentSessionPayload(session) {
+  return {
+    id: session.id,
+    nombre: session.nombre,
+    campo: session.campo,
+    sector: session.sector,
+    estado: session.estado,
+    started_at: session.startedAt,
+    closed_at: session.closedAt || null,
+    latitud_inicio: session.latitudInicio,
+    longitud_inicio: session.longitudInicio,
+    precision_gps_inicio: session.precisionGpsInicio,
+    notas: session.notas || "",
+    created_at: session.createdAt,
+  };
+}
+
+async function syncSession(session) {
+  if (!session || !navigator.onLine) return false;
+  try {
+    appendDebug(`Sincronizando recorrida ${session.nombre || session.id}...`);
+    const response = await fetch("/api/field-sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(currentSessionPayload(session)),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.detail || "respuesta sin ok true");
+
+    let updated = { ...session, syncStatus: "sincronizada", errorMessage: "" };
+    if (updated.estado === "cerrada" && updated.closedAt) {
+      const closeResponse = await fetch(`/api/field-sessions/${encodeURIComponent(updated.id)}/close`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ closed_at: updated.closedAt }),
+      });
+      if (!closeResponse.ok) throw new Error(`HTTP ${closeResponse.status}`);
+      updated.syncStatus = "cerrada sincronizada";
+    }
+    upsertLocalSession(updated);
+    if (getActiveSession()?.id === updated.id) saveActiveSession(updated);
+    appendDebug("Recorrida sincronizada.");
+    return true;
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    const updated = { ...session, syncStatus: "error", errorMessage: message };
+    upsertLocalSession(updated);
+    if (getActiveSession()?.id === updated.id) saveActiveSession(updated);
+    appendDebug(`Recorrida ERROR: ${message}`);
+    return false;
+  }
+}
+
+async function syncLocalSessions() {
+  if (!navigator.onLine) return;
+  const sessions = getLocalSessions().filter((session) => {
+    if (session.estado === "cerrada") return session.syncStatus !== "cerrada sincronizada";
+    return session.syncStatus !== "sincronizada";
+  });
+  for (const session of sessions) {
+    await syncSession(session);
+  }
+}
+
 function appendDebug(message) {
   if (!debugLog) return;
   const li = document.createElement("li");
@@ -72,11 +185,13 @@ function appendDebug(message) {
 function persistInputs() {
   localStorage.setItem("campo.activo", campoInput.value);
   localStorage.setItem("campo.sector", sectorInput.value);
+  if (sessionNameInput) localStorage.setItem("campo.sessionName", sessionNameInput.value);
 }
 
 function loadInputs() {
   campoInput.value = localStorage.getItem("campo.activo") || "";
   sectorInput.value = localStorage.getItem("campo.sector") || "";
+  if (sessionNameInput) sessionNameInput.value = localStorage.getItem("campo.sessionName") || "";
 }
 
 function setConnectionStatus() {
@@ -121,6 +236,7 @@ function buildItem(type, blob, filename) {
 
   const coords = currentPosition ? currentPosition.coords : {};
   const now = new Date();
+  const activeSession = getActiveSession();
   return {
     id: crypto.randomUUID(),
     type,
@@ -134,6 +250,8 @@ function buildItem(type, blob, filename) {
     filename,
     contentType: blob.type,
     blob,
+    sessionId: activeSession ? activeSession.id : "",
+    sessionName: activeSession ? activeSession.nombre : "",
   };
 }
 
@@ -167,6 +285,7 @@ async function renderItems() {
         <span class="pill ${statusClass}">${item.status}</span>
       </div>
       <div class="item-meta">${item.sector || "sin sector"} - ${new Date(item.createdAt).toLocaleString()} - ${gps}</div>
+      ${item.sessionId ? `<div class="item-meta">Recorrida: ${item.sessionName || item.sessionId}</div>` : ""}
       ${item.errorMessage ? `<div class="item-meta">Error: ${item.errorMessage}</div>` : ""}
     `;
     itemsList.appendChild(li);
@@ -212,6 +331,7 @@ async function renderServerItems() {
           <span class="pill subido">${item.estado || "subido"}</span>
         </div>
         <div class="item-meta">${item.sector || "sin sector"} - ${formatServerDate(item.fecha_hora)} - ${gps}${accuracy}</div>
+        ${item.session_id ? `<div class="item-meta">Recorrida: ${item.session_nombre || item.session_id} (${item.session_id})</div>` : ""}
         <div class="item-meta">${item.nombre_archivo || ""}</div>
         <div class="item-meta">${storageStatus}${storageProvider}${storageLink ? ` - <a href="${storageLink}" target="_blank" rel="noopener">archivo</a>` : ""}</div>
         ${item.storage_error ? `<div class="item-meta">Storage error: ${item.storage_error}</div>` : ""}
@@ -225,7 +345,57 @@ async function renderServerItems() {
   }
 }
 
+function renderActiveSession() {
+  const session = getActiveSession();
+  if (!activeSessionStatus) return;
+  if (!session) {
+    activeSessionStatus.textContent = "Sin recorrida activa";
+    return;
+  }
+  activeSessionStatus.textContent = `Recorrida activa: ${session.nombre || session.id}`;
+}
+
+async function renderSessions() {
+  if (!sessionsList) return;
+  sessionsList.innerHTML = "";
+  try {
+    const response = await fetch("/api/field-sessions");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const sessions = data.sessions || [];
+    if (!sessions.length) {
+      const empty = document.createElement("li");
+      empty.textContent = "Sin recorridas subidas.";
+      sessionsList.appendChild(empty);
+      return;
+    }
+
+    for (const session of sessions) {
+      const li = document.createElement("li");
+      li.innerHTML = `
+        <div class="item-main">
+          <span>${session.nombre || "Recorrida sin nombre"}</span>
+          <span class="pill ${session.estado === "cerrada" ? "subido" : "subiendo"}">${session.estado || "abierta"}</span>
+        </div>
+        <div class="item-meta">${session.campo || "sin campo"} - ${session.sector || "sin sector"}</div>
+        <div class="item-meta">Inicio: ${formatServerDate(session.started_at)}${session.closed_at ? ` - Cierre: ${formatServerDate(session.closed_at)}` : ""}</div>
+        <div class="item-meta">Items: ${session.items_count ?? 0}</div>
+      `;
+      sessionsList.appendChild(li);
+    }
+  } catch {
+    const error = document.createElement("li");
+    error.textContent = "No pude cargar las recorridas.";
+    sessionsList.appendChild(error);
+  }
+}
+
 async function uploadLocalItem(item) {
+  if (item.sessionId) {
+    const session = getLocalSessions().find((entry) => entry.id === item.sessionId);
+    if (session) await syncSession(session);
+  }
+
   appendDebug(`Intentando subir item ${item.id}...`);
   item.status = "subiendo";
   item.errorMessage = "";
@@ -241,6 +411,7 @@ async function uploadLocalItem(item) {
   form.append("longitude", item.longitude);
   form.append("gps_accuracy", item.gpsAccuracy);
   form.append("client_id", item.id);
+  form.append("session_id", item.sessionId || "");
   form.append("file", item.blob, item.filename);
 
   try {
@@ -272,6 +443,7 @@ async function syncPending(options = {}) {
     appendDebug("Error al subir: sin conexión");
     return;
   }
+  await syncLocalSessions();
   const items = await getItems();
   const shouldForce = Boolean(options.force);
   const uploadable = items.filter((entry) => {
@@ -289,6 +461,60 @@ async function syncPending(options = {}) {
   }
   await renderItems();
   await renderServerItems();
+  await renderSessions();
+}
+
+async function startFieldSession() {
+  const campo = requireCampo();
+  if (!campo) return;
+  const coords = currentPosition ? currentPosition.coords : {};
+  const now = new Date().toISOString();
+  const nombre = (sessionNameInput ? sessionNameInput.value.trim() : "") || `Recorrida ${new Date().toLocaleString()}`;
+  const session = {
+    id: crypto.randomUUID(),
+    nombre,
+    campo,
+    sector: sectorInput.value.trim(),
+    estado: "abierta",
+    startedAt: now,
+    closedAt: "",
+    latitudInicio: coords.latitude ?? "",
+    longitudInicio: coords.longitude ?? "",
+    precisionGpsInicio: coords.accuracy ?? "",
+    notas: "",
+    createdAt: now,
+    syncStatus: "pendiente",
+  };
+  saveActiveSession(session);
+  upsertLocalSession(session);
+  renderActiveSession();
+  appendDebug(`Recorrida iniciada: ${nombre}`);
+  if (navigator.onLine) {
+    await syncSession(session);
+    await renderSessions();
+  }
+}
+
+async function closeFieldSession() {
+  const session = getActiveSession();
+  if (!session) {
+    appendDebug("No hay recorrida activa para cerrar.");
+    return;
+  }
+  const closed = {
+    ...session,
+    estado: "cerrada",
+    closedAt: new Date().toISOString(),
+    syncStatus: "cerrada pendiente",
+  };
+  saveActiveSession(null);
+  upsertLocalSession(closed);
+  renderActiveSession();
+  appendDebug(`Recorrida cerrada: ${closed.nombre || closed.id}`);
+  if (navigator.onLine) {
+    await syncSession(closed);
+    await renderSessions();
+  }
 }
 
 async function startRecording() {
@@ -336,13 +562,25 @@ photoInput.addEventListener("change", async () => {
 
 campoInput.addEventListener("input", persistInputs);
 sectorInput.addEventListener("input", persistInputs);
+if (sessionNameInput) {
+  sessionNameInput.addEventListener("input", persistInputs);
+}
 gpsButton.addEventListener("click", refreshGps);
 syncButton.addEventListener("click", syncPending);
+if (startSessionButton) {
+  startSessionButton.addEventListener("click", startFieldSession);
+}
+if (closeSessionButton) {
+  closeSessionButton.addEventListener("click", closeFieldSession);
+}
 if (forceSyncButton) {
   forceSyncButton.addEventListener("click", () => syncPending({ force: true }));
 }
 if (refreshServerButton) {
   refreshServerButton.addEventListener("click", renderServerItems);
+}
+if (refreshSessionsButton) {
+  refreshSessionsButton.addEventListener("click", renderSessions);
 }
 window.addEventListener("online", () => {
   setConnectionStatus();
@@ -356,6 +594,8 @@ if ("serviceWorker" in navigator) {
 
 loadInputs();
 setConnectionStatus();
+renderActiveSession();
 refreshGps();
 renderItems();
 renderServerItems();
+renderSessions();

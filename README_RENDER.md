@@ -81,6 +81,36 @@ El backend usa las mismas variables `SUPABASE_URL` y `SUPABASE_SERVICE_ROLE_KEY`
 
 `GET /api/field-items` lee primero desde Supabase Database. Si la DB falla o no esta configurada, vuelve al fallback local en `DATA_DIR/field_items`.
 
+### SQL para recorridas
+
+Ejecutar en Supabase SQL Editor:
+
+```sql
+create table if not exists public.field_sessions (
+  id text primary key,
+  nombre text,
+  campo text,
+  sector text,
+  estado text,
+  started_at timestamptz,
+  closed_at timestamptz,
+  latitud_inicio double precision,
+  longitud_inicio double precision,
+  precision_gps_inicio double precision,
+  notas text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table public.field_items
+add column if not exists session_id text;
+
+create index if not exists idx_field_items_session_id
+on public.field_items (session_id);
+```
+
+Los items viejos pueden quedar con `session_id` en `null`. La app sigue listandolos igual.
+
 ## Variables opcionales del bot
 
 Necesarias si se habilita Telegram o las funciones del bot:

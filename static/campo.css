@@ -128,6 +128,17 @@ button,
   background: #6a5842;
 }
 
+.session-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.session-actions .secondary-button {
+  margin-top: 0;
+}
+
 .actions {
   display: grid;
   grid-template-columns: 1fr 132px;
@@ -231,5 +242,9 @@ button,
 
   .photo-button {
     min-height: 72px;
+  }
+
+  .session-actions {
+    grid-template-columns: 1fr;
   }
 }

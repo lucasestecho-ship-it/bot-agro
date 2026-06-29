@@ -10,7 +10,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from telegram import Update
@@ -37,6 +37,7 @@ SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET")
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "1144480769"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/campo_bot")).resolve()
 FIELD_ITEMS_DIR = DATA_DIR / "field_items"
+FIELD_SESSIONS_DIR = DATA_DIR / "field_sessions"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -107,6 +108,8 @@ def field_metadata_to_item(metadata):
         "storage_path": metadata.get("storage_path", ""),
         "storage_public_url": metadata.get("storage_public_url", ""),
         "storage_error": metadata.get("storage_error", ""),
+        "session_id": metadata.get("session_id", ""),
+        "session_nombre": metadata.get("session_nombre", ""),
         "drive_file_id": metadata.get("drive_file_id", ""),
         "drive_link": metadata.get("drive_web_link", ""),
         "drive_error": metadata.get("drive_error", ""),
@@ -127,6 +130,75 @@ def supabase_headers(prefer=None):
 
 def clean_db_value(value):
     return value if value not in ("", None) else None
+
+def local_session_path(session_id):
+    return FIELD_SESSIONS_DIR / f"{session_id}.json"
+
+def save_local_session(session):
+    FIELD_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    local_session_path(session["id"]).write_text(
+        json.dumps(session, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+def normalize_field_session(data):
+    now = datetime.utcnow().isoformat() + "Z"
+    session_id = (data.get("id") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="id es obligatorio")
+
+    return {
+        "id": session_id,
+        "nombre": (data.get("nombre") or "").strip(),
+        "campo": (data.get("campo") or "").strip(),
+        "sector": (data.get("sector") or "").strip(),
+        "estado": (data.get("estado") or "abierta").strip(),
+        "started_at": clean_db_value(data.get("started_at")),
+        "closed_at": clean_db_value(data.get("closed_at")),
+        "latitud_inicio": clean_db_value(data.get("latitud_inicio")),
+        "longitud_inicio": clean_db_value(data.get("longitud_inicio")),
+        "precision_gps_inicio": clean_db_value(data.get("precision_gps_inicio")),
+        "notas": (data.get("notas") or "").strip(),
+        "created_at": clean_db_value(data.get("created_at")) or now,
+        "updated_at": now,
+    }
+
+def load_local_sessions():
+    sessions = []
+    if FIELD_SESSIONS_DIR.exists():
+        for session_path in FIELD_SESSIONS_DIR.glob("*.json"):
+            try:
+                sessions.append(json.loads(session_path.read_text(encoding="utf-8")))
+            except Exception as e:
+                logger.warning(f"No se pudo leer recorrida {session_path}: {e}")
+    sessions.sort(key=lambda item: item.get("started_at") or "", reverse=True)
+    return sessions
+
+def load_local_session(session_id):
+    path = local_session_path(session_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def load_local_field_items():
+    items = []
+    session_names = {session.get("id"): session.get("nombre", "") for session in load_local_sessions()}
+    if FIELD_ITEMS_DIR.exists():
+        for metadata_path in FIELD_ITEMS_DIR.rglob("*.json"):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                logger.warning(f"No se pudo leer metadata de campo {metadata_path}: {e}")
+                continue
+
+            item = field_metadata_to_item(metadata)
+            if not item["nombre_archivo"]:
+                item["nombre_archivo"] = metadata_path.name.replace(".json", "")
+            item["session_nombre"] = item.get("session_nombre") or session_names.get(item.get("session_id"), "")
+            items.append(item)
+
+    items.sort(key=lambda item: item.get("fecha_hora") or "", reverse=True)
+    return items
 
 def upsert_field_item_metadata(metadata):
     if not supabase_database_configured():
@@ -149,6 +221,7 @@ def upsert_field_item_metadata(metadata):
         "storage_path": item["storage_path"],
         "storage_public_url": item["storage_public_url"],
         "storage_error": item["storage_error"],
+        "session_id": clean_db_value(item.get("session_id")),
         "created_at": clean_db_value(metadata.get("received_at")),
     }
     url = f"{SUPABASE_URL}/rest/v1/field_items?on_conflict=id"
@@ -172,18 +245,116 @@ def list_field_items_from_supabase():
         f"{SUPABASE_URL}/rest/v1/field_items"
         "?select=id,tipo,campo,sector,fecha_hora,latitud,longitud,precision_gps,"
         "nombre_archivo,estado,storage_status,storage_provider,storage_path,"
-        "storage_public_url,storage_error,created_at"
+        "storage_public_url,storage_error,session_id,created_at"
         "&order=fecha_hora.desc.nullslast"
     )
     response = requests.get(url, headers=supabase_headers(), timeout=30)
     if not response.ok:
         raise RuntimeError(response.text)
     items = response.json()
+    session_names = get_session_name_map_from_supabase()
     for item in items:
         item.setdefault("drive_file_id", "")
         item.setdefault("drive_link", "")
         item.setdefault("drive_error", "")
+        item.setdefault("session_id", "")
+        item["session_nombre"] = session_names.get(item.get("session_id") or "", "")
     return items
+
+def get_session_name_map_from_supabase():
+    if not supabase_database_configured():
+        return {}
+
+    url = f"{SUPABASE_URL}/rest/v1/field_sessions?select=id,nombre"
+    response = requests.get(url, headers=supabase_headers(), timeout=30)
+    if not response.ok:
+        return {}
+    return {row.get("id"): row.get("nombre", "") for row in response.json()}
+
+def upsert_field_session_to_supabase(session):
+    if not supabase_database_configured():
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/field_sessions?on_conflict=id"
+    logger.info(f"Creando recorrida: {session['id']}")
+    response = requests.post(
+        url,
+        headers=supabase_headers("resolution=merge-duplicates,return=minimal"),
+        json=session,
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(response.text)
+    logger.info(f"Recorrida OK: {session['id']}")
+    return True
+
+def close_field_session_in_supabase(session_id, closed_at):
+    if not supabase_database_configured():
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/field_sessions?id=eq.{session_id}"
+    logger.info(f"Cerrando recorrida: {session_id}")
+    response = requests.patch(
+        url,
+        headers=supabase_headers("return=minimal"),
+        json={
+            "estado": "cerrada",
+            "closed_at": closed_at,
+            "updated_at": datetime.utcnow().isoformat() + "Z",
+        },
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(response.text)
+    logger.info(f"Recorrida OK: {session_id}")
+    return True
+
+def count_items_by_session(items):
+    counts = {}
+    for item in items:
+        session_id = item.get("session_id") or ""
+        if session_id:
+            counts[session_id] = counts.get(session_id, 0) + 1
+    return counts
+
+def list_field_sessions_from_supabase():
+    if not supabase_database_configured():
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/field_sessions"
+        "?select=id,nombre,campo,sector,estado,started_at,closed_at,"
+        "latitud_inicio,longitud_inicio,precision_gps_inicio,notas,created_at,updated_at"
+        "&order=started_at.desc.nullslast"
+    )
+    response = requests.get(url, headers=supabase_headers(), timeout=30)
+    if not response.ok:
+        raise RuntimeError(response.text)
+    sessions = response.json()
+    try:
+        counts = count_items_by_session(list_field_items_from_supabase() or [])
+    except Exception:
+        counts = {}
+    for session in sessions:
+        session["items_count"] = counts.get(session.get("id"), 0)
+    return sessions
+
+def get_field_session_from_supabase(session_id):
+    if not supabase_database_configured():
+        return None
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/field_sessions"
+        f"?id=eq.{session_id}"
+        "&select=id,nombre,campo,sector,estado,started_at,closed_at,"
+        "latitud_inicio,longitud_inicio,precision_gps_inicio,notas,created_at,updated_at"
+        "&limit=1"
+    )
+    response = requests.get(url, headers=supabase_headers(), timeout=30)
+    if not response.ok:
+        raise RuntimeError(response.text)
+    rows = response.json()
+    return rows[0] if rows else None
 
 def get_superficie_from_hoja2(lote):
     try:
@@ -1305,6 +1476,83 @@ async def root():
 async def campo():
     return FileResponse(STATIC_DIR / "index.html")
 
+@fastapi_app.post("/api/field-sessions")
+async def create_field_session(payload: dict = Body(...)):
+    session = normalize_field_session(payload)
+    logger.info(f"Creando recorrida: {session['id']}")
+    save_local_session(session)
+
+    try:
+        upsert_field_session_to_supabase(session)
+    except Exception as e:
+        logger.error(f"Recorrida ERROR: {e}")
+
+    return {"ok": True, "id": session["id"]}
+
+@fastapi_app.post("/api/field-sessions/{session_id}/close")
+async def close_field_session(session_id: str, payload: dict = Body(default={})):
+    closed_at = clean_db_value(payload.get("closed_at")) or datetime.utcnow().isoformat() + "Z"
+    logger.info(f"Cerrando recorrida: {session_id}")
+    session = load_local_session(session_id) or {
+        "id": session_id,
+        "nombre": "",
+        "campo": "",
+        "sector": "",
+        "started_at": None,
+        "latitud_inicio": None,
+        "longitud_inicio": None,
+        "precision_gps_inicio": None,
+        "notas": "",
+        "created_at": datetime.utcnow().isoformat() + "Z",
+    }
+    session["estado"] = "cerrada"
+    session["closed_at"] = closed_at
+    session["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    save_local_session(session)
+
+    try:
+        close_field_session_in_supabase(session_id, closed_at)
+    except Exception as e:
+        logger.error(f"Recorrida ERROR: {e}")
+
+    return {"ok": True, "id": session_id}
+
+@fastapi_app.get("/api/field-sessions")
+async def list_field_sessions():
+    try:
+        supabase_sessions = list_field_sessions_from_supabase()
+        if supabase_sessions is not None:
+            return {"ok": True, "sessions": supabase_sessions, "source": "supabase"}
+    except Exception as e:
+        logger.error(f"Recorrida ERROR: {e}")
+
+    sessions = load_local_sessions()
+    item_counts = count_items_by_session(load_local_field_items())
+    for session in sessions:
+        session["items_count"] = item_counts.get(session.get("id"), 0)
+    return {"ok": True, "sessions": sessions, "source": "local"}
+
+@fastapi_app.get("/api/field-sessions/{session_id}")
+async def get_field_session(session_id: str):
+    try:
+        session = get_field_session_from_supabase(session_id)
+        if session is not None:
+            items = [
+                item for item in (list_field_items_from_supabase() or [])
+                if item.get("session_id") == session_id
+            ]
+            session["items_count"] = len(items)
+            return {"ok": True, "session": session, "items": items, "source": "supabase"}
+    except Exception as e:
+        logger.error(f"Recorrida ERROR: {e}")
+
+    session = load_local_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="recorrida no encontrada")
+    items = [item for item in load_local_field_items() if item.get("session_id") == session_id]
+    session["items_count"] = len(items)
+    return {"ok": True, "session": session, "items": items, "source": "local"}
+
 @fastapi_app.get("/api/field-items")
 async def list_field_items():
     try:
@@ -1314,22 +1562,7 @@ async def list_field_items():
     except Exception as e:
         logger.error(f"Metadata ERROR: {e}")
 
-    items = []
-    if FIELD_ITEMS_DIR.exists():
-        for metadata_path in FIELD_ITEMS_DIR.rglob("*.json"):
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                logger.warning(f"No se pudo leer metadata de campo {metadata_path}: {e}")
-                continue
-
-            item = field_metadata_to_item(metadata)
-            if not item["nombre_archivo"]:
-                item["nombre_archivo"] = metadata_path.name.replace(".json", "")
-            items.append(item)
-
-    items.sort(key=lambda item: item.get("fecha_hora") or "", reverse=True)
-    return {"ok": True, "items": items, "source": "local"}
+    return {"ok": True, "items": load_local_field_items(), "source": "local"}
 
 @fastapi_app.post("/api/field-items")
 async def create_field_item(
@@ -1341,6 +1574,7 @@ async def create_field_item(
     longitude: str = Form(""),
     gps_accuracy: str = Form(""),
     client_id: str = Form(""),
+    session_id: str = Form(""),
     file: UploadFile = File(...),
 ):
     item_type = item_type.strip().lower()
@@ -1380,7 +1614,10 @@ async def create_field_item(
         "ai_processed": False,
         "storage_status": "local_only",
         "storage_provider": "local",
+        "session_id": session_id.strip(),
     }
+    if session_id.strip():
+        logger.info(f"Item asociado a session_id: {session_id.strip()}")
 
     if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET:
         campo_segment = safe_storage_segment(campo, "sin-campo")
