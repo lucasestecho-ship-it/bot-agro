@@ -7,6 +7,7 @@ import mimetypes
 import shutil
 import uuid
 import re
+import unicodedata
 from contextlib import asynccontextmanager
 from pathlib import Path
 import requests
@@ -70,6 +71,21 @@ LIGHT_REPORT_ITEM_LIMIT = 30
 PHOTO_PROMPT_LIMIT = 12
 MAX_SOURCE_PHOTO_BYTES = 12 * 1024 * 1024
 REPORT_DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+REPORT_SECTION_TITLES = [
+    "Diagnostico de situacion",
+    "Observaciones principales",
+    "Recomendaciones",
+]
+NOISE_TRANSCRIPTS = {
+    "bye",
+    "bye.",
+    "thank you",
+    "thank you.",
+    "thanks",
+    "gracias",
+    "sin transcripcion disponible",
+    "sin transcripción disponible",
+}
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -843,6 +859,50 @@ def format_item_line(item):
         f"+/- {item.get('precision_gps') or '-'} m | archivo: {item.get('nombre_archivo') or '-'}"
     )
 
+def clean_inline_markdown(text):
+    cleaned = str(text or "")
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.*?)__", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    cleaned = re.sub(r"https?://\S+", "Ver archivo original", cleaned)
+    return cleaned.strip()
+
+def normalize_heading_key(text):
+    cleaned = clean_inline_markdown(text).lower().strip()
+    cleaned = "".join(
+        char for char in unicodedata.normalize("NFKD", cleaned)
+        if not unicodedata.combining(char)
+    )
+    return cleaned
+
+def normalize_transcript_text(text):
+    cleaned = clean_inline_markdown(text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+def is_noise_transcript(text):
+    cleaned = normalize_transcript_text(text)
+    normalized = cleaned.lower().strip(" .,!¡¿?;:")
+    if not normalized:
+        return True
+    if normalized in NOISE_TRANSCRIPTS:
+        return True
+    return len(normalized) < 8
+
+def valid_transcript_blocks(audios):
+    blocks = []
+    for audio in audios:
+        transcript = normalize_transcript_text(audio.get("transcript_text"))
+        if is_noise_transcript(transcript):
+            continue
+        blocks.append(
+            "Fecha {fecha}:\n{texto}".format(
+                fecha=audio.get("fecha_hora") or "sin fecha",
+                texto=transcript,
+            )
+        )
+    return blocks
+
 def audio_error_lines(audios_con_error):
     return [
         "- {archivo} | {fecha} | {error}".format(
@@ -959,9 +1019,61 @@ Listado completo de items:
     )
     return response.choices[0].message.content.strip()
 
+def build_basic_report_markdown(session, audios, photos, items, audios_con_error=None):
+    return "\n\n".join([
+        "## Resumen ejecutivo\nInforme elaborado con la informacion relevada durante la recorrida. No se agregan conclusiones fuera de los datos disponibles.",
+        "## Diagnostico de situacion\nNo registrado en la recorrida.",
+        "## Observaciones principales\nLa recorrida cuenta con evidencias documentales, coordenadas y registros de campo asociados.",
+        "## Recomendaciones\nRevisar las evidencias disponibles y completar observaciones manuales si corresponde.",
+    ])
+
+def build_report_markdown(session, audios, photos, items, audios_con_error=None):
+    logger.info("Generando texto del informe")
+    transcript_blocks = valid_transcript_blocks(audios)
+    light_mode = len(items) > LIGHT_REPORT_ITEM_LIMIT
+    photo_lines = summarized_photo_lines(photos)
+    item_lines = summarized_item_lines(items) if light_mode else [format_item_line(item) for item in items]
+    prompt = f"""
+Redacta un informe profesional, limpio y corto para cliente.
+No inventes datos. Si falta informacion, escribir "No registrado en la recorrida".
+No interpretes fotos ni describas su contenido visual; las fotos son solo evidencia documental.
+Las recomendaciones deben basarse solo en las notas de voz transcriptas y la metadata de campo.
+No copies textualmente las transcripciones.
+No muestres IDs de audios, nombres de audios, errores de audios ni frases irrelevantes.
+No escribas secciones llamadas Audios transcriptos, Audios no transcriptos, Anexo tecnico o Informe Tecnico de Consultoria Agronomica.
+No uses markdown de negritas con **.
+
+Estructura requerida:
+1. Resumen ejecutivo
+2. Diagnostico de situacion
+3. Observaciones principales
+4. Recomendaciones
+
+Recorrida:
+{json.dumps(session, ensure_ascii=False, indent=2)}
+
+Notas de voz transcriptas, solo como insumo interno:
+{chr(10).join(transcript_blocks) or "No registrado en la recorrida"}
+
+Fotos como evidencia, solo metadata:
+{chr(10).join(photo_lines) or "No registrado en la recorrida"}
+
+Items relevados, solo metadata resumida:
+{chr(10).join(item_lines) or "No registrado en la recorrida"}
+"""
+    response = get_openai_client().chat.completions.create(
+        model=os.environ.get("FIELD_REPORT_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": "Sos un asesor ganadero profesional. Escribis claro, breve, util y sin inventar datos."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return response.choices[0].message.content.strip()
+
 def markdown_summary(markdown_text):
     for line in markdown_text.splitlines():
-        cleaned = line.strip().lstrip("#").strip()
+        cleaned = clean_inline_markdown(line).strip().lstrip("#").strip()
         if cleaned and not cleaned.lower().startswith("informe de recorrida"):
             return cleaned[:1000]
     return ""
@@ -1112,18 +1224,18 @@ def extract_markdown_section(markdown_text, section_title):
     lines = markdown_text.splitlines()
     captured = []
     capture = False
-    wanted = section_title.lower()
+    wanted = normalize_heading_key(section_title)
     for line in lines:
         stripped = line.strip().lstrip("#").strip()
-        if stripped.lower().startswith(wanted):
+        if normalize_heading_key(stripped).startswith(wanted):
             capture = True
             continue
         if capture and line.strip().startswith("#"):
             break
         if capture:
             captured.append(line.strip())
-    text = "\n".join(line for line in captured if line).strip()
-    return text or markdown_summary(markdown_text) or "No registrado en la recorrida"
+    text = "\n".join(clean_inline_markdown(line) for line in captured if line).strip()
+    return text or "No registrado en la recorrida"
 
 def add_highlight_box(document, title, text):
     table = document.add_table(rows=1, cols=1)
@@ -1137,15 +1249,32 @@ def add_highlight_box(document, title, text):
     title_run.font.bold = True
     title_run.font.size = Pt(11)
     title_run.font.color.rgb = RGBColor.from_string(BRAND_DARK)
-    body_run = paragraph.add_run(text)
+    body_run = paragraph.add_run(clean_inline_markdown(text))
     body_run.font.name = "Arial"
     body_run.font.size = Pt(10)
     body_run.font.color.rgb = RGBColor.from_string(BRAND_TEXT)
 
 def add_markdown_to_doc(document, markdown_text):
+    banned_sections = (
+        "audios transcriptos",
+        "audios transcritos",
+        "audios no transcriptos",
+        "audios no transcritos",
+        "anexo tecnico",
+        "anexo técnico",
+        "informe tecnico",
+        "informe técnico",
+        "informe tecnico de consultoria",
+        "informe técnico de consultoría",
+    )
     for line in markdown_text.splitlines():
-        text = line.strip()
+        text = clean_inline_markdown(line).strip()
         if not text:
+            continue
+        normalized = normalize_heading_key(text.lstrip("#").strip())
+        if normalized.startswith(banned_sections):
+            continue
+        if "sin transcripcion disponible" in normalized or "sin transcripción disponible" in normalized:
             continue
         if text.startswith("# "):
             document.add_heading(text[2:].strip(), level=1)
@@ -1184,9 +1313,9 @@ def add_photo_metadata_table(document, photos, title):
         return
 
     document.add_heading(title, level=2)
-    table = document.add_table(rows=1, cols=6)
+    table = document.add_table(rows=1, cols=4)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    headers = ["fecha_hora", "sector", "GPS", "precision", "archivo", "link"]
+    headers = ["fecha", "sector", "GPS", "archivo"]
     for idx, header in enumerate(headers):
         cell = table.rows[0].cells[idx]
         set_cell_shading(cell, BRAND_BEIGE)
@@ -1199,9 +1328,7 @@ def add_photo_metadata_table(document, photos, title):
             photo.get("fecha_hora") or "",
             photo.get("sector") or "",
             f"{photo.get('latitud') or '-'}, {photo.get('longitud') or '-'}",
-            photo.get("precision_gps") or "",
             photo.get("nombre_archivo") or "",
-            photo.get("storage_public_url") or "",
         ]
         for idx, value in enumerate(values):
             set_cell_text(row[idx], value)
@@ -1264,7 +1391,7 @@ def add_photo_evidence_to_doc(document, photos, work_dir):
         evidence = document.add_table(rows=0, cols=2)
         for label, value in [
             ("Archivo", photo.get("nombre_archivo") or "No registrado en la recorrida"),
-            ("Link publico", photo.get("storage_public_url") or "No registrado en la recorrida"),
+            ("Original", "Ver archivo original" if photo.get("storage_public_url") else "No registrado en la recorrida"),
         ]:
             row = evidence.add_row().cells
             set_cell_shading(row[0], BRAND_BEIGE)
@@ -1306,35 +1433,21 @@ def create_report_docx(session, items, audios, photos, markdown_text, output_pat
     document.add_heading("Resumen ejecutivo", level=1)
     add_highlight_box(document, "Resumen ejecutivo", extract_markdown_section(markdown_text, "Resumen ejecutivo"))
 
-    document.add_heading("Informe tecnico", level=1)
-    add_markdown_to_doc(document, markdown_text)
+    for section_title in REPORT_SECTION_TITLES:
+        document.add_paragraph()
+        document.add_heading(section_title, level=1)
+        add_markdown_to_doc(document, extract_markdown_section(markdown_text, section_title))
 
     document.add_heading("Evidencias fotograficas", level=1)
     document.add_paragraph("Las fotos se incluyen solo como evidencia. No fueron interpretadas por IA.")
     add_photo_evidence_to_doc(document, photos, work_dir)
 
-    document.add_heading("Anexo tecnico", level=1)
-    item_table = document.add_table(rows=1, cols=6)
-    item_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    headers = ["tipo", "fecha_hora", "campo", "sector", "GPS", "archivo/link"]
-    for idx, header in enumerate(headers):
-        cell = item_table.rows[0].cells[idx]
-        set_cell_shading(cell, BRAND_DARK)
-        set_cell_text(cell, header, bold=True, color="FFFFFF")
-        set_cell_border(cell, color=BRAND_DARK, size="6")
-    for item in items:
-        row = item_table.add_row().cells
-        values = [
-            item.get("tipo") or "",
-            item.get("fecha_hora") or "",
-            item.get("campo") or "",
-            item.get("sector") or "",
-            f"{item.get('latitud') or '-'}, {item.get('longitud') or '-'} +/- {item.get('precision_gps') or '-'}",
-            item.get("storage_public_url") or item.get("nombre_archivo") or "",
-        ]
-        for idx, value in enumerate(values):
-            set_cell_text(row[idx], value)
-            set_cell_border(row[idx], color="D6C7A8", size="4")
+    document.add_paragraph()
+    method_note = document.add_paragraph()
+    method_note.add_run(
+        "Nota metodologica: El informe fue elaborado a partir de audios, fotos y coordenadas relevadas durante la recorrida. "
+        "Las fotografias se incorporan como evidencia documental. No fueron interpretadas automaticamente por IA."
+    )
 
     document.add_paragraph()
     closing = document.add_paragraph()
