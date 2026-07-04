@@ -10,7 +10,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 import requests
-from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from telegram import Update
@@ -328,7 +328,8 @@ def get_field_report_from_supabase(session_id):
         f"{SUPABASE_URL}/rest/v1/field_reports"
         f"?session_id=eq.{session_id}"
         "&select=id,session_id,estado,titulo,resumen,informe_markdown,"
-        "docx_storage_path,docx_public_url,error,created_at,updated_at"
+        "docx_storage_path,docx_public_url,error,progress_message,"
+        "started_at,finished_at,created_at,updated_at"
         "&order=created_at.desc.nullslast&limit=1"
     )
     response = requests.get(url, headers=supabase_headers(), timeout=30)
@@ -336,6 +337,21 @@ def get_field_report_from_supabase(session_id):
         raise RuntimeError(response.text)
     rows = response.json()
     return rows[0] if rows else None
+
+def update_field_report(report_id, payload):
+    if not supabase_database_configured():
+        return False
+
+    url = f"{SUPABASE_URL}/rest/v1/field_reports?id=eq.{report_id}"
+    response = requests.patch(
+        url,
+        headers=supabase_headers("return=minimal"),
+        json=payload,
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(response.text)
+    return True
 
 def get_session_name_map_from_supabase():
     if not supabase_database_configured():
@@ -462,9 +478,41 @@ def transcribe_field_audio(item, work_dir):
         return item["transcript_text"]
 
     item_id = item.get("id", "")
+    filename = item.get("nombre_archivo") or item_id
     logger.info(f"Transcribiendo audio: {item_id}")
     try:
         audio_path = download_field_item_file(item, work_dir, ".webm")
+    except Exception as e:
+        error_payload = {
+            "transcript_status": "error",
+            "transcript_error": f"No se pudo descargar audio: {e}",
+            "transcript_at": datetime.utcnow().isoformat() + "Z",
+        }
+        try:
+            patch_field_item_transcript(item_id, error_payload)
+        except Exception:
+            pass
+        item.update(error_payload)
+        logger.error(f"Audio ERROR: {item_id}: {error_payload['transcript_error']}")
+        return None
+
+    size_bytes = audio_path.stat().st_size if audio_path.exists() else 0
+    logger.info(f"Audio descargado: nombre_archivo={filename} path={audio_path} bytes={size_bytes}")
+    if size_bytes < 5 * 1024:
+        error_payload = {
+            "transcript_status": "error",
+            "transcript_error": "Audio demasiado corto o vacío",
+            "transcript_at": datetime.utcnow().isoformat() + "Z",
+        }
+        try:
+            patch_field_item_transcript(item_id, error_payload)
+        except Exception:
+            pass
+        item.update(error_payload)
+        logger.error(f"Audio ERROR: {item_id}: {error_payload['transcript_error']}")
+        return None
+
+    try:
         transcript_text = transcribe_audio(audio_path)
         transcript_payload = {
             "transcript_status": "done",
@@ -478,9 +526,10 @@ def transcribe_field_audio(item, work_dir):
         logger.info(f"Audio transcripto OK: {item_id}")
         return transcript_text
     except Exception as e:
+        message = str(e)
         error_payload = {
             "transcript_status": "error",
-            "transcript_error": str(e),
+            "transcript_error": message,
             "transcript_at": datetime.utcnow().isoformat() + "Z",
         }
         try:
@@ -488,7 +537,8 @@ def transcribe_field_audio(item, work_dir):
         except Exception:
             pass
         item.update(error_payload)
-        raise
+        logger.error(f"Audio ERROR: {item_id}: {message}")
+        return None
 
 def format_item_line(item):
     return (
@@ -498,8 +548,46 @@ def format_item_line(item):
         f"+/- {item.get('precision_gps') or '-'} m | archivo: {item.get('nombre_archivo') or '-'}"
     )
 
-def build_report_markdown(session, audios, photos, items):
+def audio_error_lines(audios_con_error):
+    return [
+        "- {archivo} | {fecha} | {error}".format(
+            archivo=audio.get("nombre_archivo") or audio.get("id") or "audio",
+            fecha=audio.get("fecha_hora") or "sin fecha",
+            error=audio.get("transcript_error") or "Error no registrado",
+        )
+        for audio in audios_con_error
+    ]
+
+def build_basic_report_markdown(session, audios, photos, items, audios_con_error=None):
+    audios_con_error = audios_con_error or []
+    transcript_lines = [
+        f"### {audio.get('nombre_archivo') or audio.get('id')}\n{audio.get('transcript_text')}"
+        for audio in audios
+        if audio.get("transcript_text")
+    ]
+    if not transcript_lines:
+        transcript_lines = ["No se pudieron transcribir audios válidos de esta recorrida."]
+
+    return "\n\n".join([
+        f"# Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or '')[:10]}",
+        "## Datos generales\n"
+        f"- Campo: {session.get('campo') or 'No registrado en la recorrida'}\n"
+        f"- Sector: {session.get('sector') or 'No registrado en la recorrida'}\n"
+        f"- Fecha de inicio: {session.get('started_at') or 'No registrado en la recorrida'}\n"
+        f"- Fecha de cierre: {session.get('closed_at') or 'No registrado en la recorrida'}\n"
+        f"- Cantidad de audios: {len(audios)}\n"
+        f"- Cantidad de fotos: {len(photos)}",
+        "## Resumen ejecutivo\nNo registrado en la recorrida" if transcript_lines[0].startswith("No se pudieron") else "## Resumen ejecutivo\nInforme generado con las transcripciones disponibles y la metadata de campo.",
+        "## Observaciones relevadas\n" + "\n\n".join(transcript_lines),
+        "## Evidencias fotograficas\n" + ("\n".join(format_item_line(photo) for photo in photos) or "No registrado en la recorrida"),
+        "## Audios no transcriptos\n" + ("\n".join(audio_error_lines(audios_con_error)) or "No registrado en la recorrida"),
+        "## Recomendaciones / proximos pasos\nNo surgieron recomendaciones específicas de la recorrida",
+        "## Anexo tecnico\n" + ("\n".join(format_item_line(item) for item in items) or "No registrado en la recorrida"),
+    ])
+
+def build_report_markdown(session, audios, photos, items, audios_con_error=None):
     logger.info("Generando texto del informe")
+    audios_con_error = audios_con_error or []
     transcript_blocks = []
     for audio in audios:
         transcript_blocks.append(
@@ -514,6 +602,10 @@ def build_report_markdown(session, audios, photos, items):
         format_item_line(photo) + f" | link: {photo.get('storage_public_url') or 'sin link publico'}"
         for photo in photos
     ]
+    audio_error_text = "\n".join(audio_error_lines(audios_con_error))
+    no_valid_audio_text = ""
+    if not any(audio.get("transcript_text") for audio in audios):
+        no_valid_audio_text = "No se pudieron transcribir audios válidos de esta recorrida."
     prompt = f"""
 Redacta un informe tecnico/profesional de consultoria agronomica para cliente.
 No inventes datos. Si falta informacion, escribir "No registrado en la recorrida".
@@ -529,12 +621,16 @@ Estructura requerida:
 6. Audios transcriptos
 7. Recomendaciones / proximos pasos
 8. Anexo tecnico
+9. Audios no transcriptos, si corresponde
 
 Recorrida:
 {json.dumps(session, ensure_ascii=False, indent=2)}
 
 Audios transcriptos:
-{chr(10).join(transcript_blocks) or "No registrado en la recorrida"}
+{chr(10).join(transcript_blocks) or no_valid_audio_text or "No registrado en la recorrida"}
+
+Audios no transcriptos:
+{audio_error_text or "No registrado en la recorrida"}
 
 Fotos como evidencia, sin interpretacion:
 {chr(10).join(photo_lines) or "No registrado en la recorrida"}
@@ -871,11 +967,43 @@ def create_report_docx(session, items, audios, photos, markdown_text, output_pat
     document.save(output_path)
     return output_path
 
-def generate_field_report(session_id):
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+def recent_generating_report(report):
+    if not report or report.get("estado") != "generando":
+        return False
+    updated = parse_iso_datetime(report.get("updated_at") or report.get("started_at"))
+    if not updated:
+        return False
+    return (datetime.utcnow() - updated).total_seconds() < 600
+
+def update_report_progress(report_id, message, estado="generando"):
+    payload = {
+        "estado": estado,
+        "progress_message": message,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    update_field_report(report_id, payload)
+
+def generate_field_report(session_id, force=False):
     if not supabase_database_configured():
         raise RuntimeError("Supabase Database no configurado")
 
     logger.info(f"Iniciando generacion de informe: {session_id}")
+    existing_report = get_field_report_from_supabase(session_id)
+    if existing_report and existing_report.get("estado") == "done" and not force:
+        logger.info(f"Informe ya existente para {session_id}: {existing_report.get('id')}")
+        return existing_report
+    if existing_report and recent_generating_report(existing_report) and not force:
+        logger.info(f"Informe en generacion reciente para {session_id}: {existing_report.get('id')}")
+        return existing_report
+
     session = get_field_session_from_supabase(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="recorrida no encontrada")
@@ -887,7 +1015,7 @@ def generate_field_report(session_id):
     logger.info(f"Audios encontrados: {len(audios)}")
     logger.info(f"Fotos encontradas: {len(photos)}")
 
-    report_id = uuid.uuid4().hex
+    report_id = existing_report.get("id") if existing_report and existing_report.get("estado") == "error" else uuid.uuid4().hex
     now = datetime.utcnow().isoformat() + "Z"
     title = f"Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or now)[:10]}"
     work_dir = DATA_DIR / "field_reports" / session_id / report_id
@@ -899,6 +1027,10 @@ def generate_field_report(session_id):
             "session_id": session_id,
             "estado": "generando",
             "titulo": title,
+            "progress_message": "Transcribiendo audios",
+            "started_at": now,
+            "finished_at": None,
+            "error": None,
             "created_at": now,
             "updated_at": now,
         })
@@ -906,15 +1038,27 @@ def generate_field_report(session_id):
         for audio in audios:
             transcribe_field_audio(audio, work_dir)
 
-        markdown_text = build_report_markdown(session, audios, photos, items)
+        audios_con_error = [audio for audio in audios if audio.get("transcript_status") == "error"]
+        valid_audio_count = sum(1 for audio in audios if audio.get("transcript_text"))
+        if not valid_audio_count:
+            logger.info("No se pudieron transcribir audios validos de esta recorrida.")
+
+        update_report_progress(report_id, "Generando texto")
+        try:
+            markdown_text = build_report_markdown(session, audios, photos, items, audios_con_error)
+        except Exception as e:
+            logger.error(f"Informe texto IA ERROR: {e}")
+            markdown_text = build_basic_report_markdown(session, audios, photos, items, audios_con_error)
         summary = markdown_summary(markdown_text)
         docx_name = f"informe_recorrida_{(session.get('started_at') or now)[:10]}_{report_id}.docx"
         docx_path = work_dir / docx_name
+        update_report_progress(report_id, "Creando DOCX")
         create_report_docx(session, items, audios, photos, markdown_text, docx_path, work_dir)
 
         campo_segment = safe_storage_segment(session.get("campo"), "sin-campo")
         storage_path = f"reports/{campo_segment}/{session_id}/{docx_name}"
         logger.info(f"Subiendo DOCX a Supabase: {storage_path}")
+        update_report_progress(report_id, "Subiendo DOCX")
         supabase_file = upload_field_file_to_supabase(
             docx_path,
             storage_path,
@@ -931,6 +1075,8 @@ def generate_field_report(session_id):
             "docx_public_url": supabase_file.get("public_url", ""),
             "error": None,
             "created_at": now,
+            "progress_message": "Informe listo",
+            "finished_at": datetime.utcnow().isoformat() + "Z",
             "updated_at": datetime.utcnow().isoformat() + "Z",
         }
         upsert_field_report(report)
@@ -943,6 +1089,9 @@ def generate_field_report(session_id):
             "estado": "error",
             "titulo": title,
             "error": str(e),
+            "progress_message": "Error al generar informe",
+            "started_at": now,
+            "finished_at": datetime.utcnow().isoformat() + "Z",
             "created_at": now,
             "updated_at": datetime.utcnow().isoformat() + "Z",
         }
@@ -2130,9 +2279,9 @@ async def list_field_sessions():
     return {"ok": True, "sessions": sessions, "source": "local"}
 
 @fastapi_app.post("/api/field-sessions/{session_id}/generate-report")
-async def generate_field_session_report(session_id: str):
+async def generate_field_session_report(session_id: str, force: bool = Query(False)):
     try:
-        report = generate_field_report(session_id)
+        report = generate_field_report(session_id, force=force)
         return {"ok": True, "report": report}
     except HTTPException:
         raise
@@ -2153,6 +2302,7 @@ async def get_field_session_report(session_id: str):
             "docx_public_url": report.get("docx_public_url") if report else "",
             "informe_markdown": report.get("informe_markdown") if report else "",
             "estado": report.get("estado") if report else "sin informe",
+            "progress_message": report.get("progress_message") if report else "",
             "error": report.get("error") if report else "",
             "source": "supabase" if supabase_database_configured() else "local",
         }
@@ -2167,6 +2317,7 @@ async def get_field_session_report(session_id: str):
         "docx_public_url": "",
         "informe_markdown": "",
         "estado": "sin informe",
+        "progress_message": "",
         "error": "",
         "source": "local",
     }

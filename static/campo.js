@@ -375,6 +375,7 @@ async function renderSessions() {
       const report = await fetchSessionReport(session.id);
       const reportState = report.estado || "sin informe";
       const reportMarkdown = report.informe_markdown || "";
+      const reportButtonText = reportState === "error" ? "Reintentar informe" : "Generar informe";
       li.innerHTML = `
         <div class="item-main">
           <span>${session.nombre || "Recorrida sin nombre"}</span>
@@ -383,9 +384,9 @@ async function renderSessions() {
         <div class="item-meta">${session.campo || "sin campo"} - ${session.sector || "sin sector"}</div>
         <div class="item-meta">Inicio: ${formatServerDate(session.started_at)}${session.closed_at ? ` - Cierre: ${formatServerDate(session.closed_at)}` : ""}</div>
         <div class="item-meta">Items: ${session.items_count ?? 0}</div>
-        <div class="item-meta">Informe: ${reportState}${report.error ? ` - ${report.error}` : ""}</div>
+        <div class="item-meta">Informe: ${reportState}${report.progress_message ? ` - ${report.progress_message}` : ""}${report.error ? ` - ${report.error}` : ""}</div>
         <div class="session-actions">
-          <button class="generate-report-button" type="button" data-session-id="${session.id}">Generar informe</button>
+          <button class="generate-report-button" type="button" data-session-id="${session.id}" data-report-state="${reportState}">${reportButtonText}</button>
           ${report.docx_public_url ? `<a class="button-link" href="${report.docx_public_url}" target="_blank" rel="noopener">Abrir informe DOCX</a>` : ""}
         </div>
         ${reportMarkdown ? `<pre class="report-preview">${reportMarkdown.slice(0, 1200)}</pre>` : ""}
@@ -393,7 +394,7 @@ async function renderSessions() {
       sessionsList.appendChild(li);
       const button = li.querySelector(".generate-report-button");
       if (button) {
-        button.addEventListener("click", () => generateReportForSession(session.id, button));
+        button.addEventListener("click", () => generateReportForSession(session.id, button, reportState === "error"));
       }
     }
   } catch {
@@ -410,16 +411,17 @@ async function fetchSessionReport(sessionId) {
     const data = await response.json();
     return {
       estado: data.estado || "sin informe",
+      progress_message: data.progress_message || "",
       docx_public_url: data.docx_public_url || "",
       informe_markdown: data.informe_markdown || "",
       error: data.error || "",
     };
   } catch {
-    return { estado: "sin informe", docx_public_url: "", informe_markdown: "", error: "" };
+    return { estado: "sin informe", progress_message: "", docx_public_url: "", informe_markdown: "", error: "" };
   }
 }
 
-async function generateReportForSession(sessionId, button) {
+async function generateReportForSession(sessionId, button, force = false) {
   if (!navigator.onLine) {
     appendDebug("No se puede generar informe sin conexion.");
     return;
@@ -427,16 +429,25 @@ async function generateReportForSession(sessionId, button) {
   button.disabled = true;
   button.textContent = "Generando...";
   appendDebug(`Generando informe de recorrida ${sessionId}...`);
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 30000);
   try {
-    const response = await fetch(`/api/field-sessions/${encodeURIComponent(sessionId)}/generate-report`, {
+    const url = `/api/field-sessions/${encodeURIComponent(sessionId)}/generate-report${force ? "?force=true" : ""}`;
+    const response = await fetch(url, {
       method: "POST",
+      signal: controller.signal,
     });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || data.detail || `HTTP ${response.status}`);
     appendDebug("Informe listo.");
   } catch (error) {
-    const message = error && error.message ? error.message : String(error);
+    const message = error && error.name === "AbortError"
+      ? "La generacion sigue en proceso. Consulta el informe en unos segundos."
+      : (error && error.message ? error.message : String(error));
     appendDebug(`Informe ERROR: ${message}`);
+  } finally {
+    window.clearTimeout(timeoutId);
+    button.disabled = false;
   }
   await renderSessions();
 }
