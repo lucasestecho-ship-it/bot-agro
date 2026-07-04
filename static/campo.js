@@ -138,7 +138,8 @@ async function syncSession(session) {
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
-    if (!data.ok) throw new Error(data.detail || "respuesta sin ok true");
+    if (!data.ok) throw new Error(data.detail || data.supabase_error || "respuesta sin ok true");
+    if (data.supabase_error) appendDebug(`Recorrida Supabase ERROR: ${data.supabase_error}`);
 
     let updated = { ...session, syncStatus: "sincronizada", errorMessage: "" };
     if (updated.estado === "cerrada" && updated.closedAt) {
@@ -305,9 +306,14 @@ async function renderServerItems() {
   serverItemsList.innerHTML = "";
   try {
     const response = await fetch("/api/field-items");
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || data.supabase_error || `HTTP ${response.status}`);
     const items = data.items || [];
+    if (data.supabase_error) {
+      const warning = document.createElement("li");
+      warning.textContent = `Supabase ERROR: ${data.supabase_error}`;
+      serverItemsList.appendChild(warning);
+    }
 
     if (!items.length) {
       const empty = document.createElement("li");
@@ -338,10 +344,11 @@ async function renderServerItems() {
       `;
       serverItemsList.appendChild(li);
     }
-  } catch {
-    const error = document.createElement("li");
-    error.textContent = "No pude cargar los items subidos.";
-    serverItemsList.appendChild(error);
+  } catch (error) {
+    const errorItem = document.createElement("li");
+    const message = error && error.message ? error.message : String(error);
+    errorItem.textContent = `No pude cargar los items subidos: ${message}`;
+    serverItemsList.appendChild(errorItem);
   }
 }
 
@@ -360,9 +367,14 @@ async function renderSessions() {
   sessionsList.innerHTML = "";
   try {
     const response = await fetch("/api/field-sessions");
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || data.supabase_error || `HTTP ${response.status}`);
     const sessions = data.sessions || [];
+    if (data.supabase_error) {
+      const warning = document.createElement("li");
+      warning.textContent = `Supabase ERROR: ${data.supabase_error}`;
+      sessionsList.appendChild(warning);
+    }
     if (!sessions.length) {
       const empty = document.createElement("li");
       empty.textContent = "Sin recorridas subidas.";
@@ -378,12 +390,13 @@ async function renderSessions() {
       const reportButtonText = reportState === "error" ? "Reintentar informe" : "Generar informe";
       li.innerHTML = `
         <div class="item-main">
-          <span>${session.nombre || "Recorrida sin nombre"}</span>
+          <span>${session.nombre || "Recorrida sin nombre"}${session.legacy ? " (datos viejos)" : ""}</span>
           <span class="pill ${session.estado === "cerrada" ? "subido" : "subiendo"}">${session.estado || "abierta"}</span>
         </div>
         <div class="item-meta">${session.campo || "sin campo"} - ${session.sector || "sin sector"}</div>
         <div class="item-meta">Inicio: ${formatServerDate(session.started_at)}${session.closed_at ? ` - Cierre: ${formatServerDate(session.closed_at)}` : ""}</div>
-        <div class="item-meta">Items: ${session.items_count ?? 0}</div>
+        <div class="item-meta">Items asociados: ${session.items_count ?? 0}${session.has_items ? "" : " - sin items asociados"}</div>
+        ${session.items_error ? `<div class="item-meta">Items ERROR: ${session.items_error}</div>` : ""}
         <div class="item-meta">Informe: ${reportState}${report.progress_message ? ` - ${report.progress_message}` : ""}${report.error ? ` - ${report.error}` : ""}</div>
         <div class="session-actions">
           <button class="generate-report-button" type="button" data-session-id="${session.id}" data-report-state="${reportState}">${reportButtonText}</button>
@@ -397,18 +410,19 @@ async function renderSessions() {
         button.addEventListener("click", () => generateReportForSession(session.id, button, reportState === "error"));
       }
     }
-  } catch {
-    const error = document.createElement("li");
-    error.textContent = "No pude cargar las recorridas.";
-    sessionsList.appendChild(error);
+  } catch (error) {
+    const errorItem = document.createElement("li");
+    const message = error && error.message ? error.message : String(error);
+    errorItem.textContent = `No pude cargar las recorridas: ${message}`;
+    sessionsList.appendChild(errorItem);
   }
 }
 
 async function fetchSessionReport(sessionId) {
   try {
     const response = await fetch(`/api/field-sessions/${encodeURIComponent(sessionId)}/report`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || data.supabase_error || `HTTP ${response.status}`);
     return {
       estado: data.estado || "sin informe",
       progress_message: data.progress_message || "",
@@ -416,8 +430,9 @@ async function fetchSessionReport(sessionId) {
       informe_markdown: data.informe_markdown || "",
       error: data.error || "",
     };
-  } catch {
-    return { estado: "sin informe", progress_message: "", docx_public_url: "", informe_markdown: "", error: "" };
+  } catch (error) {
+    const message = error && error.message ? error.message : String(error);
+    return { estado: "error", progress_message: "", docx_public_url: "", informe_markdown: "", error: message };
   }
 }
 
@@ -482,9 +497,11 @@ async function uploadLocalItem(item) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
     const data = await response.json();
-    if (!data.ok) throw new Error(data.detail || "respuesta sin ok true");
+    if (!data.ok) throw new Error(data.detail || data.metadata_error || data.storage_error || "respuesta sin ok true");
 
     appendDebug("Servidor respondió OK");
+    if (data.storage_error) appendDebug(`Storage ERROR: ${data.storage_error}`);
+    if (data.metadata_error) appendDebug(`Metadata ERROR: ${data.metadata_error}`);
     item.status = "subido confirmado";
     item.serverConfirmed = true;
     item.serverId = data.id || "";

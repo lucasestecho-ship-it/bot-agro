@@ -42,6 +42,25 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/campo_bot")).resolve()
 FIELD_ITEMS_DIR = DATA_DIR / "field_items"
 FIELD_SESSIONS_DIR = DATA_DIR / "field_sessions"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+LEGACY_SESSION_PREFIX = "legacy:"
+
+FIELD_ITEMS_COLUMNS = [
+    "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
+    "precision_gps", "nombre_archivo", "estado", "storage_status",
+    "storage_provider", "storage_path", "storage_public_url", "storage_error",
+    "session_id", "transcript_status", "transcript_text", "transcript_error",
+    "transcript_model", "transcript_at", "created_at",
+]
+FIELD_SESSIONS_COLUMNS = [
+    "id", "nombre", "campo", "sector", "estado", "started_at", "closed_at",
+    "latitud_inicio", "longitud_inicio", "precision_gps_inicio", "notas",
+    "created_at", "updated_at",
+]
+FIELD_REPORTS_COLUMNS = [
+    "id", "session_id", "estado", "titulo", "resumen", "informe_markdown",
+    "docx_storage_path", "docx_public_url", "error", "progress_message",
+    "started_at", "finished_at", "created_at", "updated_at",
+]
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -106,6 +125,179 @@ def safe_storage_segment(value, fallback):
     text = re.sub(r"[^a-z0-9._-]+", "-", text)
     text = text.strip("-._")
     return text or fallback
+
+def encode_legacy_session_id(campo, sector):
+    payload = json.dumps(
+        {"campo": campo or "", "sector": sector or ""},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    return f"{LEGACY_SESSION_PREFIX}{encoded}"
+
+def decode_legacy_session_id(session_id):
+    if not session_id.startswith(LEGACY_SESSION_PREFIX):
+        return None
+    encoded = session_id[len(LEGACY_SESSION_PREFIX):]
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+
+def is_legacy_session_id(session_id):
+    return bool(decode_legacy_session_id(session_id or ""))
+
+def fetch_supabase_rows(table, columns, order=None, limit=None):
+    select = ",".join(columns)
+    url = f"{SUPABASE_URL}/rest/v1/{table}?select={select}"
+    if order:
+        url += f"&order={order}"
+    if limit is not None:
+        url += f"&limit={limit}"
+    response = requests.get(url, headers=supabase_headers(), timeout=30)
+    if not response.ok:
+        raise RuntimeError(response.text)
+    return response.json()
+
+def with_default_columns(row, columns):
+    for column in columns:
+        row.setdefault(column, None)
+    return row
+
+def build_legacy_sessions_from_items(items):
+    groups = {}
+    for item in items:
+        if item.get("session_id"):
+            continue
+        campo = item.get("campo") or "Sin campo"
+        sector = item.get("sector") or ""
+        key = (campo, sector)
+        groups.setdefault(key, []).append(item)
+
+    sessions = []
+    for (campo, sector), group_items in groups.items():
+        dates = sorted([item.get("fecha_hora") for item in group_items if item.get("fecha_hora")])
+        started_at = dates[0] if dates else None
+        closed_at = dates[-1] if dates else None
+        session_id = encode_legacy_session_id(campo, sector)
+        sessions.append({
+            "id": session_id,
+            "nombre": f"Recorrida anterior - {campo}",
+            "campo": campo,
+            "sector": sector,
+            "estado": "legacy",
+            "started_at": started_at,
+            "closed_at": closed_at,
+            "latitud_inicio": group_items[0].get("latitud") if group_items else None,
+            "longitud_inicio": group_items[0].get("longitud") if group_items else None,
+            "precision_gps_inicio": group_items[0].get("precision_gps") if group_items else None,
+            "notas": "Recorrida virtual creada con items viejos sin session_id.",
+            "created_at": started_at,
+            "updated_at": closed_at,
+            "items_count": len(group_items),
+            "has_items": bool(group_items),
+            "legacy": True,
+        })
+
+    sessions.sort(key=lambda item: item.get("started_at") or "", reverse=True)
+    return sessions
+
+def get_legacy_session_and_items(session_id, items):
+    legacy = decode_legacy_session_id(session_id)
+    if not legacy:
+        return None, []
+    campo = legacy.get("campo") or "Sin campo"
+    sector = legacy.get("sector") or ""
+    matching_items = [
+        item for item in items
+        if not item.get("session_id")
+        and (item.get("campo") or "Sin campo") == campo
+        and (item.get("sector") or "") == sector
+    ]
+    sessions = build_legacy_sessions_from_items(matching_items)
+    session = sessions[0] if sessions else {
+        "id": session_id,
+        "nombre": f"Recorrida anterior - {campo}",
+        "campo": campo,
+        "sector": sector,
+        "estado": "legacy",
+        "items_count": 0,
+        "has_items": False,
+        "legacy": True,
+    }
+    session["id"] = session_id
+    return session, matching_items
+
+def check_supabase_storage_health():
+    result = {
+        "configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET),
+        "can_write": False,
+        "can_read": False,
+        "error": "",
+    }
+    if not result["configured"]:
+        result["error"] = "Faltan variables de Supabase Storage"
+        return result
+
+    health_dir = DATA_DIR / "_health"
+    health_dir.mkdir(parents=True, exist_ok=True)
+    local_path = health_dir / f"campo-health-{uuid.uuid4().hex}.txt"
+    download_path = health_dir / f"campo-health-download-{uuid.uuid4().hex}.txt"
+    storage_path = f"_health/{local_path.name}"
+    content = f"campo health {datetime.utcnow().isoformat()}Z"
+    try:
+        local_path.write_text(content, encoding="utf-8")
+        upload_field_file_to_supabase(local_path, storage_path, content_type="text/plain")
+        result["can_write"] = True
+        download_supabase_storage_file(storage_path, download_path)
+        result["can_read"] = download_path.read_text(encoding="utf-8") == content
+    except Exception as e:
+        result["error"] = str(e)
+    finally:
+        try:
+            local_path.unlink(missing_ok=True)
+            download_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            delete_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}"
+            requests.delete(
+                delete_url,
+                headers=supabase_headers(),
+                json={"prefixes": [storage_path]},
+                timeout=30,
+            )
+        except Exception:
+            pass
+    return result
+
+def check_supabase_table_health(table, columns):
+    result = {
+        "exists": False,
+        "missing_columns": [],
+        "error": "",
+    }
+    if not supabase_database_configured():
+        result["error"] = "Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY"
+        result["missing_columns"] = columns
+        return result
+
+    try:
+        fetch_supabase_rows(table, ["id"], limit=1)
+        result["exists"] = True
+    except Exception as e:
+        result["error"] = str(e)
+        result["missing_columns"] = columns
+        return result
+
+    for column in columns:
+        try:
+            fetch_supabase_rows(table, [column], limit=1)
+        except Exception:
+            result["missing_columns"].append(column)
+
+    return result
 
 def field_metadata_to_item(metadata):
     stored_file = metadata.get("stored_file") or ""
@@ -269,20 +461,39 @@ def list_field_items_from_supabase():
     if not supabase_database_configured():
         return None
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/field_items"
-        "?select=id,tipo,campo,sector,fecha_hora,latitud,longitud,precision_gps,"
-        "nombre_archivo,estado,storage_status,storage_provider,storage_path,"
-        "storage_public_url,storage_error,session_id,transcript_status,transcript_text,"
-        "transcript_error,transcript_model,transcript_at,created_at"
-        "&order=fecha_hora.desc.nullslast"
-    )
-    response = requests.get(url, headers=supabase_headers(), timeout=30)
-    if not response.ok:
-        raise RuntimeError(response.text)
-    items = response.json()
+    fallback_columns = [
+        "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
+        "precision_gps", "nombre_archivo", "estado", "storage_status",
+        "storage_provider", "storage_path", "storage_public_url", "storage_error",
+        "session_id", "created_at",
+    ]
+    legacy_columns = [
+        "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
+        "precision_gps", "nombre_archivo", "estado", "storage_status",
+        "storage_provider", "storage_path", "storage_public_url", "storage_error",
+        "created_at",
+    ]
+    minimal_columns = [
+        "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
+        "precision_gps", "nombre_archivo", "estado", "created_at",
+    ]
+    last_error = None
+    for columns in (FIELD_ITEMS_COLUMNS, fallback_columns, legacy_columns, minimal_columns):
+        try:
+            items = fetch_supabase_rows(
+                "field_items",
+                columns,
+                order="fecha_hora.desc.nullslast",
+            )
+            break
+        except Exception as e:
+            last_error = e
+    else:
+        raise RuntimeError(str(last_error))
+
     session_names = get_session_name_map_from_supabase()
     for item in items:
+        with_default_columns(item, FIELD_ITEMS_COLUMNS)
         item.setdefault("drive_file_id", "")
         item.setdefault("drive_link", "")
         item.setdefault("drive_error", "")
@@ -324,18 +535,35 @@ def get_field_report_from_supabase(session_id):
     if not supabase_database_configured():
         return None
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/field_reports"
-        f"?session_id=eq.{session_id}"
-        "&select=id,session_id,estado,titulo,resumen,informe_markdown,"
-        "docx_storage_path,docx_public_url,error,progress_message,"
-        "started_at,finished_at,created_at,updated_at"
-        "&order=created_at.desc.nullslast&limit=1"
-    )
-    response = requests.get(url, headers=supabase_headers(), timeout=30)
-    if not response.ok:
-        raise RuntimeError(response.text)
-    rows = response.json()
+    select_options = [
+        FIELD_REPORTS_COLUMNS,
+        [
+            "id", "session_id", "estado", "titulo", "resumen", "informe_markdown",
+            "docx_storage_path", "docx_public_url", "error", "created_at", "updated_at",
+        ],
+    ]
+    last_error = None
+    for columns in select_options:
+        try:
+            select = ",".join(columns)
+            url = (
+                f"{SUPABASE_URL}/rest/v1/field_reports"
+                f"?session_id=eq.{session_id}"
+                f"&select={select}"
+                "&order=created_at.desc.nullslast&limit=1"
+            )
+            response = requests.get(url, headers=supabase_headers(), timeout=30)
+            if not response.ok:
+                raise RuntimeError(response.text)
+            rows = response.json()
+            break
+        except Exception as e:
+            last_error = e
+    else:
+        raise RuntimeError(str(last_error))
+
+    for row in rows:
+        with_default_columns(row, FIELD_REPORTS_COLUMNS)
     return rows[0] if rows else None
 
 def update_field_report(report_id, payload):
@@ -413,39 +641,86 @@ def list_field_sessions_from_supabase():
     if not supabase_database_configured():
         return None
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/field_sessions"
-        "?select=id,nombre,campo,sector,estado,started_at,closed_at,"
-        "latitud_inicio,longitud_inicio,precision_gps_inicio,notas,created_at,updated_at"
-        "&order=started_at.desc.nullslast"
-    )
-    response = requests.get(url, headers=supabase_headers(), timeout=30)
-    if not response.ok:
-        raise RuntimeError(response.text)
-    sessions = response.json()
+    sessions = []
+    session_error = None
     try:
-        counts = count_items_by_session(list_field_items_from_supabase() or [])
-    except Exception:
-        counts = {}
+        sessions = fetch_supabase_rows(
+            "field_sessions",
+            FIELD_SESSIONS_COLUMNS,
+            order="started_at.desc.nullslast",
+        )
+    except Exception as e:
+        session_error = e
+        logger.error(f"Recorrida ERROR: {e}")
+
+    item_error = None
+    try:
+        items = list_field_items_from_supabase() or []
+    except Exception as e:
+        item_error = e
+        logger.error(f"Metadata ERROR: {e}")
+        items = []
+    counts = count_items_by_session(items)
     for session in sessions:
+        with_default_columns(session, FIELD_SESSIONS_COLUMNS)
         session["items_count"] = counts.get(session.get("id"), 0)
+        session["has_items"] = session["items_count"] > 0
+        session["legacy"] = False
+        if item_error:
+            session["items_error"] = str(item_error)
+
+    sessions.extend(build_legacy_sessions_from_items(items))
+    if session_error and not sessions:
+        raise RuntimeError(str(session_error))
     return sessions
+
+def get_items_for_session_from_supabase(session_id):
+    items = list_field_items_from_supabase() or []
+    if is_legacy_session_id(session_id):
+        return get_legacy_session_and_items(session_id, items)
+
+    session = get_field_session_from_supabase(session_id)
+    session_items = [item for item in items if item.get("session_id") == session_id]
+    if session:
+        session["items_count"] = len(session_items)
+        session["has_items"] = bool(session_items)
+        session["legacy"] = False
+    return session, session_items
 
 def get_field_session_from_supabase(session_id):
     if not supabase_database_configured():
         return None
 
-    url = (
-        f"{SUPABASE_URL}/rest/v1/field_sessions"
-        f"?id=eq.{session_id}"
-        "&select=id,nombre,campo,sector,estado,started_at,closed_at,"
-        "latitud_inicio,longitud_inicio,precision_gps_inicio,notas,created_at,updated_at"
-        "&limit=1"
-    )
-    response = requests.get(url, headers=supabase_headers(), timeout=30)
-    if not response.ok:
-        raise RuntimeError(response.text)
-    rows = response.json()
+    if is_legacy_session_id(session_id):
+        session, _items = get_items_for_session_from_supabase(session_id)
+        return session
+
+    select_options = [
+        FIELD_SESSIONS_COLUMNS,
+        ["id", "nombre", "campo", "sector", "estado", "started_at", "closed_at", "created_at"],
+    ]
+    last_error = None
+    for columns in select_options:
+        try:
+            select = ",".join(columns)
+            url = (
+                f"{SUPABASE_URL}/rest/v1/field_sessions"
+                f"?id=eq.{session_id}"
+                f"&select={select}"
+                "&limit=1"
+            )
+            response = requests.get(url, headers=supabase_headers(), timeout=30)
+            if not response.ok:
+                raise RuntimeError(response.text)
+            rows = response.json()
+            break
+        except Exception as e:
+            last_error = e
+    else:
+        raise RuntimeError(str(last_error))
+
+    for row in rows:
+        with_default_columns(row, FIELD_SESSIONS_COLUMNS)
     return rows[0] if rows else None
 
 def item_file_extension(item, fallback):
@@ -1004,11 +1279,10 @@ def generate_field_report(session_id, force=False):
         logger.info(f"Informe en generacion reciente para {session_id}: {existing_report.get('id')}")
         return existing_report
 
-    session = get_field_session_from_supabase(session_id)
+    session, items = get_items_for_session_from_supabase(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="recorrida no encontrada")
 
-    items = [item for item in (list_field_items_from_supabase() or []) if item.get("session_id") == session_id]
     items.sort(key=lambda item: item.get("fecha_hora") or "")
     audios = [item for item in items if item.get("tipo") == "audio"]
     photos = [item for item in items if item.get("tipo") == "foto"]
@@ -1018,7 +1292,7 @@ def generate_field_report(session_id, force=False):
     report_id = existing_report.get("id") if existing_report and existing_report.get("estado") == "error" else uuid.uuid4().hex
     now = datetime.utcnow().isoformat() + "Z"
     title = f"Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or now)[:10]}"
-    work_dir = DATA_DIR / "field_reports" / session_id / report_id
+    work_dir = DATA_DIR / "field_reports" / safe_storage_segment(session_id, "session") / report_id
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -2222,18 +2496,41 @@ async def root():
 async def campo():
     return FileResponse(STATIC_DIR / "index.html")
 
+@fastapi_app.get("/api/health/campo")
+async def health_campo():
+    tables = {
+        "field_items": check_supabase_table_health("field_items", FIELD_ITEMS_COLUMNS),
+        "field_sessions": check_supabase_table_health("field_sessions", FIELD_SESSIONS_COLUMNS),
+        "field_reports": check_supabase_table_health("field_reports", FIELD_REPORTS_COLUMNS),
+    }
+    return {
+        "ok": True,
+        "env": {
+            "SUPABASE_URL": bool(SUPABASE_URL),
+            "SUPABASE_SERVICE_ROLE_KEY": bool(SUPABASE_SERVICE_ROLE_KEY),
+            "SUPABASE_BUCKET": bool(SUPABASE_BUCKET),
+            "OPENAI_API_KEY": bool(OPENAI_API_KEY),
+            "DATA_DIR": str(DATA_DIR),
+            "ENABLE_TELEGRAM_BOT": os.environ.get("ENABLE_TELEGRAM_BOT", "false"),
+        },
+        "storage": check_supabase_storage_health(),
+        "tables": tables,
+    }
+
 @fastapi_app.post("/api/field-sessions")
 async def create_field_session(payload: dict = Body(...)):
     session = normalize_field_session(payload)
     logger.info(f"Creando recorrida: {session['id']}")
     save_local_session(session)
 
+    supabase_error = ""
     try:
         upsert_field_session_to_supabase(session)
     except Exception as e:
+        supabase_error = str(e)
         logger.error(f"Recorrida ERROR: {e}")
 
-    return {"ok": True, "id": session["id"]}
+    return {"ok": True, "id": session["id"], "supabase_error": supabase_error}
 
 @fastapi_app.post("/api/field-sessions/{session_id}/close")
 async def close_field_session(session_id: str, payload: dict = Body(default={})):
@@ -2256,27 +2553,32 @@ async def close_field_session(session_id: str, payload: dict = Body(default={}))
     session["updated_at"] = datetime.utcnow().isoformat() + "Z"
     save_local_session(session)
 
+    supabase_error = ""
     try:
         close_field_session_in_supabase(session_id, closed_at)
     except Exception as e:
+        supabase_error = str(e)
         logger.error(f"Recorrida ERROR: {e}")
 
-    return {"ok": True, "id": session_id}
+    return {"ok": True, "id": session_id, "supabase_error": supabase_error}
 
 @fastapi_app.get("/api/field-sessions")
 async def list_field_sessions():
+    supabase_error = ""
     try:
         supabase_sessions = list_field_sessions_from_supabase()
         if supabase_sessions is not None:
             return {"ok": True, "sessions": supabase_sessions, "source": "supabase"}
     except Exception as e:
+        supabase_error = str(e)
         logger.error(f"Recorrida ERROR: {e}")
 
     sessions = load_local_sessions()
     item_counts = count_items_by_session(load_local_field_items())
     for session in sessions:
         session["items_count"] = item_counts.get(session.get("id"), 0)
-    return {"ok": True, "sessions": sessions, "source": "local"}
+        session["has_items"] = session["items_count"] > 0
+    return {"ok": True, "sessions": sessions, "source": "local", "supabase_error": supabase_error}
 
 @fastapi_app.post("/api/field-sessions/{session_id}/generate-report")
 async def generate_field_session_report(session_id: str, force: bool = Query(False)):
@@ -2292,6 +2594,7 @@ async def generate_field_session_report(session_id: str, force: bool = Query(Fal
 @fastapi_app.get("/api/field-sessions/{session_id}/report")
 async def get_field_session_report(session_id: str):
     session = None
+    supabase_error = ""
     try:
         session = get_field_session_from_supabase(session_id)
         report = get_field_report_from_supabase(session_id)
@@ -2307,6 +2610,7 @@ async def get_field_session_report(session_id: str):
             "source": "supabase" if supabase_database_configured() else "local",
         }
     except Exception as e:
+        supabase_error = str(e)
         logger.error(f"Informe ERROR: {e}")
 
     session = session or load_local_session(session_id)
@@ -2318,41 +2622,51 @@ async def get_field_session_report(session_id: str):
         "informe_markdown": "",
         "estado": "sin informe",
         "progress_message": "",
-        "error": "",
+        "error": supabase_error,
         "source": "local",
+        "supabase_error": supabase_error,
     }
 
 @fastapi_app.get("/api/field-sessions/{session_id}")
 async def get_field_session(session_id: str):
+    supabase_error = ""
     try:
-        session = get_field_session_from_supabase(session_id)
+        session, items = get_items_for_session_from_supabase(session_id)
         if session is not None:
-            items = [
-                item for item in (list_field_items_from_supabase() or [])
-                if item.get("session_id") == session_id
-            ]
             session["items_count"] = len(items)
+            session["has_items"] = bool(items)
             return {"ok": True, "session": session, "items": items, "source": "supabase"}
     except Exception as e:
+        supabase_error = str(e)
         logger.error(f"Recorrida ERROR: {e}")
 
     session = load_local_session(session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="recorrida no encontrada")
+        return {
+            "ok": False,
+            "error": supabase_error or "recorrida no encontrada",
+            "session": None,
+            "items": [],
+            "source": "local",
+            "supabase_error": supabase_error,
+        }
     items = [item for item in load_local_field_items() if item.get("session_id") == session_id]
     session["items_count"] = len(items)
-    return {"ok": True, "session": session, "items": items, "source": "local"}
+    session["has_items"] = bool(items)
+    return {"ok": True, "session": session, "items": items, "source": "local", "supabase_error": supabase_error}
 
 @fastapi_app.get("/api/field-items")
 async def list_field_items():
+    supabase_error = ""
     try:
         supabase_items = list_field_items_from_supabase()
         if supabase_items is not None:
             return {"ok": True, "items": supabase_items, "source": "supabase"}
     except Exception as e:
+        supabase_error = str(e)
         logger.error(f"Metadata ERROR: {e}")
 
-    return {"ok": True, "items": load_local_field_items(), "source": "local"}
+    return {"ok": True, "items": load_local_field_items(), "source": "local", "supabase_error": supabase_error}
 
 @fastapi_app.post("/api/field-items")
 async def create_field_item(
@@ -2434,12 +2748,20 @@ async def create_field_item(
     metadata_path = file_path.with_suffix(file_path.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    metadata_error = ""
     try:
         upsert_field_item_metadata(metadata)
     except Exception as e:
+        metadata_error = str(e)
         logger.error(f"Metadata ERROR: {e}")
 
-    return {"ok": True, "id": item_id}
+    return {
+        "ok": True,
+        "id": item_id,
+        "storage_status": metadata.get("storage_status", ""),
+        "storage_error": metadata.get("storage_error", ""),
+        "metadata_error": metadata_error,
+    }
 
 if __name__ == "__main__":
     main()
