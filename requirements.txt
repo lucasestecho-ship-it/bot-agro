@@ -5,6 +5,7 @@ google-auth
 pdf2image
 google-api-python-client
 python-docx
+Pillow
 requests
 fastapi
 uvicorn[standard]

@@ -26,6 +26,10 @@ from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -61,6 +65,8 @@ FIELD_REPORTS_COLUMNS = [
     "docx_storage_path", "docx_public_url", "error", "progress_message",
     "started_at", "finished_at", "created_at", "updated_at",
 ]
+MAX_REPORT_PHOTOS = 15
+REPORT_DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -87,7 +93,10 @@ def get_google_sheet():
     gc = gspread.authorize(creds)
     return gc.open_by_key(GOOGLE_SHEET_ID)
 
-def upload_field_file_to_supabase(file_path, storage_path, content_type=None):
+def supabase_response_error(response, url):
+    return f"Supabase Storage ERROR status={response.status_code} url={url} body={response.text}"
+
+def upload_field_file_to_supabase(file_path, storage_path, content_type=None, upsert=False):
     if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET):
         return None
 
@@ -97,11 +106,12 @@ def upload_field_file_to_supabase(file_path, storage_path, content_type=None):
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
         "Content-Type": content_type or "application/octet-stream",
-        "x-upsert": "false",
+        "x-upsert": "true" if upsert else "false",
     }
     with open(file_path, "rb") as f:
         response = requests.post(upload_url, headers=headers, data=f, timeout=60)
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(supabase_response_error(response, upload_url))
     public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_path}"
     return {"path": storage_path, "public_url": public_url}
 
@@ -1122,24 +1132,48 @@ def add_markdown_to_doc(document, markdown_text):
         else:
             document.add_paragraph(text)
 
+def prepare_photo_for_docx(photo_path, work_dir, index):
+    if not Image:
+        logger.warning("Pillow no disponible; se inserta la foto sin comprimir")
+        return photo_path
+
+    output_path = work_dir / f"docx_photo_{index}.jpg"
+    with Image.open(photo_path) as image:
+        image.thumbnail((1600, 1600))
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        elif image.mode == "L":
+            image = image.convert("RGB")
+        image.save(output_path, format="JPEG", quality=72, optimize=True)
+    return output_path
+
 def add_photo_evidence_to_doc(document, photos, work_dir):
     if not photos:
         document.add_paragraph("No registrado en la recorrida.")
         return
 
-    for index, photo in enumerate(photos, start=1):
+    limited_photos = photos[:MAX_REPORT_PHOTOS]
+    omitted_count = max(0, len(photos) - len(limited_photos))
+    if omitted_count:
+        document.add_paragraph(f"Se muestran {MAX_REPORT_PHOTOS} fotos de {len(photos)} para mantener el informe liviano.")
+        logger.info(f"Fotos limitadas en DOCX: {len(limited_photos)} de {len(photos)}")
+
+    for index, photo in enumerate(limited_photos, start=1):
+        try:
+            photo_path = download_field_item_file(photo, work_dir, ".jpg")
+            prepared_photo_path = prepare_photo_for_docx(photo_path, work_dir, index)
+        except Exception as e:
+            logger.error(f"Foto omitida en DOCX: {photo.get('nombre_archivo') or photo.get('id')}: {e}")
+            continue
+
         document.add_heading(f"Foto {index}", level=3)
         frame = document.add_table(rows=1, cols=1)
         frame.alignment = WD_TABLE_ALIGNMENT.CENTER
         frame_cell = frame.rows[0].cells[0]
         set_cell_border(frame_cell, color="D6C7A8", size="10")
-        try:
-            photo_path = download_field_item_file(photo, work_dir, ".jpg")
-            paragraph = frame_cell.paragraphs[0]
-            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            paragraph.add_run().add_picture(str(photo_path), width=Inches(5.5))
-        except Exception as e:
-            frame_cell.paragraphs[0].add_run(f"No se pudo insertar la imagen: {e}")
+        paragraph = frame_cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.add_run().add_picture(str(prepared_photo_path), width=Inches(5.0))
 
         caption = document.add_paragraph()
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1289,11 +1323,13 @@ def generate_field_report(session_id, force=False):
     logger.info(f"Audios encontrados: {len(audios)}")
     logger.info(f"Fotos encontradas: {len(photos)}")
 
-    report_id = existing_report.get("id") if existing_report and existing_report.get("estado") == "error" else uuid.uuid4().hex
+    report_id = uuid.uuid4().hex
     now = datetime.utcnow().isoformat() + "Z"
     title = f"Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or now)[:10]}"
     work_dir = DATA_DIR / "field_reports" / safe_storage_segment(session_id, "session") / report_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    docx_path = None
+    upload_started = False
 
     try:
         upsert_field_report({
@@ -1330,14 +1366,22 @@ def generate_field_report(session_id, force=False):
         create_report_docx(session, items, audios, photos, markdown_text, docx_path, work_dir)
 
         campo_segment = safe_storage_segment(session.get("campo"), "sin-campo")
-        storage_path = f"reports/{campo_segment}/{session_id}/{docx_name}"
+        session_segment = safe_storage_segment(session_id, "session")
+        storage_path = f"reports/{campo_segment}/{session_segment}/{docx_name}"
         logger.info(f"Subiendo DOCX a Supabase: {storage_path}")
         update_report_progress(report_id, "Subiendo DOCX")
-        supabase_file = upload_field_file_to_supabase(
-            docx_path,
-            storage_path,
-            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        )
+        upload_started = True
+        try:
+            supabase_file = upload_field_file_to_supabase(
+                docx_path,
+                storage_path,
+                content_type=REPORT_DOCX_CONTENT_TYPE,
+                upsert=True,
+            )
+        except Exception as e:
+            logger.error(f"DOCX creado, falló subida a Supabase. docx_path={docx_path}")
+            update_report_progress(report_id, "DOCX creado, falló subida a Supabase", estado="error")
+            raise RuntimeError(f"{e} | docx_path={docx_path}")
         report = {
             "id": report_id,
             "session_id": session_id,
@@ -1357,13 +1401,16 @@ def generate_field_report(session_id, force=False):
         logger.info(f"Informe OK: {report_id}")
         return report
     except Exception as e:
+        progress_message = "DOCX creado, falló subida a Supabase" if upload_started and docx_path else "Error al generar informe"
+        if docx_path and docx_path.exists():
+            logger.error(f"Copia local temporal del DOCX: {docx_path}")
         error_report = {
             "id": report_id,
             "session_id": session_id,
             "estado": "error",
             "titulo": title,
             "error": str(e),
-            "progress_message": "Error al generar informe",
+            "progress_message": progress_message,
             "started_at": now,
             "finished_at": datetime.utcnow().isoformat() + "Z",
             "created_at": now,
