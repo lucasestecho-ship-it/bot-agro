@@ -65,7 +65,10 @@ FIELD_REPORTS_COLUMNS = [
     "docx_storage_path", "docx_public_url", "error", "progress_message",
     "started_at", "finished_at", "created_at", "updated_at",
 ]
-MAX_REPORT_PHOTOS = 15
+MAX_REPORT_PHOTOS = 8
+LIGHT_REPORT_ITEM_LIMIT = 30
+PHOTO_PROMPT_LIMIT = 12
+MAX_SOURCE_PHOTO_BYTES = 12 * 1024 * 1024
 REPORT_DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -124,10 +127,13 @@ def download_supabase_storage_file(storage_path, destination_path):
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
     }
-    response = requests.get(url, headers=headers, timeout=60)
+    response = requests.get(url, headers=headers, timeout=60, stream=True)
     response.raise_for_status()
     destination_path.parent.mkdir(parents=True, exist_ok=True)
-    destination_path.write_bytes(response.content)
+    with destination_path.open("wb") as output:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                output.write(chunk)
     return destination_path
 
 def safe_storage_segment(value, fallback):
@@ -744,9 +750,13 @@ def download_field_item_file(item, work_dir, fallback_extension):
     public_url = item.get("storage_public_url") or ""
     if public_url:
         try:
-            response = requests.get(public_url, timeout=60)
+            response = requests.get(public_url, timeout=60, stream=True)
             response.raise_for_status()
-            destination.write_bytes(response.content)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
             return destination
         except Exception:
             if not item.get("storage_path"):
@@ -843,6 +853,23 @@ def audio_error_lines(audios_con_error):
         for audio in audios_con_error
     ]
 
+def summarized_photo_lines(photos, limit=PHOTO_PROMPT_LIMIT):
+    lines = [
+        format_item_line(photo) + f" | link: {photo.get('storage_public_url') or 'sin link publico'}"
+        for photo in photos[:limit]
+    ]
+    remaining = len(photos) - len(lines)
+    if remaining > 0:
+        lines.append(f"- {remaining} fotos adicionales listadas solo como evidencia en el DOCX.")
+    return lines
+
+def summarized_item_lines(items, limit=LIGHT_REPORT_ITEM_LIMIT):
+    lines = [format_item_line(item) for item in items[:limit]]
+    remaining = len(items) - len(lines)
+    if remaining > 0:
+        lines.append(f"- {remaining} items adicionales omitidos del prompt para modo liviano.")
+    return lines
+
 def build_basic_report_markdown(session, audios, photos, items, audios_con_error=None):
     audios_con_error = audios_con_error or []
     transcript_lines = [
@@ -883,10 +910,9 @@ def build_report_markdown(session, audios, photos, items, audios_con_error=None)
             )
         )
 
-    photo_lines = [
-        format_item_line(photo) + f" | link: {photo.get('storage_public_url') or 'sin link publico'}"
-        for photo in photos
-    ]
+    light_mode = len(items) > LIGHT_REPORT_ITEM_LIMIT
+    photo_lines = summarized_photo_lines(photos)
+    item_lines = summarized_item_lines(items) if light_mode else [format_item_line(item) for item in items]
     audio_error_text = "\n".join(audio_error_lines(audios_con_error))
     no_valid_audio_text = ""
     if not any(audio.get("transcript_text") for audio in audios):
@@ -921,7 +947,7 @@ Fotos como evidencia, sin interpretacion:
 {chr(10).join(photo_lines) or "No registrado en la recorrida"}
 
 Listado completo de items:
-{chr(10).join(format_item_line(item) for item in items) or "No registrado en la recorrida"}
+{chr(10).join(item_lines) or "No registrado en la recorrida"}
 """
     response = get_openai_client().chat.completions.create(
         model=os.environ.get("FIELD_REPORT_MODEL", "gpt-4o-mini"),
@@ -1133,37 +1159,75 @@ def add_markdown_to_doc(document, markdown_text):
             document.add_paragraph(text)
 
 def prepare_photo_for_docx(photo_path, work_dir, index):
+    size_bytes = photo_path.stat().st_size if photo_path.exists() else 0
+    if size_bytes > MAX_SOURCE_PHOTO_BYTES:
+        raise RuntimeError(f"foto demasiado pesada para insertar ({size_bytes} bytes)")
+
     if not Image:
         logger.warning("Pillow no disponible; se inserta la foto sin comprimir")
         return photo_path
 
     output_path = work_dir / f"docx_photo_{index}.jpg"
     with Image.open(photo_path) as image:
-        image.thumbnail((1600, 1600))
+        image.verify()
+    with Image.open(photo_path) as image:
+        image.thumbnail((1280, 1280))
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
         elif image.mode == "L":
             image = image.convert("RGB")
-        image.save(output_path, format="JPEG", quality=72, optimize=True)
+        image.save(output_path, format="JPEG", quality=68, optimize=True)
     return output_path
+
+def add_photo_metadata_table(document, photos, title):
+    if not photos:
+        return
+
+    document.add_heading(title, level=2)
+    table = document.add_table(rows=1, cols=6)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    headers = ["fecha_hora", "sector", "GPS", "precision", "archivo", "link"]
+    for idx, header in enumerate(headers):
+        cell = table.rows[0].cells[idx]
+        set_cell_shading(cell, BRAND_BEIGE)
+        set_cell_text(cell, header, bold=True, color=BRAND_DARK)
+        set_cell_border(cell, color="D6C7A8", size="4")
+
+    for photo in photos:
+        row = table.add_row().cells
+        values = [
+            photo.get("fecha_hora") or "",
+            photo.get("sector") or "",
+            f"{photo.get('latitud') or '-'}, {photo.get('longitud') or '-'}",
+            photo.get("precision_gps") or "",
+            photo.get("nombre_archivo") or "",
+            photo.get("storage_public_url") or "",
+        ]
+        for idx, value in enumerate(values):
+            set_cell_text(row[idx], value)
+            set_cell_border(row[idx], color="D6C7A8", size="4")
 
 def add_photo_evidence_to_doc(document, photos, work_dir):
     if not photos:
         document.add_paragraph("No registrado en la recorrida.")
         return
 
-    limited_photos = photos[:MAX_REPORT_PHOTOS]
-    omitted_count = max(0, len(photos) - len(limited_photos))
+    inserted_photos = photos[:MAX_REPORT_PHOTOS]
+    not_inserted_photos = photos[MAX_REPORT_PHOTOS:]
+    omitted_count = len(not_inserted_photos)
     if omitted_count:
         document.add_paragraph(f"Se muestran {MAX_REPORT_PHOTOS} fotos de {len(photos)} para mantener el informe liviano.")
-        logger.info(f"Fotos limitadas en DOCX: {len(limited_photos)} de {len(photos)}")
+        logger.info(f"Fotos limitadas en DOCX: {len(inserted_photos)} de {len(photos)}")
 
-    for index, photo in enumerate(limited_photos, start=1):
+    for index, photo in enumerate(inserted_photos, start=1):
+        photo_path = None
+        prepared_photo_path = None
         try:
             photo_path = download_field_item_file(photo, work_dir, ".jpg")
             prepared_photo_path = prepare_photo_for_docx(photo_path, work_dir, index)
         except Exception as e:
             logger.error(f"Foto omitida en DOCX: {photo.get('nombre_archivo') or photo.get('id')}: {e}")
+            not_inserted_photos.append(photo)
             continue
 
         document.add_heading(f"Foto {index}", level=3)
@@ -1174,6 +1238,13 @@ def add_photo_evidence_to_doc(document, photos, work_dir):
         paragraph = frame_cell.paragraphs[0]
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         paragraph.add_run().add_picture(str(prepared_photo_path), width=Inches(5.0))
+        try:
+            if prepared_photo_path and prepared_photo_path != photo_path:
+                prepared_photo_path.unlink(missing_ok=True)
+            if photo_path:
+                photo_path.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"No se pudo borrar temporal de foto: {e}")
 
         caption = document.add_paragraph()
         caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -1201,6 +1272,8 @@ def add_photo_evidence_to_doc(document, photos, work_dir):
             set_cell_text(row[1], value)
             set_cell_border(row[0], color="D6C7A8", size="4")
             set_cell_border(row[1], color="D6C7A8", size="4")
+
+    add_photo_metadata_table(document, not_inserted_photos, "Evidencias fotograficas no insertadas")
 
 def create_report_docx(session, items, audios, photos, markdown_text, output_path, work_dir):
     logger.info("Creando DOCX")
@@ -1320,8 +1393,11 @@ def generate_field_report(session_id, force=False):
     items.sort(key=lambda item: item.get("fecha_hora") or "")
     audios = [item for item in items if item.get("tipo") == "audio"]
     photos = [item for item in items if item.get("tipo") == "foto"]
+    light_mode = len(items) > LIGHT_REPORT_ITEM_LIMIT
     logger.info(f"Audios encontrados: {len(audios)}")
     logger.info(f"Fotos encontradas: {len(photos)}")
+    if light_mode:
+        logger.info(f"Informe en modo liviano por cantidad de items: {len(items)}")
 
     report_id = uuid.uuid4().hex
     now = datetime.utcnow().isoformat() + "Z"
@@ -1363,7 +1439,10 @@ def generate_field_report(session_id, force=False):
         docx_name = f"informe_recorrida_{(session.get('started_at') or now)[:10]}_{report_id}.docx"
         docx_path = work_dir / docx_name
         update_report_progress(report_id, "Creando DOCX")
-        create_report_docx(session, items, audios, photos, markdown_text, docx_path, work_dir)
+        try:
+            create_report_docx(session, items, audios, photos, markdown_text, docx_path, work_dir)
+        except MemoryError:
+            raise RuntimeError("Memoria insuficiente generando DOCX; informe demasiado pesado")
 
         campo_segment = safe_storage_segment(session.get("campo"), "sin-campo")
         session_segment = safe_storage_segment(session_id, "session")
@@ -1402,6 +1481,9 @@ def generate_field_report(session_id, force=False):
         return report
     except Exception as e:
         progress_message = "DOCX creado, falló subida a Supabase" if upload_started and docx_path else "Error al generar informe"
+        error_message = str(e) or "Error desconocido generando informe"
+        if isinstance(e, MemoryError):
+            error_message = "Memoria insuficiente generando DOCX; informe demasiado pesado"
         if docx_path and docx_path.exists():
             logger.error(f"Copia local temporal del DOCX: {docx_path}")
         error_report = {
@@ -1409,7 +1491,7 @@ def generate_field_report(session_id, force=False):
             "session_id": session_id,
             "estado": "error",
             "titulo": title,
-            "error": str(e),
+            "error": error_message,
             "progress_message": progress_message,
             "started_at": now,
             "finished_at": datetime.utcnow().isoformat() + "Z",
@@ -1420,8 +1502,8 @@ def generate_field_report(session_id, force=False):
             upsert_field_report(error_report)
         except Exception:
             pass
-        logger.error(f"Informe ERROR: {e}")
-        raise
+        logger.error(f"Informe ERROR: {error_message}")
+        raise RuntimeError(error_message)
 
 def get_superficie_from_hoja2(lote):
     try:
