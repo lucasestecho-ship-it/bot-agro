@@ -122,6 +122,8 @@ create table if not exists public.field_items (
   storage_path text,
   storage_public_url text,
   storage_error text,
+  photo_label text,
+  audio_label text,
   created_at timestamptz default now()
 );
 
@@ -141,6 +143,8 @@ add column if not exists storage_provider text,
 add column if not exists storage_path text,
 add column if not exists storage_public_url text,
 add column if not exists storage_error text,
+add column if not exists photo_label text,
+add column if not exists audio_label text,
 add column if not exists session_id text,
 add column if not exists transcript_status text,
 add column if not exists transcript_text text,

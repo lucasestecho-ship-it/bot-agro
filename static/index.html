@@ -50,6 +50,11 @@
 
     <section class="actions">
       <button id="talkButton" class="talk" type="button">Mantener para hablar</button>
+      <div id="recordingControls" class="recording-controls" hidden>
+        <div id="recordingDuration" class="item-meta">Grabando... 0 s</div>
+        <button id="stopRecordingButton" type="button">Detener y guardar</button>
+        <button id="cancelRecordingButton" class="secondary-button" type="button">Cancelar</button>
+      </div>
       <label class="photo-button">
         Foto
         <input id="photoInput" type="file" accept="image/*" capture="environment">

@@ -53,7 +53,7 @@ FIELD_ITEMS_COLUMNS = [
     "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
     "precision_gps", "nombre_archivo", "estado", "storage_status",
     "storage_provider", "storage_path", "storage_public_url", "storage_error",
-    "session_id", "transcript_status", "transcript_text", "transcript_error",
+    "session_id", "photo_label", "audio_label", "transcript_status", "transcript_text", "transcript_error",
     "transcript_model", "transcript_at", "created_at",
 ]
 FIELD_SESSIONS_COLUMNS = [
@@ -157,6 +157,21 @@ def safe_storage_segment(value, fallback):
     text = re.sub(r"[^a-z0-9._-]+", "-", text)
     text = text.strip("-._")
     return text or fallback
+
+def clean_report_filename_segment(value, fallback="Sin_Campo", max_length=60):
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    text = "".join(
+        char for char in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(char)
+    )
+    text = re.sub(r"[^A-Za-z0-9]+", " ", text).strip()
+    if not text:
+        return fallback
+    words = [word[:1].upper() + word[1:] for word in text.split()]
+    cleaned = "_".join(words)
+    return cleaned[:max_length].strip("_") or fallback
 
 def encode_legacy_session_id(campo, sector):
     payload = json.dumps(
@@ -352,6 +367,8 @@ def field_metadata_to_item(metadata):
         "storage_error": metadata.get("storage_error", ""),
         "session_id": metadata.get("session_id", ""),
         "session_nombre": metadata.get("session_nombre", ""),
+        "photo_label": metadata.get("photo_label", ""),
+        "audio_label": metadata.get("audio_label", ""),
         "transcript_status": metadata.get("transcript_status", ""),
         "transcript_text": metadata.get("transcript_text", ""),
         "transcript_error": metadata.get("transcript_error", ""),
@@ -469,6 +486,8 @@ def upsert_field_item_metadata(metadata):
         "storage_public_url": item["storage_public_url"],
         "storage_error": item["storage_error"],
         "session_id": clean_db_value(item.get("session_id")),
+        "photo_label": clean_db_value(item.get("photo_label")),
+        "audio_label": clean_db_value(item.get("audio_label")),
         "transcript_status": clean_db_value(item.get("transcript_status")),
         "transcript_text": clean_db_value(item.get("transcript_text")),
         "transcript_error": clean_db_value(item.get("transcript_error")),
@@ -497,7 +516,7 @@ def list_field_items_from_supabase():
         "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
         "precision_gps", "nombre_archivo", "estado", "storage_status",
         "storage_provider", "storage_path", "storage_public_url", "storage_error",
-        "session_id", "created_at",
+        "session_id", "photo_label", "audio_label", "created_at",
     ]
     legacy_columns = [
         "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
@@ -915,7 +934,7 @@ def audio_error_lines(audios_con_error):
 
 def summarized_photo_lines(photos, limit=PHOTO_PROMPT_LIMIT):
     lines = [
-        format_item_line(photo) + f" | link: {photo.get('storage_public_url') or 'sin link publico'}"
+        format_item_line(photo) + f" | comentario: {photo.get('photo_label') or 'sin comentario'}"
         for photo in photos[:limit]
     ]
     remaining = len(photos) - len(lines)
@@ -1313,9 +1332,9 @@ def add_photo_metadata_table(document, photos, title):
         return
 
     document.add_heading(title, level=2)
-    table = document.add_table(rows=1, cols=4)
+    table = document.add_table(rows=1, cols=5)
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    headers = ["fecha", "sector", "GPS", "archivo"]
+    headers = ["fecha", "sector", "comentario", "GPS", "archivo"]
     for idx, header in enumerate(headers):
         cell = table.rows[0].cells[idx]
         set_cell_shading(cell, BRAND_BEIGE)
@@ -1327,6 +1346,7 @@ def add_photo_metadata_table(document, photos, title):
         values = [
             photo.get("fecha_hora") or "",
             photo.get("sector") or "",
+            photo.get("photo_label") or "",
             f"{photo.get('latitud') or '-'}, {photo.get('longitud') or '-'}",
             photo.get("nombre_archivo") or "",
         ]
@@ -1357,7 +1377,9 @@ def add_photo_evidence_to_doc(document, photos, work_dir):
             not_inserted_photos.append(photo)
             continue
 
-        document.add_heading(f"Foto {index}", level=3)
+        label = clean_inline_markdown(photo.get("photo_label") or "")
+        heading = f"Foto {index} — {label}" if label else f"Foto {index}"
+        document.add_heading(heading, level=3)
         frame = document.add_table(rows=1, cols=1)
         frame.alignment = WD_TABLE_ALIGNMENT.CENTER
         frame_cell = frame.rows[0].cells[0]
@@ -1391,6 +1413,7 @@ def add_photo_evidence_to_doc(document, photos, work_dir):
         evidence = document.add_table(rows=0, cols=2)
         for label, value in [
             ("Archivo", photo.get("nombre_archivo") or "No registrado en la recorrida"),
+            ("Comentario", photo.get("photo_label") or "Sin comentario"),
             ("Original", "Ver archivo original" if photo.get("storage_public_url") else "No registrado en la recorrida"),
         ]:
             row = evidence.add_row().cells
@@ -1549,7 +1572,9 @@ def generate_field_report(session_id, force=False):
             logger.error(f"Informe texto IA ERROR: {e}")
             markdown_text = build_basic_report_markdown(session, audios, photos, items, audios_con_error)
         summary = markdown_summary(markdown_text)
-        docx_name = f"informe_recorrida_{(session.get('started_at') or now)[:10]}_{report_id}.docx"
+        report_date = (session.get("started_at") or now)[:10]
+        campo_filename = clean_report_filename_segment(session.get("campo"), "Sin_Campo")
+        docx_name = f"Informe_{campo_filename}_{report_date}.docx"
         docx_path = work_dir / docx_name
         update_report_progress(report_id, "Creando DOCX")
         try:
@@ -2921,6 +2946,8 @@ async def create_field_item(
     gps_accuracy: str = Form(""),
     client_id: str = Form(""),
     session_id: str = Form(""),
+    photo_label: str = Form(""),
+    audio_label: str = Form(""),
     file: UploadFile = File(...),
 ):
     item_type = item_type.strip().lower()
@@ -2961,6 +2988,8 @@ async def create_field_item(
         "storage_status": "local_only",
         "storage_provider": "local",
         "session_id": session_id.strip(),
+        "photo_label": photo_label.strip(),
+        "audio_label": audio_label.strip(),
     }
     if session_id.strip():
         logger.info(f"Item asociado a session_id: {session_id.strip()}")

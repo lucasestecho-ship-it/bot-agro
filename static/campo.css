@@ -158,6 +158,19 @@ button,
   background: #a43b2f;
 }
 
+.recording-controls {
+  display: grid;
+  gap: 8px;
+}
+
+.recording-controls[hidden] {
+  display: none;
+}
+
+.recording-controls .secondary-button {
+  margin-top: 0;
+}
+
 .photo-button {
   display: grid;
   place-items: center;
