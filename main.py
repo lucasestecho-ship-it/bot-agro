@@ -3086,6 +3086,13 @@ async def root():
 async def campo():
     return FileResponse(STATIC_DIR / "index.html")
 
+@fastapi_app.get("/sw.js", include_in_schema=False)
+async def campo_service_worker():
+    response = FileResponse(STATIC_DIR / "sw.js", media_type="application/javascript")
+    response.headers["Service-Worker-Allowed"] = "/"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
 @fastapi_app.get("/api/health/campo")
 async def health_campo():
     tables = {

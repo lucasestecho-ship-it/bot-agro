@@ -1468,7 +1468,9 @@ window.addEventListener("online", async () => {
 window.addEventListener("offline", setConnectionStatus);
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/static/sw.js");
+  navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch((error) => {
+    appendDebug(`No se pudo iniciar el servicio de avisos: ${error.message || error}`);
+  });
 }
 
 loadInputs();
