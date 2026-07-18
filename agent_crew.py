@@ -589,3 +589,36 @@ Salidas: {json.dumps(worker_payload, ensure_ascii=False)}
                 f"y {len(uncovered)} clientes sin proximo paso."
             ),
         }
+
+    def persist_daily_review(self):
+        review = self.daily_review()
+        now = iso_now()
+        due_tasks = (review.get("overdue") or []) + (review.get("today") or [])
+        run = {
+            "id": f"run-daily-cartera-{review['date']}",
+            "event_id": f"daily-cartera-{review['date']}",
+            "agent": "Cartera",
+            "status": "completed",
+            "input_summary": "Revision autonoma diaria de clientes y compromisos",
+            "output": normalize_worker_output({
+                "summary": review["summary"],
+                "findings": [
+                    f"{task.get('client_name') or 'Sin cliente'}: {task.get('title') or 'pendiente'}"
+                    for task in due_tasks[:12]
+                ],
+                "recommendations": [
+                    "Revisar primero los compromisos vencidos y las decisiones pendientes"
+                ] if due_tasks else ["No hay compromisos vencidos ni para hoy"],
+                "missing_data": [
+                    f"{client.get('name') or 'Cliente'}: falta proximo paso o frecuencia"
+                    for client in (review.get("clients_without_next_action") or [])[:12]
+                ],
+                "next_actions": [],
+            }),
+            "error": "",
+            "started_at": now,
+            "finished_at": now,
+            "created_at": now,
+        }
+        self._save_run(run)
+        return {"review": review, "run": run}

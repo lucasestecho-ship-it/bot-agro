@@ -14,18 +14,32 @@
     <header class="topbar">
       <div>
         <p class="eyebrow">Capataz Campo</p>
-        <h1>Qué tengo que hacer hoy</h1>
+        <h1>Qué hicieron hoy los agentes</h1>
       </div>
       <span id="connectionStatus" class="status">offline</span>
     </header>
 
+    <section class="panel work-panel">
+      <div class="list-header">
+        <div>
+          <h2>Trabajo de la cuadrilla</h2>
+          <p id="agentWorkSummary" class="section-copy">Cargando trabajos...</p>
+        </div>
+        <button id="refreshDashboardButton" class="compact-button" type="button">Actualizar</button>
+      </div>
+      <div id="agentWorkList" class="agent-work-list"></div>
+      <div id="emailDraftsBox" class="email-drafts-box" hidden>
+        <h3>Correos preparados</h3>
+        <div id="emailDraftsList" class="email-drafts-list"></div>
+      </div>
+    </section>
+
     <section class="panel today-panel">
       <div class="list-header">
         <div>
-          <h2>Seguimiento</h2>
+          <h2>Lo que necesita tu intervención</h2>
           <p id="todaySummary" class="section-copy">Cargando tareas...</p>
         </div>
-        <button id="refreshDashboardButton" class="compact-button" type="button">Actualizar</button>
       </div>
       <div class="quick-buttons">
         <button id="notificationsButton" class="secondary-button compact-button" type="button">Activar avisos</button>
@@ -48,10 +62,10 @@
 
     <section class="panel intake-panel">
       <p class="eyebrow">Entrada del Capataz</p>
-      <h2>Contame qué pasó o qué tenés que hacer</h2>
-      <textarea id="noteInput" rows="4" placeholder="Ej: Doña Elena. Mandar la receta el martes y volver dentro de siete días."></textarea>
-      <button id="analyzeTextButton" class="primary-wide" type="button">Revisar y guardar</button>
-      <p id="sharedTextNotice" class="notice" hidden>Recibido desde otra aplicación. Revisalo y tocá “Revisar y guardar”.</p>
+      <h2>Mandales material o pediles un trabajo</h2>
+      <textarea id="noteInput" rows="4" placeholder="Ej: Doña Elena. Analicen esta recorrida, comparen alternativas y déjenme listo el correo para el cliente."></textarea>
+      <button id="analyzeTextButton" class="primary-wide" type="button">Asignar a los agentes</button>
+      <p id="sharedTextNotice" class="notice" hidden>Recibido desde otra aplicación. Revisalo y tocá “Asignar a los agentes”.</p>
     </section>
 
     <section class="panel">
@@ -147,7 +161,7 @@
         <div id="draftAgents" class="agent-row"></div>
       </details>
       <div class="list-header draft-task-header">
-        <h3>Compromisos y recordatorios</h3>
+        <h3>Acciones detectadas (secundario)</h3>
         <button id="addDraftTaskButton" class="compact-button" type="button">Agregar tarea</button>
       </div>
       <div id="draftTasks" class="draft-tasks"></div>

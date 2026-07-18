@@ -69,6 +69,10 @@ const noteInput = document.getElementById("noteInput");
 const analyzeTextButton = document.getElementById("analyzeTextButton");
 const sharedTextNotice = document.getElementById("sharedTextNotice");
 const refreshDashboardButton = document.getElementById("refreshDashboardButton");
+const agentWorkSummary = document.getElementById("agentWorkSummary");
+const agentWorkList = document.getElementById("agentWorkList");
+const emailDraftsBox = document.getElementById("emailDraftsBox");
+const emailDraftsList = document.getElementById("emailDraftsList");
 const todaySummary = document.getElementById("todaySummary");
 const todayTasksList = document.getElementById("todayTasksList");
 const clientsDatalist = document.getElementById("clientsDatalist");
@@ -263,7 +267,7 @@ function currentSessionPayload(session) {
   };
 }
 
-async function syncSession(session) {
+async function syncSession(session, options = {}) {
   if (!session || !navigator.onLine) return false;
   try {
     appendDebug(`Sincronizando recorrida ${session.nombre || session.id}...`);
@@ -278,13 +282,23 @@ async function syncSession(session) {
     if (data.supabase_error) throw new Error(`Supabase no guardó la recorrida: ${data.supabase_error}`);
 
     let updated = { ...session, syncStatus: "sincronizada", errorMessage: "" };
-    if (updated.estado === "cerrada" && updated.closedAt) {
+    if (updated.estado === "cerrada" && options.deferClose) {
+      updated.syncStatus = "cierre preparado";
+    } else if (updated.estado === "cerrada" && updated.closedAt) {
       const closeResponse = await fetch(`/api/field-sessions/${encodeURIComponent(updated.id)}/close`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ closed_at: updated.closedAt }),
       });
       if (!closeResponse.ok) throw new Error(`HTTP ${closeResponse.status}`);
+      const closeData = await closeResponse.json();
+      if (closeData.report_queued) {
+        appendDebug("Informe automático en cola.");
+        window.setTimeout(renderSessions, 7000);
+        window.setTimeout(loadDashboard, 7000);
+        window.setTimeout(renderSessions, 25000);
+        window.setTimeout(loadDashboard, 25000);
+      }
       updated.syncStatus = "cerrada sincronizada";
     }
     upsertLocalSession(updated);
@@ -301,14 +315,27 @@ async function syncSession(session) {
   }
 }
 
-async function syncLocalSessions() {
+async function syncLocalSessions(options = {}) {
   if (!navigator.onLine) return;
+  const phase = options.phase || "all";
+  const readySessionIds = options.readySessionIds || null;
   const sessions = getLocalSessions().filter((session) => {
+    if (phase === "open") {
+      return session.estado !== "cerrada" && session.syncStatus !== "sincronizada";
+    }
+    if (phase === "prepare_closed") {
+      return session.estado === "cerrada" && session.syncStatus !== "cerrada sincronizada";
+    }
+    if (phase === "finalize_closed") {
+      return session.estado === "cerrada"
+        && session.syncStatus !== "cerrada sincronizada"
+        && (!readySessionIds || readySessionIds.has(session.id));
+    }
     if (session.estado === "cerrada") return session.syncStatus !== "cerrada sincronizada";
     return session.syncStatus !== "sincronizada";
   });
   for (const session of sessions) {
-    await syncSession(session);
+    await syncSession(session, { deferClose: phase === "prepare_closed" });
   }
 }
 
@@ -465,6 +492,11 @@ function addSessionAssignmentControls(container, item, sessions) {
     option.textContent = `${session.nombre || "Recorrida"} · ${session.campo || "sin campo"}`;
     select.appendChild(option);
   }
+  const email = document.createElement("input");
+  email.type = "email";
+  email.placeholder = "Correo del cliente";
+  email.value = client.email || "";
+  email.setAttribute("aria-label", `Correo para ${client.name || "cliente"}`);
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = "Asignar a recorrida";
@@ -759,7 +791,10 @@ async function syncPending(options = {}) {
     appendDebug("Error al subir: sin conexión");
     return;
   }
-  await syncLocalSessions();
+  await syncLocalSessions({ phase: "open" });
+  // Una recorrida cerrada offline debe existir en el servidor antes de subir sus archivos,
+  // pero se finaliza recien despues de que todos sus items quedaron confirmados.
+  await syncLocalSessions({ phase: "prepare_closed" });
   const items = await getItems();
   const shouldForce = Boolean(options.force);
   const uploadable = items.filter((entry) => {
@@ -775,6 +810,16 @@ async function syncPending(options = {}) {
   for (const item of uploadable) {
     await uploadLocalItem(item);
   }
+  const refreshedItems = await getItems();
+  const readyClosedSessionIds = new Set(
+    getLocalSessions()
+      .filter((session) => session.estado === "cerrada")
+      .filter((session) => !refreshedItems.some(
+        (item) => item.sessionId === session.id && item.status !== "subido confirmado"
+      ))
+      .map((session) => session.id)
+  );
+  await syncLocalSessions({ phase: "finalize_closed", readySessionIds: readyClosedSessionIds });
   await renderItems();
   await renderServerItems();
   await renderSessions();
@@ -833,8 +878,7 @@ async function closeFieldSession() {
   renderActiveSession();
   appendDebug(`Recorrida cerrada: ${closed.nombre || closed.id}`);
   if (navigator.onLine) {
-    await syncSession(closed);
-    await renderSessions();
+    await syncPending();
   }
 }
 
@@ -1071,7 +1115,7 @@ async function analyzeTextIntake() {
     alert(`No pude analizar la nota: ${error.message || error}`);
   } finally {
     analyzeTextButton.disabled = false;
-    analyzeTextButton.textContent = "Revisar y guardar";
+    analyzeTextButton.textContent = "Asignar a los agentes";
   }
 }
 
@@ -1231,7 +1275,10 @@ function createUncoveredClientItem(client) {
       const response = await fetch(`/api/capataz/clients/${encodeURIComponent(client.id)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ followup_days: Number(select.value) }),
+        body: JSON.stringify({
+          followup_days: Number(select.value),
+          email: email.value.trim() || null,
+        }),
       });
       const data = await response.json();
       if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
@@ -1241,7 +1288,7 @@ function createUncoveredClientItem(client) {
       alert(`No pude guardar la frecuencia: ${error.message || error}`);
     }
   });
-  controls.append(select, save);
+  controls.append(select, email, save);
   li.append(title, controls);
   return li;
 }
@@ -1265,12 +1312,231 @@ async function showDueNotification(dashboard) {
   localStorage.setItem("capataz.lastNotification", hash);
 }
 
+function normalizeAgentOutput(run) {
+  const output = run?.output;
+  if (output && typeof output === "object") return output;
+  if (typeof output === "string") {
+    try {
+      const parsed = JSON.parse(output);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function formatWorkTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("es-AR", { dateStyle: "short", timeStyle: "short" });
+}
+
+async function prepareEmailForEvent(eventId, button) {
+  button.disabled = true;
+  button.textContent = "Preparando...";
+  try {
+    const response = await fetch(`/api/capataz/events/${encodeURIComponent(eventId)}/email-draft`, {
+      method: "POST",
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    await loadDashboard();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "Preparar correo";
+    alert(`No pude preparar el correo: ${error.message || error}`);
+  }
+}
+
+function createAgentWorkCard(group, emailByEvent) {
+  const card = document.createElement("article");
+  card.className = "work-card";
+  const runs = group.runs;
+  const statuses = runs.map((run) => String(run.status || "").toLowerCase());
+  const processing = statuses.some((status) => ["queued", "running"].includes(status));
+  const failed = statuses.some((status) => ["error", "failed"].includes(status));
+  if (processing) card.classList.add("processing");
+  if (failed) card.classList.add("failed");
+
+  const heading = document.createElement("div");
+  heading.className = "work-card-title";
+  const title = document.createElement("strong");
+  title.textContent = group.inputSummary || "Trabajo recibido";
+  const state = document.createElement("span");
+  state.className = `work-state${processing ? " processing" : failed ? " failed" : ""}`;
+  state.textContent = processing ? "trabajando" : failed ? "con error" : "terminado";
+  heading.append(title, state);
+
+  const agents = document.createElement("div");
+  agents.className = "work-card-agents";
+  for (const run of runs) {
+    const badge = document.createElement("span");
+    badge.className = "agent-badge";
+    badge.textContent = run.agent || "Agente";
+    agents.appendChild(badge);
+  }
+
+  const preferredRun = runs.find((run) => run.agent === "Contralor")
+    || [...runs].reverse().find((run) => normalizeAgentOutput(run).summary)
+    || runs[0];
+  const output = normalizeAgentOutput(preferredRun);
+  const summary = document.createElement("div");
+  summary.className = "work-card-summary";
+  summary.textContent = output.summary
+    || (processing ? "Los agentes están procesando la entrada." : "Trabajo terminado; abrí la decisión si requiere aprobación.");
+
+  const meta = document.createElement("div");
+  meta.className = "work-card-meta item-meta";
+  const finished = runs.map((run) => run.finished_at || run.created_at).filter(Boolean).sort().at(-1);
+  meta.textContent = formatWorkTime(finished);
+
+  const actions = document.createElement("div");
+  actions.className = "work-card-actions";
+  if (!processing && !emailByEvent.has(group.eventId)) {
+    const emailButton = document.createElement("button");
+    emailButton.type = "button";
+    emailButton.textContent = "Preparar correo";
+    emailButton.addEventListener("click", () => prepareEmailForEvent(group.eventId, emailButton));
+    actions.appendChild(emailButton);
+  }
+  card.append(heading, agents, summary, meta);
+  if (actions.childElementCount) card.appendChild(actions);
+  return card;
+}
+
+function createReportWorkCard(report) {
+  const card = document.createElement("article");
+  const status = String(report.estado || "").toLowerCase();
+  const processing = status === "generando";
+  const failed = status === "error";
+  card.className = `work-card${processing ? " processing" : failed ? " failed" : ""}`;
+  const heading = document.createElement("div");
+  heading.className = "work-card-title";
+  const title = document.createElement("strong");
+  title.textContent = report.titulo || "Informe de recorrida";
+  const state = document.createElement("span");
+  state.className = `work-state${processing ? " processing" : failed ? " failed" : ""}`;
+  state.textContent = processing ? "generando" : failed ? "con error" : "terminado";
+  heading.append(title, state);
+  const agents = document.createElement("div");
+  agents.className = "work-card-agents";
+  const badge = document.createElement("span");
+  badge.className = "agent-badge";
+  badge.textContent = "Informes";
+  agents.appendChild(badge);
+  const summary = document.createElement("div");
+  summary.className = "work-card-summary";
+  summary.textContent = report.resumen || report.progress_message || report.error || "Informe listo";
+  const actions = document.createElement("div");
+  actions.className = "work-card-actions email-card-actions";
+  for (const [url, label] of [[report.pdf_public_url, "Abrir PDF"], [report.docx_public_url, "Abrir DOCX"]]) {
+    const safeUrl = safeExternalUrl(url);
+    if (!safeUrl || status !== "done") continue;
+    const link = document.createElement("a");
+    link.className = "button-link";
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = label;
+    actions.appendChild(link);
+  }
+  card.append(heading, agents, summary);
+  if (actions.childElementCount) card.appendChild(actions);
+  return card;
+}
+
+function renderAgentWork(runs, emailDrafts, reports = []) {
+  if (!agentWorkList || !agentWorkSummary) return;
+  agentWorkList.innerHTML = "";
+  const emailByEvent = new Map(emailDrafts.filter((item) => item.event_id).map((item) => [item.event_id, item]));
+  const groups = new Map();
+  for (const run of runs) {
+    const eventId = run.event_id || run.id || `sin-evento-${groups.size}`;
+    if (!groups.has(eventId)) groups.set(eventId, { eventId, inputSummary: run.input_summary || "", runs: [] });
+    const group = groups.get(eventId);
+    group.runs.push(run);
+    if (!group.inputSummary && run.input_summary) group.inputSummary = run.input_summary;
+  }
+  const workGroups = [...groups.values()].slice(0, 10);
+  const completed = workGroups.filter((group) => group.runs.every((run) => ["completed", "fallback"].includes(String(run.status || "").toLowerCase()))).length;
+  const processing = workGroups.filter((group) => group.runs.some((run) => ["queued", "running"].includes(String(run.status || "").toLowerCase()))).length;
+  const finishedReports = reports.filter((report) => report.estado === "done").length;
+  const processingReports = reports.filter((report) => report.estado === "generando").length;
+  agentWorkSummary.textContent = `${completed + finishedReports} trabajo(s) terminado(s) · ${processing + processingReports} en proceso`;
+  for (const report of reports.slice(0, 5)) agentWorkList.appendChild(createReportWorkCard(report));
+  if (!workGroups.length && !reports.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty-work";
+    empty.textContent = "Todavía no hay trabajos. Mandales una nota acá o compartí texto, audio, foto o PDF a tu bot de Telegram.";
+    agentWorkList.appendChild(empty);
+    return;
+  }
+  for (const group of workGroups) agentWorkList.appendChild(createAgentWorkCard(group, emailByEvent));
+}
+
+function renderEmailDrafts(emailDrafts) {
+  if (!emailDraftsBox || !emailDraftsList) return;
+  emailDraftsList.innerHTML = "";
+  emailDraftsBox.hidden = !emailDrafts.length;
+  for (const draft of emailDrafts.slice(0, 10)) {
+    const card = document.createElement("article");
+    card.className = "email-card";
+    const title = document.createElement("strong");
+    title.textContent = draft.subject || "Correo preparado";
+    const meta = document.createElement("div");
+    meta.className = "item-meta";
+    const destination = draft.to_email || "destinatario pendiente";
+    const state = draft.status === "gmail_created" ? "borrador creado en Gmail" : "preparado; falta sincronizar con Gmail";
+    meta.textContent = `${draft.client_name || "sin cliente"} · ${destination} · ${state}`;
+    const actions = document.createElement("div");
+    actions.className = "email-card-actions";
+    if (draft.status === "gmail_created") {
+      const open = document.createElement("a");
+      open.className = "button-link";
+      open.href = "https://mail.google.com/mail/u/0/#drafts";
+      open.target = "_blank";
+      open.rel = "noopener noreferrer";
+      open.textContent = "Abrir borradores de Gmail";
+      actions.appendChild(open);
+    } else {
+      const sync = document.createElement("button");
+      sync.type = "button";
+      sync.textContent = "Crear en Gmail";
+      sync.addEventListener("click", async () => {
+        sync.disabled = true;
+        sync.textContent = "Sincronizando...";
+        try {
+          const response = await fetch("/api/capataz/email-drafts/sync", { method: "POST" });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+          if (!data.configured) throw new Error("Gmail todavía no está conectado en Render");
+          await loadDashboard();
+        } catch (error) {
+          sync.disabled = false;
+          sync.textContent = "Crear en Gmail";
+          alert(`No pude crear el borrador en Gmail: ${error.message || error}`);
+        }
+      });
+      actions.appendChild(sync);
+    }
+    card.append(title, meta);
+    if (actions.childElementCount) card.appendChild(actions);
+    emailDraftsList.appendChild(card);
+  }
+}
+
 async function loadDashboard() {
   if (!todayTasksList) return;
   try {
     const response = await fetch("/api/capataz/dashboard");
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    const agentRuns = data.agent_activity || [];
+    const emailDrafts = data.email_drafts || [];
+    renderAgentWork(agentRuns, emailDrafts, data.recent_reports || []);
+    renderEmailDrafts(emailDrafts);
     todayTasksList.innerHTML = "";
     const overdue = data.tasks?.overdue || [];
     const today = data.tasks?.today || [];
@@ -1330,6 +1596,7 @@ async function loadDashboard() {
     }
     await showDueNotification(data);
   } catch (error) {
+    if (agentWorkSummary) agentWorkSummary.textContent = `No pude cargar el trabajo: ${error.message || error}`;
     todaySummary.textContent = `No pude cargar el seguimiento: ${error.message || error}`;
   }
 }
