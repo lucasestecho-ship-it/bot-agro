@@ -1,4 +1,4 @@
-const CACHE_NAME = "capataz-campo-v10";
+const CACHE_NAME = "capataz-campo-v11";
 const ASSETS = [
   "/campo",
   "/static/campo.css",
