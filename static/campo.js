@@ -2,6 +2,46 @@ const DB_NAME = "campo-pwa";
 const STORE_NAME = "items";
 const ACTIVE_SESSION_KEY = "campo.activeSession";
 const SESSIONS_KEY = "campo.sessions";
+const APP_TOKEN_KEY = "capataz.appToken";
+const nativeFetch = window.fetch.bind(window);
+let tokenPromptPromise = null;
+
+function requestFreshAppToken() {
+  if (!tokenPromptPromise) {
+    tokenPromptPromise = Promise.resolve().then(() => (
+      window.prompt("Clave personal de Capataz Campo", "")?.trim() || ""
+    ));
+  }
+  return tokenPromptPromise;
+}
+
+window.fetch = async (input, init = {}) => {
+  const requestUrl = typeof input === "string" ? input : input.url;
+  const isPrivateApi = requestUrl.startsWith("/api/") && requestUrl !== "/api/health/campo";
+  const options = { ...init };
+  if (isPrivateApi) {
+    const headers = new Headers(init.headers || {});
+    const token = localStorage.getItem(APP_TOKEN_KEY) || "";
+    if (token) headers.set("X-Field-App-Token", token);
+    options.headers = headers;
+  }
+  let response = await nativeFetch(input, options);
+  if (isPrivateApi && response.status === 401 && !options._tokenRetried) {
+    const attemptedToken = new Headers(options.headers || {}).get("X-Field-App-Token") || "";
+    const storedToken = localStorage.getItem(APP_TOKEN_KEY) || "";
+    const token = storedToken && storedToken !== attemptedToken
+      ? storedToken
+      : await requestFreshAppToken();
+    if (!token) return response;
+    localStorage.setItem(APP_TOKEN_KEY, token);
+    const headers = new Headers(options.headers || {});
+    headers.set("X-Field-App-Token", token);
+    response = await nativeFetch(input, { ...options, headers, _tokenRetried: true });
+    if (response.status === 401) localStorage.removeItem(APP_TOKEN_KEY);
+    window.setTimeout(() => { tokenPromptPromise = null; }, 250);
+  }
+  return response;
+};
 const campoInput = document.getElementById("campoInput");
 const sectorInput = document.getElementById("sectorInput");
 const sessionNameInput = document.getElementById("sessionNameInput");
@@ -25,6 +65,30 @@ const startSessionButton = document.getElementById("startSessionButton");
 const closeSessionButton = document.getElementById("closeSessionButton");
 const activeSessionStatus = document.getElementById("activeSessionStatus");
 const debugLog = document.getElementById("debugLog");
+const noteInput = document.getElementById("noteInput");
+const analyzeTextButton = document.getElementById("analyzeTextButton");
+const sharedTextNotice = document.getElementById("sharedTextNotice");
+const refreshDashboardButton = document.getElementById("refreshDashboardButton");
+const todaySummary = document.getElementById("todaySummary");
+const todayTasksList = document.getElementById("todayTasksList");
+const clientsDatalist = document.getElementById("clientsDatalist");
+const waterProjectsBox = document.getElementById("waterProjectsBox");
+const waterProjectsList = document.getElementById("waterProjectsList");
+const decisionsBox = document.getElementById("decisionsBox");
+const decisionsList = document.getElementById("decisionsList");
+const uncoveredClientsBox = document.getElementById("uncoveredClientsBox");
+const uncoveredClientsSummary = document.getElementById("uncoveredClientsSummary");
+const uncoveredClientsList = document.getElementById("uncoveredClientsList");
+const notificationsButton = document.getElementById("notificationsButton");
+const installButton = document.getElementById("installButton");
+const draftDialog = document.getElementById("draftDialog");
+const draftForm = document.getElementById("draftForm");
+const draftClientInput = document.getElementById("draftClientInput");
+const draftSummaryInput = document.getElementById("draftSummaryInput");
+const draftAgents = document.getElementById("draftAgents");
+const draftTasks = document.getElementById("draftTasks");
+const addDraftTaskButton = document.getElementById("addDraftTaskButton");
+const cancelDraftButton = document.getElementById("cancelDraftButton");
 
 let dbPromise;
 let recorder;
@@ -36,6 +100,68 @@ let cancelCurrentRecording = false;
 let longPressTimer = null;
 let longPressRecording = false;
 let suppressNextClick = false;
+let recordingSession = null;
+let currentDraft = null;
+let currentDraftSourceText = "";
+let draftsDeferredForSession = false;
+let installPromptEvent = null;
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "'": "&#39;",
+    '"': "&quot;",
+  })[character]);
+}
+
+function safeExternalUrl(value) {
+  try {
+    const parsed = new URL(String(value || ""), window.location.origin);
+    if (!["http:", "https:"].includes(parsed.protocol)) return "";
+    return escapeHtml(parsed.href);
+  } catch {
+    return "";
+  }
+}
+
+function urlBase64ToUint8Array(value) {
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = window.atob(base64);
+  return Uint8Array.from([...raw].map((character) => character.charCodeAt(0)));
+}
+
+async function enablePushNotifications() {
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+    throw new Error("Este navegador no admite avisos en segundo plano");
+  }
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("Permiso de notificaciones bloqueado");
+
+  const keyResponse = await fetch("/api/capataz/push/public-key");
+  const keyData = await keyResponse.json();
+  if (!keyResponse.ok || !keyData.ok) {
+    throw new Error(keyData.detail || "Los avisos todavía no están configurados en el servidor");
+  }
+  const registration = await navigator.serviceWorker.ready;
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(keyData.public_key),
+    });
+  }
+  const response = await fetch("/api/capataz/push/subscribe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ subscription: subscription.toJSON() }),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+  localStorage.setItem("capataz.pushEnabled", "true");
+}
 
 function openDb() {
   if (dbPromise) return dbPromise;
@@ -149,7 +275,7 @@ async function syncSession(session) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     if (!data.ok) throw new Error(data.detail || data.supabase_error || "respuesta sin ok true");
-    if (data.supabase_error) appendDebug(`Recorrida Supabase ERROR: ${data.supabase_error}`);
+    if (data.supabase_error) throw new Error(`Supabase no guardó la recorrida: ${data.supabase_error}`);
 
     let updated = { ...session, syncStatus: "sincronizada", errorMessage: "" };
     if (updated.estado === "cerrada" && updated.closedAt) {
@@ -241,13 +367,25 @@ function requireCampo() {
   return campo;
 }
 
+function requireActiveSession() {
+  const session = getActiveSession();
+  if (!session || session.estado !== "abierta") {
+    alert("Primero iniciá una recorrida. Así el audio o la foto quedan asignados correctamente.");
+    startSessionButton?.focus();
+    return null;
+  }
+  return session;
+}
+
 function buildItem(type, blob, filename, options = {}) {
   const campo = requireCampo();
   if (!campo) return null;
 
+  const activeSession = options.session || requireActiveSession();
+  if (!activeSession) return null;
+
   const coords = currentPosition ? currentPosition.coords : {};
   const now = new Date();
-  const activeSession = getActiveSession();
   return {
     id: crypto.randomUUID(),
     type,
@@ -261,8 +399,8 @@ function buildItem(type, blob, filename, options = {}) {
     filename,
     contentType: blob.type,
     blob,
-    sessionId: activeSession ? activeSession.id : "",
-    sessionName: activeSession ? activeSession.nombre : "",
+    sessionId: activeSession.id,
+    sessionName: activeSession.nombre,
     photoLabel: options.photoLabel || "",
     audioLabel: options.audioLabel || "",
   };
@@ -274,6 +412,7 @@ async function addItem(type, blob, filename, options = {}) {
   await storeItem(item);
   await renderItems();
   appendDebug("Item local creado en estado pendiente.");
+  if (navigator.onLine) await uploadLocalItem(item);
 }
 
 async function renderItems() {
@@ -294,14 +433,14 @@ async function renderItems() {
     const statusClass = item.status === "subido confirmado" ? "subido" : item.status;
     li.innerHTML = `
       <div class="item-main">
-        <span>${item.type === "audio" ? "Audio" : "Foto"} - ${item.campo}</span>
-        <span class="pill ${statusClass}">${item.status}</span>
+        <span>${item.type === "audio" ? "Audio" : "Foto"} - ${escapeHtml(item.campo)}</span>
+        <span class="pill ${escapeHtml(statusClass)}">${escapeHtml(item.status)}</span>
       </div>
-      <div class="item-meta">${item.sector || "sin sector"} - ${new Date(item.createdAt).toLocaleString()} - ${gps}</div>
-      ${item.photoLabel ? `<div class="item-meta">Comentario foto: ${item.photoLabel}</div>` : ""}
-      ${item.audioLabel ? `<div class="item-meta">Comentario audio: ${item.audioLabel}</div>` : ""}
-      ${item.sessionId ? `<div class="item-meta">Recorrida: ${item.sessionName || item.sessionId}</div>` : ""}
-      ${item.errorMessage ? `<div class="item-meta">Error: ${item.errorMessage}</div>` : ""}
+      <div class="item-meta">${escapeHtml(item.sector || "sin sector")} - ${escapeHtml(new Date(item.createdAt).toLocaleString())} - ${escapeHtml(gps)}</div>
+      ${item.photoLabel ? `<div class="item-meta">Comentario foto: ${escapeHtml(item.photoLabel)}</div>` : ""}
+      ${item.audioLabel ? `<div class="item-meta">Comentario audio: ${escapeHtml(item.audioLabel)}</div>` : ""}
+      ${item.sessionId ? `<div class="item-meta">Asignado a: ${escapeHtml(item.sessionName || item.sessionId)}${item.assignedSessionId ? " · verificado" : " · pendiente de verificar"}</div>` : ""}
+      ${item.errorMessage ? `<div class="item-meta">Error: ${escapeHtml(item.errorMessage)}</div>` : ""}
     `;
     itemsList.appendChild(li);
   }
@@ -314,6 +453,43 @@ function formatServerDate(value) {
   return date.toLocaleString();
 }
 
+function addSessionAssignmentControls(container, item, sessions) {
+  if (!container || item.session_id || !sessions.length) return;
+  const controls = document.createElement("div");
+  controls.className = "assign-session-controls";
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Recorrida para asignar");
+  for (const session of sessions) {
+    const option = document.createElement("option");
+    option.value = session.id;
+    option.textContent = `${session.nombre || "Recorrida"} · ${session.campo || "sin campo"}`;
+    select.appendChild(option);
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Asignar a recorrida";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      const response = await fetch(`/api/field-items/${encodeURIComponent(item.id)}/assign-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: select.value }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+      appendDebug(`Item ${item.id} asignado a ${data.session_name}.`);
+      await renderServerItems();
+      await renderSessions();
+    } catch (error) {
+      button.disabled = false;
+      alert(`No pude asignar el archivo: ${error.message || error}`);
+    }
+  });
+  controls.append(select, button);
+  container.appendChild(controls);
+}
+
 async function renderServerItems() {
   if (!serverItemsList) return;
 
@@ -323,6 +499,16 @@ async function renderServerItems() {
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || data.supabase_error || `HTTP ${response.status}`);
     const items = data.items || [];
+    let assignableSessions = [];
+    try {
+      const sessionsResponse = await fetch("/api/field-sessions");
+      const sessionsData = await sessionsResponse.json();
+      if (sessionsResponse.ok && sessionsData.ok) {
+        assignableSessions = (sessionsData.sessions || []).filter((session) => session.id && !session.legacy);
+      }
+    } catch {
+      assignableSessions = [];
+    }
     if (data.supabase_error) {
       const warning = document.createElement("li");
       warning.textContent = `Supabase ERROR: ${data.supabase_error}`;
@@ -343,21 +529,23 @@ async function renderServerItems() {
         : "sin GPS";
       const accuracy = item.precision_gps ? ` - precision ${Math.round(Number(item.precision_gps))} m` : "";
       const storageLink = item.storage_public_url || item.drive_link || "";
+      const safeStorageLink = safeExternalUrl(storageLink);
       const storageStatus = item.storage_status || "local_only";
       const storageProvider = item.storage_provider ? ` (${item.storage_provider})` : "";
       li.innerHTML = `
         <div class="item-main">
-          <span>${item.tipo === "audio" ? "Audio" : "Foto"} - ${item.campo || "sin campo"}</span>
-          <span class="pill subido">${item.estado || "subido"}</span>
+          <span>${item.tipo === "audio" ? "Audio" : "Foto"} - ${escapeHtml(item.campo || "sin campo")}</span>
+          <span class="pill subido">${escapeHtml(item.estado || "subido")}</span>
         </div>
-        <div class="item-meta">${item.sector || "sin sector"} - ${formatServerDate(item.fecha_hora)} - ${gps}${accuracy}</div>
-        ${item.photo_label ? `<div class="item-meta">Comentario foto: ${item.photo_label}</div>` : ""}
-        ${item.audio_label ? `<div class="item-meta">Comentario audio: ${item.audio_label}</div>` : ""}
-        ${item.session_id ? `<div class="item-meta">Recorrida: ${item.session_nombre || item.session_id} (${item.session_id})</div>` : ""}
-        <div class="item-meta">${item.nombre_archivo || ""}</div>
-        <div class="item-meta">${storageStatus}${storageProvider}${storageLink ? ` - <a href="${storageLink}" target="_blank" rel="noopener">archivo</a>` : ""}</div>
-        ${item.storage_error ? `<div class="item-meta">Storage error: ${item.storage_error}</div>` : ""}
+        <div class="item-meta">${escapeHtml(item.sector || "sin sector")} - ${escapeHtml(formatServerDate(item.fecha_hora))} - ${escapeHtml(gps + accuracy)}</div>
+        ${item.photo_label ? `<div class="item-meta">Comentario foto: ${escapeHtml(item.photo_label)}</div>` : ""}
+        ${item.audio_label ? `<div class="item-meta">Comentario audio: ${escapeHtml(item.audio_label)}</div>` : ""}
+        ${item.session_id ? `<div class="item-meta">Asignado a: ${escapeHtml(item.session_nombre || item.session_id)} · verificado en Supabase</div>` : `<div class="item-meta">SIN RECORRIDA ASIGNADA</div>`}
+        <div class="item-meta">${escapeHtml(item.nombre_archivo || "")}</div>
+        <div class="item-meta">${escapeHtml(storageStatus + storageProvider)}${safeStorageLink ? ` - <a href="${safeStorageLink}" target="_blank" rel="noopener">archivo</a>` : ""}</div>
+        ${item.storage_error ? `<div class="item-meta">Storage error: ${escapeHtml(item.storage_error)}</div>` : ""}
       `;
+      addSessionAssignmentControls(li, item, assignableSessions);
       serverItemsList.appendChild(li);
     }
   } catch (error) {
@@ -371,11 +559,17 @@ async function renderServerItems() {
 function renderActiveSession() {
   const session = getActiveSession();
   if (!activeSessionStatus) return;
+  const hasActiveSession = Boolean(session && session.estado === "abierta");
+  campoInput.disabled = hasActiveSession;
+  if (sessionNameInput) sessionNameInput.disabled = hasActiveSession;
+  talkButton.disabled = !hasActiveSession;
+  photoInput.disabled = !hasActiveSession;
+  photoInput.closest(".photo-button")?.classList.toggle("disabled", !hasActiveSession);
   if (!session) {
-    activeSessionStatus.textContent = "Sin recorrida activa";
+    activeSessionStatus.textContent = "Sin recorrida activa · audio y foto bloqueados";
     return;
   }
-  activeSessionStatus.textContent = `Recorrida activa: ${session.nombre || session.id}`;
+  activeSessionStatus.textContent = `Recorrida activa: ${session.nombre || session.id} · archivos vinculados a ${session.id.slice(0, 8)}`;
 }
 
 async function renderSessions() {
@@ -406,19 +600,20 @@ async function renderSessions() {
       const reportButtonText = reportState === "error" ? "Reintentar informe" : "Generar informe";
       li.innerHTML = `
         <div class="item-main">
-          <span>${session.nombre || "Recorrida sin nombre"}${session.legacy ? " (datos viejos)" : ""}</span>
-          <span class="pill ${session.estado === "cerrada" ? "subido" : "subiendo"}">${session.estado || "abierta"}</span>
+          <span>${escapeHtml(session.nombre || "Recorrida sin nombre")}${session.legacy ? " (datos viejos)" : ""}</span>
+          <span class="pill ${session.estado === "cerrada" ? "subido" : "subiendo"}">${escapeHtml(session.estado || "abierta")}</span>
         </div>
-        <div class="item-meta">${session.campo || "sin campo"} - ${session.sector || "sin sector"}</div>
-        <div class="item-meta">Inicio: ${formatServerDate(session.started_at)}${session.closed_at ? ` - Cierre: ${formatServerDate(session.closed_at)}` : ""}</div>
-        <div class="item-meta">Items asociados: ${session.items_count ?? 0}${session.has_items ? "" : " - sin items asociados"}</div>
-        ${session.items_error ? `<div class="item-meta">Items ERROR: ${session.items_error}</div>` : ""}
-        <div class="item-meta">Informe: ${reportState}${report.progress_message ? ` - ${report.progress_message}` : ""}${report.error ? ` - ${report.error}` : ""}</div>
+        <div class="item-meta">${escapeHtml(session.campo || "sin campo")} - ${escapeHtml(session.sector || "sin sector")}</div>
+        <div class="item-meta">Inicio: ${escapeHtml(formatServerDate(session.started_at))}${session.closed_at ? ` - Cierre: ${escapeHtml(formatServerDate(session.closed_at))}` : ""}</div>
+        <div class="item-meta">Items asociados: ${Number(session.items_count || 0)}${session.has_items ? "" : " - sin items asociados"}</div>
+        ${session.items_error ? `<div class="item-meta">Items ERROR: ${escapeHtml(session.items_error)}</div>` : ""}
+        <div class="item-meta">Informe: ${escapeHtml(reportState)}${report.progress_message ? ` - ${escapeHtml(report.progress_message)}` : ""}${report.error ? ` - ${escapeHtml(report.error)}` : ""}</div>
         <div class="session-actions">
-          <button class="generate-report-button" type="button" data-session-id="${session.id}" data-report-state="${reportState}">${reportButtonText}</button>
-          ${report.docx_public_url ? `<a class="button-link" href="${report.docx_public_url}" target="_blank" rel="noopener">Abrir informe DOCX</a>` : ""}
+          <button class="generate-report-button" type="button" data-session-id="${escapeHtml(session.id)}" data-report-state="${escapeHtml(reportState)}">${escapeHtml(reportButtonText)}</button>
+          ${safeExternalUrl(report.pdf_public_url) ? `<a class="button-link" href="${safeExternalUrl(report.pdf_public_url)}" target="_blank" rel="noopener">Abrir informe PDF</a>` : ""}
+          ${safeExternalUrl(report.docx_public_url) ? `<a class="button-link" href="${safeExternalUrl(report.docx_public_url)}" target="_blank" rel="noopener">Abrir informe DOCX</a>` : ""}
         </div>
-        ${reportMarkdown ? `<pre class="report-preview">${reportMarkdown.slice(0, 1200)}</pre>` : ""}
+        ${reportMarkdown ? `<pre class="report-preview">${escapeHtml(reportMarkdown.slice(0, 1200))}</pre>` : ""}
       `;
       sessionsList.appendChild(li);
       const button = li.querySelector(".generate-report-button");
@@ -443,12 +638,13 @@ async function fetchSessionReport(sessionId) {
       estado: data.estado || "sin informe",
       progress_message: data.progress_message || "",
       docx_public_url: data.docx_public_url || "",
+      pdf_public_url: data.pdf_public_url || "",
       informe_markdown: data.informe_markdown || "",
       error: data.error || "",
     };
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
-    return { estado: "error", progress_message: "", docx_public_url: "", informe_markdown: "", error: message };
+    return { estado: "error", progress_message: "", docx_public_url: "", pdf_public_url: "", informe_markdown: "", error: message };
   }
 }
 
@@ -460,24 +656,28 @@ async function generateReportForSession(sessionId, button, force = false) {
   button.disabled = true;
   button.textContent = "Generando...";
   appendDebug(`Generando informe de recorrida ${sessionId}...`);
-  const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 30000);
   try {
     const url = `/api/field-sessions/${encodeURIComponent(sessionId)}/generate-report${force ? "?force=true" : ""}`;
-    const response = await fetch(url, {
-      method: "POST",
-      signal: controller.signal,
-    });
+    const response = await fetch(url, { method: "POST" });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || data.detail || `HTTP ${response.status}`);
-    appendDebug("Informe listo.");
+    appendDebug("Informe en proceso.");
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 5000));
+      const report = await fetchSessionReport(sessionId);
+      button.textContent = report.progress_message || "Generando...";
+      if (report.estado === "done") {
+        appendDebug("Informe PDF y DOCX listos.");
+        await renderSessions();
+        return;
+      }
+      if (report.estado === "error") throw new Error(report.error || "Error al generar informe");
+    }
+    appendDebug("El informe sigue generándose. Podés cerrar la app y volver más tarde.");
   } catch (error) {
-    const message = error && error.name === "AbortError"
-      ? "La generacion sigue en proceso. Consulta el informe en unos segundos."
-      : (error && error.message ? error.message : String(error));
+    const message = error && error.message ? error.message : String(error);
     appendDebug(`Informe ERROR: ${message}`);
   } finally {
-    window.clearTimeout(timeoutId);
     button.disabled = false;
   }
   await renderSessions();
@@ -486,7 +686,17 @@ async function generateReportForSession(sessionId, button, force = false) {
 async function uploadLocalItem(item) {
   if (item.sessionId) {
     const session = getLocalSessions().find((entry) => entry.id === item.sessionId);
-    if (session) await syncSession(session);
+    if (session) {
+      const sessionSynced = await syncSession(session);
+      if (!sessionSynced) {
+        item.status = "error";
+        item.serverConfirmed = false;
+        item.errorMessage = "La recorrida no se guardó en Supabase; el archivo no se subió para evitar que quede huérfano.";
+        await storeItem(item);
+        await renderItems();
+        return;
+      }
+    }
   }
 
   appendDebug(`Intentando subir item ${item.id}...`);
@@ -503,6 +713,7 @@ async function uploadLocalItem(item) {
   form.append("latitude", item.latitude);
   form.append("longitude", item.longitude);
   form.append("gps_accuracy", item.gpsAccuracy);
+  // client_id conserva el UUID local para que una resubida sea idempotente.
   form.append("client_id", item.id);
   form.append("session_id", item.sessionId || "");
   form.append("photo_label", item.photoLabel || "");
@@ -516,6 +727,9 @@ async function uploadLocalItem(item) {
 
     const data = await response.json();
     if (!data.ok) throw new Error(data.detail || data.metadata_error || data.storage_error || "respuesta sin ok true");
+    if (!data.assigned_session_id || data.assigned_session_id !== item.sessionId) {
+      throw new Error("El servidor no confirmó la recorrida del archivo");
+    }
 
     appendDebug("Servidor respondió OK");
     if (data.storage_error) appendDebug(`Storage ERROR: ${data.storage_error}`);
@@ -523,6 +737,11 @@ async function uploadLocalItem(item) {
     item.status = "subido confirmado";
     item.serverConfirmed = true;
     item.serverId = data.id || "";
+    item.assignedSessionId = data.assigned_session_id;
+    if (data.capataz_draft) {
+      queueDraft(data.capataz_draft, data.transcript_text || item.audioLabel || item.photoLabel || "");
+    }
+    if (data.capataz_error) appendDebug(`Capataz: ${data.capataz_error}`);
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
     appendDebug(`Error al subir: ${message}`);
@@ -545,7 +764,7 @@ async function syncPending(options = {}) {
   const shouldForce = Boolean(options.force);
   const uploadable = items.filter((entry) => {
     if (entry.status === "subiendo") return false;
-    if (shouldForce) return true;
+    if (shouldForce) return entry.status !== "subido confirmado";
     return entry.status !== "subido confirmado";
   });
 
@@ -562,6 +781,11 @@ async function syncPending(options = {}) {
 }
 
 async function startFieldSession() {
+  const existing = getActiveSession();
+  if (existing && existing.estado === "abierta") {
+    alert(`Ya está activa la recorrida “${existing.nombre || existing.campo}”. Cerrala antes de iniciar otra.`);
+    return;
+  }
   const campo = requireCampo();
   if (!campo) return;
   const coords = currentPosition ? currentPosition.coords : {};
@@ -616,6 +840,8 @@ async function closeFieldSession() {
 
 async function startRecording() {
   if (recorder && recorder.state === "recording") return;
+  recordingSession = requireActiveSession();
+  if (!recordingSession) return;
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   audioChunks = [];
   cancelCurrentRecording = false;
@@ -631,21 +857,25 @@ async function startRecording() {
     const durationMs = Date.now() - recordingStartedAt;
     setRecordingUi(false);
     if (cancelCurrentRecording) {
+      recordingSession = null;
       appendDebug("Grabacion cancelada.");
       return;
     }
     if (durationMs < 1000) {
       appendDebug("Audio demasiado corto, no se guardo.");
       alert("Audio demasiado corto, no se guardó.");
+      recordingSession = null;
       return;
     }
     const blob = new Blob(audioChunks, { type: recorder.mimeType || "audio/webm" });
     if (!blob.size) {
       appendDebug("Audio vacio, no se guardo.");
+      recordingSession = null;
       return;
     }
-    const audioLabel = (window.prompt("Comentario del audio", "") || "").trim();
-    await addItem("audio", blob, `audio-${Date.now()}.webm`, { audioLabel });
+    const session = recordingSession;
+    recordingSession = null;
+    await addItem("audio", blob, `audio-${Date.now()}.webm`, { session });
   };
   recorder.start();
   setRecordingUi(true);
@@ -653,7 +883,7 @@ async function startRecording() {
 
 function setRecordingUi(isRecording) {
   talkButton.classList.toggle("recording", isRecording);
-  talkButton.textContent = isRecording ? "Grabando..." : "Mantener para hablar";
+  talkButton.textContent = isRecording ? "Grabando..." : "Tocar para grabar";
   if (recordingControls) recordingControls.hidden = !isRecording;
   if (isRecording) {
     updateRecordingDuration();
@@ -682,7 +912,425 @@ async function toggleRecording() {
   try {
     await startRecording();
   } catch {
+    recordingSession = null;
     alert("No pude acceder al microfono.");
+  }
+}
+
+function getDraftQueue() {
+  return readJsonStorage("capataz.draftQueue", []);
+}
+
+function saveDraftQueue(queue) {
+  localStorage.setItem("capataz.draftQueue", JSON.stringify(queue));
+}
+
+function queueDraft(draft, sourceText = "") {
+  if (!draft) return;
+  const queue = getDraftQueue();
+  if (queue.some((entry) => entry?.draft?.draft_id === draft.draft_id)) return;
+  queue.push({ draft, sourceText });
+  saveDraftQueue(queue);
+  draftsDeferredForSession = false;
+  openNextDraft();
+}
+
+function finishCurrentDraft() {
+  const queue = getDraftQueue();
+  queue.shift();
+  saveDraftQueue(queue);
+  currentDraft = null;
+  currentDraftSourceText = "";
+  if (draftDialog?.open) draftDialog.close();
+  window.setTimeout(openNextDraft, 100);
+}
+
+function deferCurrentDraft() {
+  currentDraft = null;
+  currentDraftSourceText = "";
+  draftsDeferredForSession = true;
+  if (draftDialog?.open) draftDialog.close();
+  appendDebug("Borrador conservado para revisar más tarde.");
+}
+
+function renderDraftAgents() {
+  if (!draftAgents || !currentDraft) return;
+  draftAgents.innerHTML = "";
+  for (const agent of currentDraft.agents || []) {
+    const badge = document.createElement("span");
+    badge.className = "agent-badge";
+    if (agent === "Margen") badge.classList.add("economic");
+    if (agent === "Agua") badge.classList.add("water");
+    badge.textContent = agent;
+    draftAgents.appendChild(badge);
+  }
+}
+
+function renderDraftTasks() {
+  if (!draftTasks || !currentDraft) return;
+  draftTasks.innerHTML = "";
+  const tasks = currentDraft.tasks || [];
+  if (!tasks.length) {
+    const empty = document.createElement("p");
+    empty.className = "section-copy";
+    empty.textContent = "No detecté un compromiso. Podés guardar solamente la nota o agregar una tarea.";
+    draftTasks.appendChild(empty);
+    return;
+  }
+  tasks.forEach((task, index) => {
+    const card = document.createElement("div");
+    card.className = "draft-task";
+    card.dataset.index = String(index);
+
+    const titleLabel = document.createElement("label");
+    titleLabel.textContent = "Tarea";
+    const titleInput = document.createElement("input");
+    titleInput.className = "draft-task-title";
+    titleInput.value = task.title || "";
+    titleLabel.appendChild(titleInput);
+
+    const grid = document.createElement("div");
+    grid.className = "draft-task-grid";
+    const dueLabel = document.createElement("label");
+    dueLabel.textContent = "Fecha";
+    const dueInput = document.createElement("input");
+    dueInput.type = "date";
+    dueInput.className = "draft-task-due";
+    dueInput.value = task.due_date || "";
+    dueLabel.appendChild(dueInput);
+
+    grid.append(dueLabel);
+
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "remove-draft-task";
+    removeButton.textContent = "Quitar tarea";
+    removeButton.addEventListener("click", () => {
+      collectDraftFromForm();
+      currentDraft.tasks.splice(index, 1);
+      renderDraftTasks();
+    });
+    card.append(titleLabel, grid, removeButton);
+    draftTasks.appendChild(card);
+  });
+}
+
+function collectDraftFromForm() {
+  if (!currentDraft) return null;
+  currentDraft.client_name = draftClientInput?.value.trim() || "";
+  currentDraft.summary = draftSummaryInput?.value.trim() || "";
+  const collected = [];
+  for (const card of draftTasks?.querySelectorAll(".draft-task") || []) {
+    const original = currentDraft.tasks?.[Number(card.dataset.index)] || {};
+    const title = card.querySelector(".draft-task-title")?.value.trim() || "";
+    if (!title) continue;
+    collected.push({
+      ...original,
+      title,
+      due_date: card.querySelector(".draft-task-due")?.value || null,
+      agent: original.agent || "Cartera",
+      priority: original.priority || "media",
+    });
+  }
+  currentDraft.tasks = collected;
+  return currentDraft;
+}
+
+function openNextDraft() {
+  if (!draftDialog || draftDialog.open || currentDraft || draftsDeferredForSession) return;
+  const entry = getDraftQueue()[0];
+  if (!entry) return;
+  currentDraft = entry.draft;
+  currentDraftSourceText = entry.sourceText || "";
+  draftClientInput.value = currentDraft.client_name || "";
+  draftSummaryInput.value = currentDraft.summary || "";
+  renderDraftAgents();
+  renderDraftTasks();
+  if (typeof draftDialog.showModal === "function") draftDialog.showModal();
+  else draftDialog.setAttribute("open", "");
+}
+
+async function analyzeTextIntake() {
+  const text = noteInput?.value.trim() || "";
+  if (!text) {
+    noteInput?.focus();
+    return;
+  }
+  analyzeTextButton.disabled = true;
+  analyzeTextButton.textContent = "Analizando...";
+  try {
+    const response = await fetch("/api/capataz/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, field_name: campoInput.value.trim(), source: "texto_app" }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    queueDraft(data.draft, text);
+  } catch (error) {
+    alert(`No pude analizar la nota: ${error.message || error}`);
+  } finally {
+    analyzeTextButton.disabled = false;
+    analyzeTextButton.textContent = "Revisar y guardar";
+  }
+}
+
+async function confirmCurrentDraft() {
+  const draft = collectDraftFromForm();
+  if (!draft) return;
+  const confirmButton = document.getElementById("confirmDraftButton");
+  confirmButton.disabled = true;
+  confirmButton.textContent = "Guardando...";
+  try {
+    const response = await fetch("/api/capataz/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ draft, source_text: currentDraftSourceText }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    if (noteInput && noteInput.value.trim() === currentDraftSourceText.trim()) noteInput.value = "";
+    appendDebug(`Capataz guardó ${data.tasks?.length || 0} tarea(s).`);
+    if (data.crew_queued) {
+      appendDebug("La cuadrilla está analizando la entrada.");
+      window.setTimeout(loadDashboard, 7000);
+      window.setTimeout(loadDashboard, 20000);
+      window.setTimeout(loadDashboard, 45000);
+    }
+    finishCurrentDraft();
+    await loadDashboard();
+  } catch (error) {
+    alert(`No pude guardar: ${error.message || error}`);
+  } finally {
+    confirmButton.disabled = false;
+    confirmButton.textContent = "Confirmar y guardar";
+  }
+}
+
+function taskDateLabel(task, bucket) {
+  if (!task.due_date) return "sin fecha";
+  if (bucket === "overdue") return `atrasada desde ${task.due_date}`;
+  if (bucket === "today") return "para hoy";
+  return `para ${task.due_date}`;
+}
+
+function createTaskListItem(task, bucket) {
+  const li = document.createElement("li");
+  li.classList.add(bucket);
+  const main = document.createElement("div");
+  main.className = "item-main";
+  const title = document.createElement("span");
+  title.textContent = task.title || "Tarea sin título";
+  main.append(title);
+
+  const meta = document.createElement("div");
+  meta.className = "item-meta";
+  meta.textContent = `${task.client_name || "sin cliente"} · ${taskDateLabel(task, bucket)}`;
+
+  const actions = document.createElement("div");
+  actions.className = "task-actions";
+  const done = document.createElement("button");
+  done.type = "button";
+  done.textContent = "Hecho";
+  done.addEventListener("click", async () => {
+    done.disabled = true;
+    try {
+      const response = await fetch(`/api/capataz/tasks/${encodeURIComponent(task.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "done" }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      await loadDashboard();
+    } catch (error) {
+      done.disabled = false;
+      alert(`No pude cerrar la tarea: ${error.message || error}`);
+    }
+  });
+  actions.appendChild(done);
+  li.append(main, meta, actions);
+  return li;
+}
+
+function createDecisionListItem(decision) {
+  const li = document.createElement("li");
+  li.className = "decision-card";
+
+  const title = document.createElement("strong");
+  title.textContent = decision.client_name || decision.topic || "Decisión pendiente";
+  const summary = document.createElement("div");
+  summary.textContent = decision.summary || "Análisis listo para revisar";
+
+  const recommendation = document.createElement("div");
+  recommendation.className = "item-meta";
+  recommendation.textContent = `Recomendación: ${decision.recommendation || "revisar antes de ejecutar"}`;
+  const economic = document.createElement("div");
+  economic.className = "item-meta";
+  economic.textContent = `Económico: ${decision.economic_summary || "faltan datos para cuantificar"}`;
+
+  const missing = decision.missing_data || [];
+  const missingData = document.createElement("div");
+  missingData.className = "item-meta";
+  missingData.textContent = missing.length ? `Falta: ${missing.join(" · ")}` : "Sin datos faltantes marcados";
+
+  const actions = document.createElement("div");
+  actions.className = "decision-actions";
+  const approve = document.createElement("button");
+  approve.type = "button";
+  approve.textContent = "Aprobar y crear tareas";
+  const reject = document.createElement("button");
+  reject.type = "button";
+  reject.className = "reject-decision";
+  reject.textContent = "Descartar";
+
+  const updateDecision = async (action) => {
+    approve.disabled = true;
+    reject.disabled = true;
+    try {
+      const response = await fetch(`/api/capataz/decisions/${encodeURIComponent(decision.id)}/${action}`, {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+      await loadDashboard();
+    } catch (error) {
+      approve.disabled = false;
+      reject.disabled = false;
+      alert(`No pude actualizar la decisión: ${error.message || error}`);
+    }
+  };
+  approve.addEventListener("click", () => updateDecision("approve"));
+  reject.addEventListener("click", () => updateDecision("reject"));
+  actions.append(approve, reject);
+  li.append(title, summary, recommendation, economic, missingData, actions);
+  return li;
+}
+
+function createUncoveredClientItem(client) {
+  const li = document.createElement("li");
+  const title = document.createElement("strong");
+  title.textContent = client.name || "Cliente sin nombre";
+  const controls = document.createElement("div");
+  controls.className = "client-frequency-controls";
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", `Frecuencia para ${client.name || "cliente"}`);
+  for (const [days, label] of [["", "Elegir frecuencia"], ["7", "Semanal"], ["15", "Cada 15 días"], ["30", "Mensual"], ["60", "Cada 2 meses"], ["90", "Cada 3 meses"]]) {
+    const option = document.createElement("option");
+    option.value = days;
+    option.textContent = label;
+    option.selected = String(client.followup_days || "") === days;
+    select.appendChild(option);
+  }
+  const save = document.createElement("button");
+  save.type = "button";
+  save.textContent = "Guardar";
+  save.addEventListener("click", async () => {
+    if (!select.value) return;
+    save.disabled = true;
+    try {
+      const response = await fetch(`/api/capataz/clients/${encodeURIComponent(client.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ followup_days: Number(select.value) }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+      await loadDashboard();
+    } catch (error) {
+      save.disabled = false;
+      alert(`No pude guardar la frecuencia: ${error.message || error}`);
+    }
+  });
+  controls.append(select, save);
+  li.append(title, controls);
+  return li;
+}
+
+async function showDueNotification(dashboard) {
+  if (localStorage.getItem("capataz.pushEnabled") === "true") return;
+  if (!("Notification" in window) || Notification.permission !== "granted") return;
+  const due = [...(dashboard.tasks?.overdue || []), ...(dashboard.tasks?.today || [])];
+  if (!due.length) return;
+  const hash = `${dashboard.date}:${due.map((task) => task.id).sort().join(",")}`;
+  if (localStorage.getItem("capataz.lastNotification") === hash) return;
+  const registration = await navigator.serviceWorker?.ready;
+  if (!registration) return;
+  await registration.showNotification("Capataz Campo", {
+    body: `${due.length} tarea(s) para revisar hoy`,
+    icon: "/static/logo.png",
+    badge: "/static/logo.png",
+    tag: "capataz-daily",
+    data: { url: "/campo" },
+  });
+  localStorage.setItem("capataz.lastNotification", hash);
+}
+
+async function loadDashboard() {
+  if (!todayTasksList) return;
+  try {
+    const response = await fetch("/api/capataz/dashboard");
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    todayTasksList.innerHTML = "";
+    const overdue = data.tasks?.overdue || [];
+    const today = data.tasks?.today || [];
+    const upcoming = data.tasks?.upcoming || [];
+    const noDate = data.tasks?.no_date || [];
+    const visible = [
+      ...overdue.map((task) => [task, "overdue"]),
+      ...today.map((task) => [task, "today"]),
+      ...upcoming.slice(0, 5).map((task) => [task, "upcoming"]),
+      ...noDate.map((task) => [task, "no-date"]),
+    ];
+    todaySummary.textContent = `${overdue.length} atrasada(s) · ${today.length} para hoy · ${upcoming.length} próxima(s)`;
+    if (!visible.length) {
+      const empty = document.createElement("li");
+      empty.textContent = "No hay tareas cargadas. Mandale una nota o un audio al Capataz.";
+      todayTasksList.appendChild(empty);
+    } else {
+      for (const [task, bucket] of visible) todayTasksList.appendChild(createTaskListItem(task, bucket));
+    }
+
+    clientsDatalist.innerHTML = "";
+    for (const client of data.clients || []) {
+      const option = document.createElement("option");
+      option.value = client.name || "";
+      clientsDatalist.appendChild(option);
+    }
+
+    const decisions = data.pending_decisions || [];
+    if (decisionsBox && decisionsList) {
+      decisionsList.innerHTML = "";
+      decisionsBox.hidden = !decisions.length;
+      for (const decision of decisions) decisionsList.appendChild(createDecisionListItem(decision));
+    }
+
+    const uncoveredClients = data.clients_without_next_action || [];
+    if (uncoveredClientsBox && uncoveredClientsList && uncoveredClientsSummary) {
+      uncoveredClientsList.innerHTML = "";
+      uncoveredClientsBox.hidden = !uncoveredClients.length;
+      uncoveredClientsSummary.textContent = `${uncoveredClients.length} cliente(s) sin próximo paso`;
+      for (const client of uncoveredClients) {
+        uncoveredClientsList.appendChild(createUncoveredClientItem(client));
+      }
+    }
+
+    const projects = data.water_projects || [];
+    waterProjectsList.innerHTML = "";
+    waterProjectsBox.hidden = !projects.length;
+    for (const project of projects) {
+      const li = document.createElement("li");
+      const title = document.createElement("strong");
+      title.textContent = project.client_name || project.title || "Proyecto de agua";
+      const meta = document.createElement("div");
+      meta.className = "item-meta";
+      meta.textContent = project.next_action || project.title || "Sin próxima acción";
+      li.append(title, meta);
+      waterProjectsList.appendChild(li);
+    }
+    await showDueNotification(data);
+  } catch (error) {
+    todaySummary.textContent = `No pude cargar el seguimiento: ${error.message || error}`;
   }
 }
 
@@ -728,8 +1376,12 @@ if (cancelRecordingButton) {
 photoInput.addEventListener("change", async () => {
   const file = photoInput.files[0];
   if (!file) return;
-  const photoLabel = (window.prompt("Etiqueta o comentario de la foto", "") || "").trim();
-  await addItem("foto", file, file.name || `foto-${Date.now()}.jpg`, { photoLabel });
+  const session = requireActiveSession();
+  if (!session) {
+    photoInput.value = "";
+    return;
+  }
+  await addItem("foto", file, file.name || `foto-${Date.now()}.jpg`, { session });
   photoInput.value = "";
 });
 
@@ -755,9 +1407,63 @@ if (refreshServerButton) {
 if (refreshSessionsButton) {
   refreshSessionsButton.addEventListener("click", renderSessions);
 }
-window.addEventListener("online", () => {
+if (analyzeTextButton) {
+  analyzeTextButton.addEventListener("click", analyzeTextIntake);
+}
+if (refreshDashboardButton) {
+  refreshDashboardButton.addEventListener("click", loadDashboard);
+}
+if (addDraftTaskButton) {
+  addDraftTaskButton.addEventListener("click", () => {
+    collectDraftFromForm();
+    currentDraft.tasks = currentDraft.tasks || [];
+    currentDraft.tasks.push({ title: "", due_date: null, priority: "media", agent: "Cartera", notes: "" });
+    renderDraftTasks();
+  });
+}
+if (cancelDraftButton) {
+  cancelDraftButton.addEventListener("click", deferCurrentDraft);
+}
+if (draftForm) {
+  draftForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await confirmCurrentDraft();
+  });
+}
+if (notificationsButton) {
+  notificationsButton.addEventListener("click", async () => {
+    notificationsButton.disabled = true;
+    try {
+      await enablePushNotifications();
+      notificationsButton.textContent = "Avisos activados";
+    } catch (error) {
+      notificationsButton.textContent = "Activar avisos";
+      alert(error.message || error);
+    } finally {
+      notificationsButton.disabled = false;
+    }
+  });
+  if (localStorage.getItem("capataz.pushEnabled") === "true") {
+    notificationsButton.textContent = "Avisos activados";
+  }
+}
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  installPromptEvent = event;
+  if (installButton) installButton.hidden = false;
+});
+if (installButton) {
+  installButton.addEventListener("click", async () => {
+    if (!installPromptEvent) return;
+    await installPromptEvent.prompt();
+    installPromptEvent = null;
+    installButton.hidden = true;
+  });
+}
+window.addEventListener("online", async () => {
   setConnectionStatus();
-  appendDebug("Conexion online. Toca Sincronizar para subir pendientes.");
+  appendDebug("Conexion online. Sincronizando pendientes.");
+  await syncPending();
 });
 window.addEventListener("offline", setConnectionStatus);
 
@@ -766,9 +1472,18 @@ if ("serviceWorker" in navigator) {
 }
 
 loadInputs();
+const sharedText = localStorage.getItem("capataz.sharedText") || "";
+if (sharedText && noteInput) {
+  noteInput.value = sharedText;
+  localStorage.removeItem("capataz.sharedText");
+  if (sharedTextNotice) sharedTextNotice.hidden = false;
+}
 setConnectionStatus();
 renderActiveSession();
 refreshGps();
 renderItems();
 renderServerItems();
 renderSessions();
+loadDashboard();
+openNextDraft();
+window.setInterval(loadDashboard, 15 * 60 * 1000);
