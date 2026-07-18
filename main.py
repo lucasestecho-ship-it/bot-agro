@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import logging
 import tempfile
@@ -22,7 +23,7 @@ from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
-from pdf2image import convert_from_path
+import fitz
 from docx import Document as DocxDocument
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
@@ -42,7 +43,16 @@ except ImportError:
     Image = None
 
 from agent_crew import AgentCrew
-from capataz import CapatazStore, PersistentStorageError, analyze_intake, normalize_key
+from archive_manager import ArchiveManager
+from capataz import (
+    CapatazStore,
+    PersistentStorageError,
+    analyze_intake,
+    argentina_now,
+    iso_now,
+    normalize_key,
+)
+from gmail_drafts import EmailDraftManager, GmailDraftService
 from push_notifications import PushNotifier
 
 logging.basicConfig(level=logging.INFO)
@@ -119,6 +129,17 @@ NOISE_TRANSCRIPTS = {
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 agent_crew = AgentCrew(capataz_store, openai_client=openai_client)
 push_notifier = PushNotifier(capataz_store)
+gmail_service = GmailDraftService()
+email_draft_manager = EmailDraftManager(
+    capataz_store,
+    gmail_service=gmail_service,
+    openai_client=openai_client,
+)
+archive_manager = ArchiveManager(
+    supabase_url=SUPABASE_URL,
+    service_role_key=SUPABASE_SERVICE_ROLE_KEY,
+    bucket=SUPABASE_BUCKET,
+)
 
 def get_openai_client():
     if not openai_client:
@@ -704,6 +725,28 @@ def get_field_report_from_supabase(session_id):
     for row in rows:
         with_default_columns(row, FIELD_REPORTS_COLUMNS)
     return rows[0] if rows else None
+
+
+def list_recent_field_reports_from_supabase(limit=10):
+    if not supabase_database_configured():
+        return []
+    select = ",".join(FIELD_REPORTS_COLUMNS)
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/field_reports",
+        headers=supabase_headers(),
+        params={
+            "select": select,
+            "order": "created_at.desc.nullslast",
+            "limit": max(1, min(int(limit or 10), 30)),
+        },
+        timeout=30,
+    )
+    if not response.ok:
+        raise RuntimeError(response.text)
+    rows = response.json()
+    for row in rows:
+        with_default_columns(row, FIELD_REPORTS_COLUMNS)
+    return rows
 
 def update_field_report(report_id, payload):
     if not supabase_database_configured():
@@ -2009,15 +2052,39 @@ def describir_imagen_recorrida(image_path):
     return response.choices[0].message.content.strip()
 
 def transcribe_pdf(pdf_path):
-    pages = convert_from_path(pdf_path, dpi=150)
-    textos = []
-    for i, page in enumerate(pages):
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            page.save(tmp.name, "JPEG")
-            texto_pagina = transcribe_image(tmp.name)
-            os.unlink(tmp.name)
-            textos.append(f"--- Pagina {i+1} ---\n{texto_pagina}")
-    return "\n\n".join(textos)
+    document = fitz.open(pdf_path)
+    if len(document) > 40:
+        document.close()
+        raise ValueError("El PDF supera el limite de 40 paginas")
+    extracted = []
+    for index, page in enumerate(document):
+        page_text = page.get_text("text").strip()
+        if page_text:
+            extracted.append(f"--- Pagina {index + 1} ---\n{page_text}")
+    plain_text = "\n\n".join(extracted).strip()
+    if len(plain_text) >= 100:
+        document.close()
+        return plain_text[:100000]
+
+    if len(document) > 12:
+        document.close()
+        raise ValueError("El PDF escaneado supera el limite de 12 paginas")
+
+    scanned_pages = []
+    try:
+        for index, page in enumerate(document):
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp:
+                image_path = temp.name
+            try:
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                pixmap.save(image_path)
+                page_text = transcribe_image(image_path)
+                scanned_pages.append(f"--- Pagina {index + 1} ---\n{page_text}")
+            finally:
+                Path(image_path).unlink(missing_ok=True)
+    finally:
+        document.close()
+    return "\n\n".join(scanned_pages)[:100000]
 
 def clasificar_mensaje(text):
     prompt = (
@@ -2954,25 +3021,233 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error: {e}")
         await context.bot.send_message(chat_id=chat_id, text="Error al procesar: " + str(e))
 
+def process_capataz_event(event, draft, source_text=""):
+    """Ejecuta la cuadrilla y materializa trabajos internos, incluido el borrador de correo."""
+    result = agent_crew.process_event(event, draft, source_text=source_text)
+    email_draft = email_draft_manager.prepare(
+        event,
+        draft,
+        result,
+        source_text=source_text,
+    )
+    return {**result, "email_draft": email_draft}
+
+
+def persist_telegram_asset(
+    file_path,
+    *,
+    event,
+    asset_type,
+    file_name,
+    content_type,
+    transcript_text="",
+):
+    asset_id = f"asset-{uuid.uuid4().hex}"
+    now = iso_now()
+    row = {
+        "id": asset_id,
+        "event_id": event.get("id"),
+        "client_id": event.get("client_id"),
+        "client_name": event.get("client_name"),
+        "source": "telegram",
+        "asset_type": asset_type,
+        "file_name": file_name,
+        "content_type": content_type or "application/octet-stream",
+        "transcript_text": str(transcript_text or "")[:20000],
+        "storage_status": "local_only",
+        "storage_provider": "local",
+        "storage_path": "",
+        "storage_public_url": "",
+        "storage_error": "",
+        "created_at": now,
+        "updated_at": now,
+    }
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET:
+        date_path = argentina_now().strftime("%Y-%m-%d")
+        object_path = (
+            f"inbox/telegram/{date_path}/"
+            f"{safe_storage_segment(event.get('client_name'), 'sin-cliente')}/"
+            f"{asset_id}_{safe_storage_segment(file_name, 'archivo')}"
+        )
+        try:
+            uploaded = upload_field_file_to_supabase(
+                file_path,
+                object_path,
+                content_type=content_type,
+            )
+            row.update(
+                {
+                    "storage_status": "supabase_uploaded",
+                    "storage_provider": "supabase",
+                    "storage_path": uploaded.get("path") or object_path,
+                    "storage_public_url": uploaded.get("public_url") or "",
+                }
+            )
+        except Exception as exc:
+            row.update(
+                {
+                    "storage_status": "supabase_error",
+                    "storage_provider": "supabase",
+                    "storage_path": object_path,
+                    "storage_error": str(exc)[:2000],
+                }
+            )
+    source, warning = capataz_store.save_rows("intake_assets", [row])
+    if capataz_store.supabase_configured and source != "supabase":
+        raise PersistentStorageError(warning or "No se pudo guardar el archivo recibido por Telegram")
+    return row
+
+
+async def cmd_capataz_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
+        return
+    dashboard = await asyncio.to_thread(capataz_store.dashboard)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(
+            "Capataz Campo activo.\n"
+            f"Agentes recientes: {len(dashboard.get('agent_activity') or [])}.\n"
+            f"Borradores de correo: {len(dashboard.get('email_drafts') or [])}.\n"
+            "Compartime desde WhatsApp texto, audio, foto o PDF."
+        ),
+    )
+
+
+async def handle_capataz_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    chat_id = message.chat_id
+    if MY_CHAT_ID and chat_id != MY_CHAT_ID:
+        await context.bot.send_message(chat_id=chat_id, text="Este Capataz es privado.")
+        return
+
+    temp_path = None
+    asset_type = ""
+    file_name = ""
+    content_type = ""
+    try:
+        text = str(message.text or message.caption or "").strip()
+        if message.voice or message.audio:
+            media = message.voice or message.audio
+            telegram_file = await context.bot.get_file(media.file_id)
+            file_name = getattr(media, "file_name", None) or f"audio_{uuid.uuid4().hex[:8]}.ogg"
+            content_type = getattr(media, "mime_type", None) or "audio/ogg"
+            suffix = Path(file_name).suffix or ".ogg"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
+                temp_path = temp.name
+            await telegram_file.download_to_drive(temp_path)
+            await context.bot.send_message(chat_id=chat_id, text="Recibido. Transcribiendo y asignando agentes...")
+            transcription = await asyncio.to_thread(transcribe_audio, temp_path)
+            text = "\n\n".join(value for value in (text, transcription) if value).strip()
+            asset_type = "audio"
+        elif message.photo:
+            telegram_file = await context.bot.get_file(message.photo[-1].file_id)
+            file_name = f"foto_{uuid.uuid4().hex[:8]}.jpg"
+            content_type = "image/jpeg"
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp:
+                temp_path = temp.name
+            await telegram_file.download_to_drive(temp_path)
+            await context.bot.send_message(chat_id=chat_id, text="Recibido. Analizando la imagen y asignando agentes...")
+            description = await asyncio.to_thread(transcribe_image, temp_path)
+            text = "\n\n".join(value for value in (text, description) if value).strip()
+            asset_type = "foto"
+        elif message.document:
+            document = message.document
+            telegram_file = await context.bot.get_file(document.file_id)
+            file_name = document.file_name or f"documento_{uuid.uuid4().hex[:8]}"
+            content_type = document.mime_type or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+            suffix = Path(file_name).suffix or mimetypes.guess_extension(content_type) or ".bin"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
+                temp_path = temp.name
+            await telegram_file.download_to_drive(temp_path)
+            await context.bot.send_message(chat_id=chat_id, text="Recibido. Leyendo el archivo y asignando agentes...")
+            if content_type.startswith("image/"):
+                extracted = await asyncio.to_thread(transcribe_image, temp_path)
+                asset_type = "foto"
+            elif content_type.startswith("audio/"):
+                extracted = await asyncio.to_thread(transcribe_audio, temp_path)
+                asset_type = "audio"
+            elif content_type == "application/pdf" or suffix.lower() == ".pdf":
+                extracted = await asyncio.to_thread(transcribe_pdf, temp_path)
+                asset_type = "pdf"
+            else:
+                raise ValueError("Formato no soportado. Compartime texto, audio, imagen o PDF.")
+            text = "\n\n".join(value for value in (text, extracted) if value).strip()
+        if not text:
+            raise ValueError("No pude extraer contenido del mensaje")
+
+        draft = await asyncio.to_thread(
+            analyze_intake,
+            text,
+            source="telegram",
+            openai_client=openai_client,
+        )
+        confirmed = await asyncio.to_thread(capataz_store.confirm_intake, draft, source_text=text)
+        plan = await asyncio.to_thread(
+            agent_crew.queue_event,
+            confirmed["event"],
+            draft,
+            source_text=text,
+        )
+        if temp_path:
+            await asyncio.to_thread(
+                persist_telegram_asset,
+                temp_path,
+                event=confirmed["event"],
+                asset_type=asset_type,
+                file_name=file_name,
+                content_type=content_type,
+                transcript_text=text,
+            )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Trabajando con: " + ", ".join(plan.get("agents") or ["Capataz"]),
+        )
+        processed = await asyncio.to_thread(
+            process_capataz_event,
+            confirmed["event"],
+            draft,
+            text,
+        )
+        runs = processed.get("runs") or []
+        decision = processed.get("decision") or {}
+        summaries = [
+            f"{run.get('agent')}: {(run.get('output') or {}).get('summary')}"
+            for run in runs
+            if (run.get("output") or {}).get("summary")
+        ]
+        response_lines = ["Trabajo terminado."]
+        response_lines.extend(summaries[:6])
+        if decision:
+            response_lines.append("Decision lista para revisar en Capataz Campo.")
+        email_draft = processed.get("email_draft")
+        if email_draft:
+            email_status = (
+                "guardado en Gmail"
+                if email_draft.get("status") == "gmail_created"
+                else "preparado en Capataz"
+            )
+            response_lines.append(f"Correo {email_status}: {email_draft.get('subject')}")
+        response_lines.append("Abrir: https://bot-agro-campo.onrender.com/campo")
+        await context.bot.send_message(chat_id=chat_id, text="\n\n".join(response_lines)[:4000])
+    except Exception as exc:
+        logger.exception("Error procesando entrada de Telegram")
+        await context.bot.send_message(chat_id=chat_id, text=f"No pude terminar el trabajo: {str(exc)[:1000]}")
+    finally:
+        if temp_path:
+            Path(temp_path).unlink(missing_ok=True)
+
+
 def build_telegram_application():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Comandos de recorrida
-    app.add_handler(CommandHandler("recorrida_inicio", cmd_recorrida_inicio))
-    app.add_handler(CommandHandler("cerrar_recorrida", cmd_cerrar_recorrida))
-    app.add_handler(CommandHandler("recorrida_cancelar", cmd_recorrida_cancelar))
-
-    # Handler general
+    app.add_handler(CommandHandler("start", cmd_capataz_status))
+    app.add_handler(CommandHandler("status", cmd_capataz_status))
     app.add_handler(MessageHandler(
-        filters.TEXT | filters.VOICE | filters.PHOTO | filters.Document.ALL,
-        handle_message
+        filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | filters.Document.ALL,
+        handle_capataz_telegram_message,
     ))
-
-    # Recordatorio diario a las 8am Argentina (UTC-3 = 11:00 UTC)
-    app.job_queue.run_daily(
-        enviar_recordatorios,
-        time=datetime.strptime("11:00", "%H:%M").time()
-    )
 
     return app
 
@@ -3114,6 +3389,8 @@ async def health_campo():
         "tables": tables,
         "capataz_tables": capataz_store.schema_health(),
         "push": push_notifier.status(),
+        "gmail": gmail_service.status(),
+        "archive": archive_manager.status(),
     }
 
 @fastapi_app.post("/share-target")
@@ -3182,7 +3459,7 @@ async def confirm_capataz_intake(background_tasks: BackgroundTasks, payload: dic
         )
     if queued:
         background_tasks.add_task(
-            agent_crew.process_event,
+            process_capataz_event,
             result["event"],
             draft,
             source_text,
@@ -3194,6 +3471,11 @@ async def get_capataz_dashboard():
     dashboard = capataz_store.dashboard()
     if capataz_store.supabase_configured and dashboard.get("warnings"):
         raise HTTPException(status_code=503, detail="No se pudo leer el seguimiento desde Supabase")
+    try:
+        dashboard["recent_reports"] = list_recent_field_reports_from_supabase(limit=10)
+    except Exception as exc:
+        logger.warning(f"No se pudieron agregar informes al tablero: {exc}")
+        dashboard["recent_reports"] = []
     return {"ok": True, **dashboard}
 
 @fastapi_app.get("/api/capataz/crew")
@@ -3223,8 +3505,109 @@ async def subscribe_capataz_push(payload: dict = Body(...)):
 @fastapi_app.post("/api/capataz/reminders/dispatch")
 async def dispatch_capataz_reminders():
     try:
-        return {"ok": True, **push_notifier.dispatch_due()}
+        daily_review = await asyncio.to_thread(agent_crew.persist_daily_review)
+        followup_drafts = await asyncio.to_thread(email_draft_manager.prepare_due_followups)
+        reminders = (
+            await asyncio.to_thread(push_notifier.dispatch_due)
+            if push_notifier.configured
+            else {"sent": 0, "failed": 0, "skipped": "Web Push no configurado"}
+        )
+        email_sync = await asyncio.to_thread(email_draft_manager.sync_prepared)
+        return {
+            "ok": True,
+            **reminders,
+            "daily_review": daily_review,
+            "followup_drafts": followup_drafts,
+            "email_sync": email_sync,
+        }
     except (PersistentStorageError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@fastapi_app.get("/api/archive/status")
+async def get_archive_status():
+    return {"ok": True, "archive": await asyncio.to_thread(archive_manager.status)}
+
+
+@fastapi_app.get("/api/archive/manifest")
+async def get_archive_manifest(limit: int = Query(100, ge=1, le=500)):
+    try:
+        objects = await asyncio.to_thread(archive_manager.manifest, limit=limit)
+        return {"ok": True, "objects": objects}
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@fastapi_app.post("/api/archive/confirm")
+async def confirm_local_archive(payload: dict = Body(...)):
+    try:
+        archived = await asyncio.to_thread(
+            archive_manager.confirm,
+            str(payload.get("archive_id") or ""),
+            str(payload.get("sha256") or ""),
+            payload.get("size_bytes"),
+            str(payload.get("relative_path") or ""),
+            machine=str(payload.get("machine") or ""),
+        )
+        return {"ok": True, "archive": archived}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@fastapi_app.get("/api/capataz/gmail/status")
+async def get_gmail_status():
+    return {"ok": True, **gmail_service.status()}
+
+
+@fastapi_app.post("/api/capataz/email-drafts/sync")
+async def sync_gmail_drafts():
+    try:
+        result = await asyncio.to_thread(email_draft_manager.sync_prepared)
+        return {"ok": True, **result}
+    except (PersistentStorageError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@fastapi_app.post("/api/capataz/events/{event_id}/email-draft")
+async def prepare_event_email_draft(event_id: str):
+    event_id = validate_record_id(event_id, "event_id")
+    events, source, warning = capataz_store.list_rows("client_events", order="created_at.desc")
+    event = next((row for row in events if row.get("id") == event_id), None)
+    if not event:
+        raise HTTPException(status_code=404, detail="evento no encontrado")
+    if capataz_store.supabase_configured and source != "supabase":
+        raise HTTPException(status_code=503, detail=warning or "evento no disponible")
+    runs, runs_source, runs_warning = capataz_store.list_rows("agent_runs", order="created_at.desc")
+    decisions, decisions_source, decisions_warning = capataz_store.list_rows("decisions", order="created_at.desc")
+    if capataz_store.supabase_configured and (
+        runs_source != "supabase" or decisions_source != "supabase"
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=runs_warning or decisions_warning or "trabajo de agentes no disponible",
+        )
+    draft = {
+        "client_name": event.get("client_name") or "",
+        "summary": event.get("summary") or "",
+        "event_type": event.get("event_type") or "nota",
+        "agents": event.get("agents") or ["Cartera"],
+    }
+    result = {
+        "runs": [row for row in runs if row.get("event_id") == event_id],
+        "decision": next((row for row in decisions if row.get("event_id") == event_id), None),
+    }
+    try:
+        email_draft = email_draft_manager.prepare(
+            event,
+            draft,
+            result,
+            source_text=event.get("source_text") or "",
+            force=True,
+        )
+        return {"ok": True, "email_draft": email_draft}
+    except PersistentStorageError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 @fastapi_app.get("/api/capataz/events/{event_id}/runs")
@@ -3260,7 +3643,7 @@ async def dispatch_capataz_event(event_id: str):
         "tasks": [],
     }
     try:
-        result = agent_crew.process_event(event, draft, source_text=event.get("source_text") or "")
+        result = process_capataz_event(event, draft, source_text=event.get("source_text") or "")
         return {"ok": True, **result}
     except PersistentStorageError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -3328,7 +3711,11 @@ async def create_field_session(payload: dict = Body(...)):
     return {"ok": True, "id": session["id"], "supabase_error": supabase_error}
 
 @fastapi_app.post("/api/field-sessions/{session_id}/close")
-async def close_field_session(session_id: str, payload: dict = Body(default={})):
+async def close_field_session(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    payload: dict = Body(default={}),
+):
     session_id = validate_record_id(session_id, "session_id")
     closed_at = clean_db_value(payload.get("closed_at")) or datetime.utcnow().isoformat() + "Z"
     logger.info(f"Cerrando recorrida: {session_id}")
@@ -3359,7 +3746,22 @@ async def close_field_session(session_id: str, payload: dict = Body(default={}))
     if supabase_database_configured() and supabase_error:
         raise HTTPException(status_code=503, detail=f"Supabase no cerro la recorrida: {supabase_error}")
 
-    return {"ok": True, "id": session_id, "supabase_error": supabase_error}
+    report_queued = False
+    if supabase_database_configured():
+        try:
+            _remote_session, session_items = get_items_for_session_from_supabase(session_id)
+            if session_items:
+                background_tasks.add_task(generate_field_report, session_id, False)
+                report_queued = True
+        except Exception as exc:
+            logger.warning(f"No se pudo encolar el informe automatico de {session_id}: {exc}")
+
+    return {
+        "ok": True,
+        "id": session_id,
+        "supabase_error": supabase_error,
+        "report_queued": report_queued,
+    }
 
 @fastapi_app.get("/api/field-sessions")
 async def list_field_sessions():

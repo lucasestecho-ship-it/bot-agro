@@ -6,3 +6,7 @@ __pycache__/
 private_key.pem
 public_key.pem
 vapid/
+gmail_render_variables.json
+client_secret*.json
+credentials*.json
+*.partial

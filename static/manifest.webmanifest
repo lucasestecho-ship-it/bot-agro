@@ -1,7 +1,7 @@
 {
   "name": "Capataz Campo",
   "short_name": "Capataz",
-  "description": "Recorridas, clientes, tareas y proyectos de agua del estudio de Lucas Estecho.",
+  "description": "Agentes, recorridas, informes y seguimiento de clientes del estudio de Lucas Estecho.",
   "id": "/campo",
   "start_url": "/campo",
   "scope": "/",

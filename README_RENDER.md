@@ -16,7 +16,18 @@ Antes del primer despliegue de esta version, ejecutar completo en Supabase SQL E
 supabase/capataz_campo.sql
 ```
 
-La migracion agrega las columnas necesarias para conservar `session_id`, la cuadrilla de agentes, decisiones, tareas, proyectos de agua y suscripciones push. Tambien crea las funciones transaccionales. No borra datos anteriores.
+La migracion agrega las columnas necesarias para conservar `session_id`, la cuadrilla de agentes, decisiones, tareas, proyectos de agua, suscripciones push, borradores de Gmail, archivos recibidos por Telegram y el manifiesto del archivador local. Tambien crea las funciones transaccionales. No borra datos anteriores.
+
+El orden de activacion de esta version es importante:
+
+1. subir la rama y abrir el PR, sin fusionar todavia;
+2. ejecutar `supabase/capataz_campo.sql` completo;
+3. fusionar y esperar el deploy de Render;
+4. cargar OAuth de Gmail;
+5. cambiar `ENABLE_TELEGRAM_BOT=true` y desplegar;
+6. instalar el archivador de Windows.
+
+La migracion debe ir antes del deploy porque el tablero nuevo lee `email_drafts` y `archive_objects`.
 
 ## Configuracion manual
 
@@ -60,6 +71,17 @@ Opcional:
 FIELD_REPORT_MODEL=gpt-4o-mini
 CAPATAZ_AGENT_MODEL=gpt-4o-mini
 ```
+
+Para Gmail:
+
+```bash
+GMAIL_CLIENT_ID=...
+GMAIL_CLIENT_SECRET=...
+GMAIL_REFRESH_TOKEN=...
+GMAIL_SENDER=lucas.estecho@gmail.com
+```
+
+La app usa OAuth de usuario y crea borradores; no puede usar la cuenta de servicio de Google Sheets para un Gmail personal.
 
 `SUPABASE_SERVICE_ROLE_KEY` y `OPENAI_API_KEY` van solo en Render, nunca en el frontend.
 Google Drive no se usa para la app `/campo`.
@@ -106,7 +128,24 @@ select cron.schedule(
 );
 ```
 
-`11:00 UTC` equivale a `08:00` de Argentina. El endpoint solo notifica si existen tareas vencidas, tareas para hoy o decisiones pendientes.
+`11:00 UTC` equivale a `08:00` de Argentina. El endpoint notifica pendientes y tambien reintenta materializar en Gmail los borradores preparados que hubieran quedado en espera.
+
+## Archivar y liberar Supabase desde Windows
+
+Despues del deploy, abrir PowerShell dentro del repo actualizado y ejecutar:
+
+```powershell
+.\windows\instalar_archivador.ps1
+```
+
+El instalador pide el mismo `FIELD_APP_TOKEN` de Render y usa por defecto:
+
+```text
+C:\Users\Lucas Estecho\Documents\CapatazCampo\Archivo
+```
+
+No copia la `SUPABASE_SERVICE_ROLE_KEY` a Windows. El borrado remoto ocurre en Render y solamente despues de que el cliente confirma una descarga completa con SHA-256, tamaño y ruta exacta.
+Las evidencias de campo solo se ofrecen al archivador cuando la recorrida esta cerrada y existe un informe con estado `done`.
 
 ## Supabase Storage para archivos persistentes
 
@@ -363,16 +402,16 @@ Necesarias si se habilita Telegram o las funciones del bot:
 ```bash
 TELEGRAM_TOKEN=...
 OPENAI_API_KEY=...
-GOOGLE_SHEET_ID=...
-GOOGLE_CREDENTIALS_JSON=...
 MY_CHAT_ID=1144480769
 ```
 
-Para esta primera prueba dejar:
+Durante la migracion dejar:
 
 ```bash
 ENABLE_TELEGRAM_BOT=false
 ```
+
+Despues de ejecutar la migracion y verificar el deploy, cambiarla a `true`. El bot nuevo guarda en Supabase y no usa Google Sheets ni Google Drive.
 
 ## Blueprint
 

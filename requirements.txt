@@ -2,7 +2,7 @@ python-telegram-bot[job-queue]
 openai
 gspread
 google-auth
-pdf2image
+PyMuPDF
 google-api-python-client
 python-docx
 Pillow

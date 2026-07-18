@@ -30,9 +30,13 @@ services:
         sync: false
       - key: VAPID_SUBJECT
         sync: false
-      - key: GOOGLE_SHEET_ID
-        sync: false
-      - key: GOOGLE_CREDENTIALS_JSON
-        sync: false
       - key: MY_CHAT_ID
         sync: false
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
+        sync: false
+      - key: GMAIL_SENDER
+        value: lucas.estecho@gmail.com

@@ -182,6 +182,110 @@ button:disabled,
   background: rgba(248, 255, 249, 0.94);
 }
 
+.work-panel {
+  border-color: #76a58a;
+  background: rgba(247, 255, 250, 0.97);
+}
+
+.agent-work-list,
+.email-drafts-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.work-card,
+.email-card {
+  display: grid;
+  gap: 7px;
+  border: 1px solid #cad9cd;
+  border-left: 5px solid #2b7650;
+  border-radius: 8px;
+  padding: 11px;
+  background: #fff;
+}
+
+.work-card.processing {
+  border-left-color: #c1842d;
+  background: #fffdf7;
+}
+
+.work-card.failed {
+  border-left-color: #a43b2f;
+  background: #fff8f7;
+}
+
+.work-card-title,
+.work-card-meta,
+.email-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.work-card-summary {
+  white-space: pre-line;
+  line-height: 1.4;
+}
+
+.work-card-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.work-state {
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #dceee3;
+  color: #1f6b45;
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.work-state.processing {
+  background: #f3e6c8;
+  color: #765116;
+}
+
+.work-state.failed {
+  background: #f4d9d5;
+  color: #8d3025;
+}
+
+.work-card-actions button,
+.email-card-actions button,
+.email-card-actions .button-link {
+  min-height: 38px;
+  padding: 8px 11px;
+}
+
+.email-drafts-box {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #d1ded4;
+}
+
+.email-drafts-box h3 {
+  margin: 0;
+  font-size: 0.98rem;
+}
+
+.email-card {
+  border-left-color: #8a5d9b;
+}
+
+.empty-work {
+  margin: 12px 0 0;
+  border: 1px dashed #aebcaf;
+  border-radius: 8px;
+  padding: 12px;
+  color: #526158;
+  background: rgba(255, 255, 255, 0.7);
+}
+
 .intake-panel h2 {
   margin-bottom: 12px;
 }
@@ -366,7 +470,7 @@ button:disabled,
 
 .client-frequency-controls {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto;
   gap: 8px;
 }
 
@@ -560,9 +664,10 @@ button:disabled,
   }
 
   .draft-task-grid,
-  .dialog-actions,
-  .decision-actions,
-  .assign-session-controls {
+    .dialog-actions,
+    .decision-actions,
+    .assign-session-controls,
+    .client-frequency-controls {
     grid-template-columns: 1fr;
   }
 

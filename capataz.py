@@ -33,13 +33,15 @@ KNOWN_CLIENT_NAMES = [
 ]
 
 CAPATAZ_TABLES = {
-    "clients": ["id", "name", "status", "followup_days", "last_contact_at", "next_contact_at", "notes", "created_at", "updated_at"],
+    "clients": ["id", "name", "email", "phone", "status", "followup_days", "last_contact_at", "next_contact_at", "notes", "created_at", "updated_at"],
     "client_events": ["id", "client_id", "client_name", "source", "source_text", "summary", "event_type", "agents", "economic_review", "water_project", "field_name", "created_at"],
     "tasks": ["id", "client_id", "client_name", "event_id", "title", "due_date", "priority", "agent", "status", "notes", "created_at", "updated_at"],
     "water_projects": ["id", "client_id", "client_name", "title", "status", "next_action", "next_review_date", "notes", "created_at", "updated_at"],
     "agent_runs": ["id", "event_id", "agent", "status", "input_summary", "output", "error", "started_at", "finished_at", "created_at"],
     "decisions": ["id", "event_id", "client_id", "client_name", "topic", "agents", "summary", "technical_basis", "economic_summary", "recommendation", "risks", "missing_data", "next_actions", "confidence", "status", "created_at", "updated_at"],
     "push_subscriptions": ["id", "endpoint", "subscription", "active", "last_success_at", "last_error", "created_at", "updated_at"],
+    "email_drafts": ["id", "event_id", "client_id", "client_name", "to_email", "subject", "body_text", "status", "gmail_draft_id", "gmail_message_id", "error", "created_at", "updated_at"],
+    "intake_assets": ["id", "event_id", "client_id", "client_name", "source", "asset_type", "file_name", "content_type", "transcript_text", "storage_status", "storage_provider", "storage_path", "storage_public_url", "storage_error", "created_at", "updated_at"],
 }
 
 
@@ -70,12 +72,22 @@ def stable_client_id(name):
     return f"client-{slug}"
 
 
+def indicates_completed_contact(text):
+    key = normalize_key(text)
+    return bool(re.search(
+        r"\b(hable|llame|mande|envie|visite|me reuni|respondio|confirmo recepcion)\b",
+        key,
+    ))
+
+
 def known_client_rows():
     now = iso_now()
     return [
         {
             "id": stable_client_id(name),
             "name": name,
+            "email": None,
+            "phone": None,
             "status": "active",
             "followup_days": None,
             "last_contact_at": None,
@@ -445,6 +457,12 @@ class CapatazStore:
             persist=not self.supabase_configured,
         )
         now = iso_now()
+        if client and indicates_completed_contact(source_text):
+            client = {**client, "last_contact_at": now, "updated_at": now}
+            if client.get("followup_days"):
+                client["next_contact_at"] = (
+                    argentina_now() + timedelta(days=int(client["followup_days"]))
+                ).isoformat()
         event_id = f"event-{normalized.get('draft_id')}"
         event = {
             "id": event_id,
@@ -564,6 +582,7 @@ class CapatazStore:
         projects, projects_source, projects_warning = self.list_rows("water_projects", order="next_review_date.asc.nullslast")
         decisions, decisions_source, decisions_warning = self.list_rows("decisions", order="created_at.desc")
         runs, runs_source, runs_warning = self.list_rows("agent_runs", order="created_at.desc")
+        email_drafts, emails_source, emails_warning = self.list_rows("email_drafts", order="created_at.desc")
         today = argentina_now().date()
         active = [task for task in tasks if str(task.get("status") or "pending").lower() not in {"done", "completed", "cancelled"}]
         buckets = {"overdue": [], "today": [], "upcoming": [], "no_date": []}
@@ -605,6 +624,7 @@ class CapatazStore:
                 projects_warning,
                 decisions_warning,
                 runs_warning,
+                emails_warning,
             )
             if warning
         ]
@@ -619,12 +639,14 @@ class CapatazStore:
             ][:20],
             "clients_without_next_action": uncovered_clients,
             "agent_activity": runs[:30],
+            "email_drafts": email_drafts[:30],
             "source": {
                 "clients": clients_source,
                 "tasks": tasks_source,
                 "water_projects": projects_source,
                 "decisions": decisions_source,
                 "agent_runs": runs_source,
+                "email_drafts": emails_source,
             },
             "warnings": warnings,
         }
@@ -733,7 +755,10 @@ class CapatazStore:
         return {"id": task_id, **payload, "remote_error": remote_error}
 
     def update_client(self, client_id, changes):
-        allowed = {"name", "status", "followup_days", "last_contact_at", "next_contact_at", "notes"}
+        allowed = {
+            "name", "email", "phone", "status", "followup_days",
+            "last_contact_at", "next_contact_at", "notes",
+        }
         payload = {key: value for key, value in (changes or {}).items() if key in allowed}
         followup_days = payload.get("followup_days")
         if followup_days in ("", None, 0, "0"):

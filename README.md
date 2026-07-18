@@ -1,6 +1,6 @@
 # Capataz Campo
 
-PWA Android para recorridas, audios, fotos, clientes, tareas, decisiones y proyectos de agua. FastAPI corre en Render y Supabase conserva los datos.
+PWA Android y cuadrilla de agentes para recorridas, audios, fotos, clientes, decisiones, informes y borradores de correo. FastAPI corre en Render; Supabase conserva temporalmente los datos y una tarea de Windows archiva los archivos pesados en la computadora.
 
 La aplicacion anterior se llamaba internamente Bot Agro. La interfaz y el manifiesto ahora usan exclusivamente **Capataz Campo**.
 
@@ -37,8 +37,6 @@ exec uvicorn main:fastapi_app --host 0.0.0.0 --port "${PORT:-8000}"
    ```bash
    export TELEGRAM_TOKEN="..."
    export OPENAI_API_KEY="..."
-   export GOOGLE_SHEET_ID="..."
-   export GOOGLE_CREDENTIALS_JSON='...'
    export MY_CHAT_ID="1144480769"
    export DATA_DIR="/tmp/campo_bot"
    export FIELD_APP_TOKEN=""
@@ -95,12 +93,14 @@ La pantalla `/campo` permite:
 - impedir que una foto o un audio se suban sin recorrida activa
 - verificar en Supabase que cada archivo conserve el mismo `session_id`
 - recibir texto compartido desde Android
-- convertir texto o audios en borradores de tareas que Lucas confirma antes de guardar
+- asignar texto o audios a los agentes y mostrar arriba el trabajo terminado
 - mostrar tareas atrasadas, para hoy y proximas
 - subir automaticamente cuando hay conexion, sin pedir etiquetas despues de cada foto o audio
 - mostrar decisiones tecnicas y economicas para aprobar o descartar
 - recibir avisos push aunque la PWA no este abierta, cuando Web Push esta configurado
 - generar informes de recorrida en PDF y DOCX, con una seccion economica y sin inventar precios
+- generar automaticamente el informe cuando una recorrida queda cerrada y todos sus archivos subieron
+- mostrar los informes, analisis y correos preparados como resultados de trabajo, no como simples recordatorios
 
 Cada item guarda metadata: campo, sector, fecha/hora, latitud, longitud, precision GPS, tipo y estado.
 
@@ -120,7 +120,42 @@ Cada item guarda metadata: campo, sector, fecha/hora, latitud, longitud, precisi
 - `Contralor`: audita las salidas antes de mostrar una decision.
 - `Ejecutor`: convierte una decision aprobada por Lucas en tareas; no comunica ni ejecuta acciones externas por su cuenta.
 
-Las notas simples de seguimiento no generan una segunda aprobacion innecesaria. Las decisiones tecnicas, de agua o economicas aparecen en **Por decidir** y solo crean tareas nuevas cuando Lucas las aprueba.
+Las notas simples de seguimiento no generan una segunda aprobacion innecesaria. Las decisiones tecnicas, de agua o economicas aparecen en **Por decidir** y solo crean tareas nuevas cuando Lucas las aprueba. Los agentes sí producen resultados antes de esa aprobación: analisis auditados, informes y borradores reales de Gmail.
+
+## Entrada por Telegram desde WhatsApp
+
+Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto y PDF. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo.
+
+Solo se atiende el chat configurado en `MY_CHAT_ID`. El handler nuevo no depende de Google Sheets ni de Google Drive.
+
+## Borradores de Gmail
+
+Si la entrada pide un correo, una respuesta, una propuesta o un presupuesto, `Comercial` e `Informes` preparan el texto y el backend llama unicamente a `users.drafts.create`. No existe una ruta para enviar el mensaje. Lucas lo revisa y lo envia desde Gmail.
+
+Variables de Render:
+
+```text
+GMAIL_CLIENT_ID
+GMAIL_CLIENT_SECRET
+GMAIL_REFRESH_TOKEN
+GMAIL_SENDER=lucas.estecho@gmail.com
+```
+
+La autorizacion inicial se realiza una sola vez en Windows con `windows/configurar_gmail.ps1`.
+Para uso duradero, el proyecto OAuth externo no debe quedar en estado `Testing`, porque Google limita esos refresh tokens a siete dias cuando se solicitan permisos de Gmail.
+
+## Archivo local y limpieza de Supabase
+
+`windows/instalar_archivador.ps1` configura dos tareas de Windows: al iniciar sesion y todos los dias a las 20:00. El archivador:
+
+1. pide a Render un manifiesto con URLs de descarga temporales;
+2. descarga cada archivo a `Documents\CapatazCampo\Archivo`;
+3. verifica que la descarga no este vacia o incompleta y calcula SHA-256;
+4. confirma a Render la ruta exacta, tamaño y hash;
+5. recien entonces Render elimina ese objeto puntual de Supabase Storage.
+
+La `service_role` permanece en Render. Windows guarda solamente `FIELD_APP_TOKEN` en el Administrador de credenciales.
+Los originales de una recorrida no entran al manifiesto mientras siga abierta, el informe este en proceso o el informe haya fallado.
 
 ## Migracion de Supabase
 
@@ -144,18 +179,18 @@ Las fotos subidas desde `/campo` no se procesan con IA. El backend solo guarda e
 
 En Render, `FIELD_APP_TOKEN` es obligatorio. La PWA lo pide una sola vez y lo conserva en el telefono. La clave `service_role` nunca sale del backend. Las confirmaciones, las aprobaciones y sus tareas se guardan mediante funciones transaccionales de Supabase: se guarda todo o no se guarda nada.
 
-## Telegram
+## Activar Telegram
 
-El bot de Telegram puede arrancar junto con FastAPI si:
+El bot puede arrancar junto con FastAPI si:
 
 ```bash
 ENABLE_TELEGRAM_BOT=true
 ```
 
-Para la primera prueba en Render conviene dejar:
+Durante la migracion se deja apagado; se cambia a `true` despues de ejecutar el SQL nuevo y desplegar:
 
 ```bash
 ENABLE_TELEGRAM_BOT=false
 ```
 
-Los comandos existentes `/recorrida_inicio`, `/cerrar_recorrida` y `/recorrida_cancelar` siguen registrados con los mismos handlers cuando el bot esta habilitado.
+Los comandos disponibles son `/start` y `/status`. El flujo normal consiste en compartirle texto, audio, foto o PDF.

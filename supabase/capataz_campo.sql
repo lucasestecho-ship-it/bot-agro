@@ -21,6 +21,8 @@ on public.field_items (session_id);
 create table if not exists public.clients (
   id text primary key,
   name text not null,
+  email text,
+  phone text,
   status text not null default 'active',
   followup_days integer,
   last_contact_at timestamptz,
@@ -32,6 +34,8 @@ create table if not exists public.clients (
 
 alter table public.clients
 add column if not exists name text,
+add column if not exists email text,
+add column if not exists phone text,
 add column if not exists status text default 'active',
 add column if not exists followup_days integer,
 add column if not exists last_contact_at timestamptz,
@@ -223,6 +227,126 @@ add column if not exists updated_at timestamptz default now();
 create index if not exists idx_push_subscriptions_active
 on public.push_subscriptions (active, created_at desc);
 
+create table if not exists public.email_drafts (
+  id text primary key,
+  event_id text,
+  client_id text,
+  client_name text,
+  to_email text,
+  subject text not null,
+  body_text text not null,
+  status text not null default 'prepared',
+  gmail_draft_id text,
+  gmail_message_id text,
+  error text default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.email_drafts
+add column if not exists event_id text,
+add column if not exists client_id text,
+add column if not exists client_name text,
+add column if not exists to_email text,
+add column if not exists subject text,
+add column if not exists body_text text,
+add column if not exists status text default 'prepared',
+add column if not exists gmail_draft_id text,
+add column if not exists gmail_message_id text,
+add column if not exists error text default '',
+add column if not exists created_at timestamptz default now(),
+add column if not exists updated_at timestamptz default now();
+
+create index if not exists idx_email_drafts_status_created
+on public.email_drafts (status, created_at desc);
+
+create table if not exists public.intake_assets (
+  id text primary key,
+  event_id text,
+  client_id text,
+  client_name text,
+  source text not null default 'telegram',
+  asset_type text not null,
+  file_name text not null,
+  content_type text,
+  transcript_text text,
+  storage_status text,
+  storage_provider text,
+  storage_path text,
+  storage_public_url text,
+  storage_error text default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.intake_assets
+add column if not exists event_id text,
+add column if not exists client_id text,
+add column if not exists client_name text,
+add column if not exists source text default 'telegram',
+add column if not exists asset_type text,
+add column if not exists file_name text,
+add column if not exists content_type text,
+add column if not exists transcript_text text,
+add column if not exists storage_status text,
+add column if not exists storage_provider text,
+add column if not exists storage_path text,
+add column if not exists storage_public_url text,
+add column if not exists storage_error text default '',
+add column if not exists created_at timestamptz default now(),
+add column if not exists updated_at timestamptz default now();
+
+create index if not exists idx_intake_assets_event_created
+on public.intake_assets (event_id, created_at desc);
+
+create table if not exists public.archive_objects (
+  id text primary key,
+  source_table text not null,
+  source_id text not null,
+  object_role text not null,
+  client_name text,
+  session_id text,
+  object_path text not null,
+  relative_path text not null,
+  file_name text not null,
+  content_type text,
+  status text not null default 'pending',
+  sha256 text,
+  size_bytes bigint,
+  archive_machine text,
+  downloaded_at timestamptz,
+  storage_deleted_at timestamptz,
+  error text default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.archive_objects
+add column if not exists source_table text,
+add column if not exists source_id text,
+add column if not exists object_role text,
+add column if not exists client_name text,
+add column if not exists session_id text,
+add column if not exists object_path text,
+add column if not exists relative_path text,
+add column if not exists file_name text,
+add column if not exists content_type text,
+add column if not exists status text default 'pending',
+add column if not exists sha256 text,
+add column if not exists size_bytes bigint,
+add column if not exists archive_machine text,
+add column if not exists downloaded_at timestamptz,
+add column if not exists storage_deleted_at timestamptz,
+add column if not exists error text default '',
+add column if not exists created_at timestamptz default now(),
+add column if not exists updated_at timestamptz default now();
+
+create unique index if not exists idx_archive_objects_source_path
+on public.archive_objects (source_table, source_id, object_role, object_path);
+
+create index if not exists idx_archive_objects_status_created
+on public.archive_objects (status, created_at asc);
+
 -- Una confirmacion se guarda completa o no se guarda nada.
 create or replace function public.confirm_capataz_intake(payload jsonb)
 returns jsonb
@@ -241,6 +365,8 @@ begin
     select * from jsonb_populate_record(null::public.clients, payload->'client')
     on conflict (id) do update set
       name = excluded.name,
+      email = coalesce(excluded.email, clients.email),
+      phone = coalesce(excluded.phone, clients.phone),
       status = excluded.status,
       followup_days = excluded.followup_days,
       last_contact_at = excluded.last_contact_at,
@@ -376,6 +502,9 @@ alter table public.water_projects enable row level security;
 alter table public.agent_runs enable row level security;
 alter table public.decisions enable row level security;
 alter table public.push_subscriptions enable row level security;
+alter table public.email_drafts enable row level security;
+alter table public.intake_assets enable row level security;
+alter table public.archive_objects enable row level security;
 
 insert into public.clients (id, name, status)
 values

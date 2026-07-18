@@ -50,6 +50,18 @@ class CapatazStoreTests(unittest.TestCase):
             refreshed = store.dashboard()
             self.assertFalse(any(row["id"] == client["id"] for row in refreshed["clients_without_next_action"]))
 
+    def test_completed_contact_moves_client_followup_forward(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CapatazStore(data_dir=Path(temp_dir))
+            client = next(row for row in store.dashboard()["clients"] if row["name"] == "Policarpo")
+            store.update_client(client["id"], {"followup_days": 15})
+            before = next(row for row in store.dashboard()["clients"] if row["id"] == client["id"])
+            draft = heuristic_analysis("Policarpo: hablé hoy y confirmó que recibió el informe")
+            store.confirm_intake(draft, source_text="Policarpo: hablé hoy y confirmó que recibió el informe")
+            after = next(row for row in store.dashboard()["clients"] if row["id"] == client["id"])
+            self.assertIsNotNone(after["last_contact_at"])
+            self.assertGreater(after["next_contact_at"], before["next_contact_at"])
+
 
 if __name__ == "__main__":
     unittest.main()
