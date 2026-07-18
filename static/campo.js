@@ -121,8 +121,9 @@ function escapeHtml(value) {
 }
 
 function safeExternalUrl(value) {
+  if (typeof value !== "string" || !value.trim()) return "";
   try {
-    const parsed = new URL(String(value || ""), window.location.origin);
+    const parsed = new URL(value.trim(), window.location.origin);
     if (!["http:", "https:"].includes(parsed.protocol)) return "";
     return escapeHtml(parsed.href);
   } catch {
@@ -492,11 +493,6 @@ function addSessionAssignmentControls(container, item, sessions) {
     option.textContent = `${session.nombre || "Recorrida"} · ${session.campo || "sin campo"}`;
     select.appendChild(option);
   }
-  const email = document.createElement("input");
-  email.type = "email";
-  email.placeholder = "Correo del cliente";
-  email.value = client.email || "";
-  email.setAttribute("aria-label", `Correo para ${client.name || "cliente"}`);
   const button = document.createElement("button");
   button.type = "button";
   button.textContent = "Asignar a recorrida";
@@ -1265,6 +1261,11 @@ function createUncoveredClientItem(client) {
     option.selected = String(client.followup_days || "") === days;
     select.appendChild(option);
   }
+  const email = document.createElement("input");
+  email.type = "email";
+  email.placeholder = "Correo del cliente";
+  email.value = client.email || "";
+  email.setAttribute("aria-label", `Correo para ${client.name || "cliente"}`);
   const save = document.createElement("button");
   save.type = "button";
   save.textContent = "Guardar";
@@ -1410,7 +1411,9 @@ function createReportWorkCard(report) {
   const card = document.createElement("article");
   const status = String(report.estado || "").toLowerCase();
   const processing = status === "generando";
-  const failed = status === "error";
+  const hasDeliverable = Boolean(safeExternalUrl(report.pdf_public_url) || safeExternalUrl(report.docx_public_url));
+  const missingFile = status === "done" && !hasDeliverable;
+  const failed = status === "error" || missingFile;
   card.className = `work-card${processing ? " processing" : failed ? " failed" : ""}`;
   const heading = document.createElement("div");
   heading.className = "work-card-title";
@@ -1418,7 +1421,7 @@ function createReportWorkCard(report) {
   title.textContent = report.titulo || "Informe de recorrida";
   const state = document.createElement("span");
   state.className = `work-state${processing ? " processing" : failed ? " failed" : ""}`;
-  state.textContent = processing ? "generando" : failed ? "con error" : "terminado";
+  state.textContent = processing ? "generando" : missingFile ? "sin archivo" : failed ? "con error" : "terminado";
   heading.append(title, state);
   const agents = document.createElement("div");
   agents.className = "work-card-agents";
@@ -1428,7 +1431,9 @@ function createReportWorkCard(report) {
   agents.appendChild(badge);
   const summary = document.createElement("div");
   summary.className = "work-card-summary";
-  summary.textContent = report.resumen || report.progress_message || report.error || "Informe listo";
+  summary.textContent = missingFile
+    ? "El registro dice terminado, pero no existe un PDF o DOCX descargable. No se cuenta como trabajo entregado."
+    : report.resumen || report.progress_message || report.error || "Informe listo";
   const actions = document.createElement("div");
   actions.className = "work-card-actions email-card-actions";
   for (const [url, label] of [[report.pdf_public_url, "Abrir PDF"], [report.docx_public_url, "Abrir DOCX"]]) {
@@ -1462,7 +1467,9 @@ function renderAgentWork(runs, emailDrafts, reports = []) {
   const workGroups = [...groups.values()].slice(0, 10);
   const completed = workGroups.filter((group) => group.runs.every((run) => ["completed", "fallback"].includes(String(run.status || "").toLowerCase()))).length;
   const processing = workGroups.filter((group) => group.runs.some((run) => ["queued", "running"].includes(String(run.status || "").toLowerCase()))).length;
-  const finishedReports = reports.filter((report) => report.estado === "done").length;
+  const finishedReports = reports.filter((report) => (
+    report.estado === "done" && (safeExternalUrl(report.pdf_public_url) || safeExternalUrl(report.docx_public_url))
+  )).length;
   const processingReports = reports.filter((report) => report.estado === "generando").length;
   agentWorkSummary.textContent = `${completed + finishedReports} trabajo(s) terminado(s) · ${processing + processingReports} en proceso`;
   for (const report of reports.slice(0, 5)) agentWorkList.appendChild(createReportWorkCard(report));

@@ -7,6 +7,8 @@ google-api-python-client
 python-docx
 Pillow
 requests
+numpy>=1.26,<3
+rasterio>=1.4,<2
 fastapi
 uvicorn[standard]
 python-multipart

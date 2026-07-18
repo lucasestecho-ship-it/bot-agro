@@ -55,6 +55,19 @@ Documents\CapatazCampo\gmail_render_variables.json
 
 Copiar sus cuatro valores a Render y borrar el JSON local cuando se haya confirmado que Gmail funciona. No subirlo a GitHub ni mandarlo por chat.
 
+## 4 bis. NDVI Sentinel automatico
+
+En el panel Sentinel Hub de Copernicus Data Space, crear un OAuth Client y guardar en Render:
+
+```text
+CDSE_CLIENT_ID
+CDSE_CLIENT_SECRET
+CDSE_NDVI_LOOKBACK_DAYS=45
+CDSE_MAX_CLOUD_PERCENT=30
+```
+
+El bot agrupa KML, GeoTIFF y XML auxiliares de un mismo envio. Calcula topografia desde el DEM y, si el texto pide NDVI, usa el KML como area de interes para solicitar Sentinel-2 L2A. Si las credenciales no estan configuradas, no inventa un NDVI: termina la topografia y muestra el faltante.
+
 ## 5. Archivador de Supabase
 
 En la misma PowerShell:
@@ -83,3 +96,4 @@ C:\Users\Lucas Estecho\Documents\CapatazCampo\Archivo
 4. Revisar Borradores en Gmail; no debe existir ningún mensaje enviado.
 5. Hacer una recorrida con una foto y un audio, cerrarla y esperar el informe PDF/DOCX automático.
 6. Ejecutar el archivador manual y comprobar que el archivo existe en Windows antes de verificar que desapareció de Supabase Storage.
+7. Compartir juntos un KML, un DEM GeoTIFF y el pedido `analizar topografia para agua y NDVI`; debe responder una sola vez con cotas y pendientes calculadas. El NDVI se agrega si CDSE esta configurado.
