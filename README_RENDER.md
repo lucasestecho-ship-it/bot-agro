@@ -1,4 +1,4 @@
-# Deploy en Render Free
+# Capataz Campo en Render
 
 Esta configuracion despliega la app FastAPI `main:fastapi_app` para que funcionen:
 
@@ -6,6 +6,17 @@ Esta configuracion despliega la app FastAPI `main:fastapi_app` para que funcione
 - `GET /campo`
 - `GET /docs`
 - `POST /api/field-items`
+- `GET /api/capataz/dashboard`
+- `POST /api/capataz/analyze`
+- `POST /api/capataz/confirm`
+
+Antes del primer despliegue de esta version, ejecutar completo en Supabase SQL Editor:
+
+```text
+supabase/capataz_campo.sql
+```
+
+La migracion agrega las columnas necesarias para conservar `session_id`, la cuadrilla de agentes, decisiones, tareas, proyectos de agua y suscripciones push. Tambien crea las funciones transaccionales. No borra datos anteriores.
 
 ## Configuracion manual
 
@@ -40,16 +51,62 @@ SUPABASE_URL=https://TU_PROYECTO.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=tu_service_role_key
 SUPABASE_BUCKET=campo-items
 OPENAI_API_KEY=tu_openai_api_key
+FIELD_APP_TOKEN=una_clave_larga_y_unica
 ```
 
 Opcional:
 
 ```bash
 FIELD_REPORT_MODEL=gpt-4o-mini
+CAPATAZ_AGENT_MODEL=gpt-4o-mini
 ```
 
 `SUPABASE_SERVICE_ROLE_KEY` y `OPENAI_API_KEY` van solo en Render, nunca en el frontend.
 Google Drive no se usa para la app `/campo`.
+
+Si Render, Supabase u OpenAI estan configurados y falta `FIELD_APP_TOKEN`, las rutas privadas responden 503. Esto evita publicar una API con `service_role` sin proteccion.
+
+## Avisos push en Android
+
+1. En una computadora con Python, instalar `pywebpush` y generar un par VAPID:
+
+   ```bash
+   pip install pywebpush
+   mkdir vapid
+   cd vapid
+   vapid --gen
+   vapid --applicationServerKey
+   ```
+
+2. Cargar en Render:
+
+   - `VAPID_PUBLIC_KEY`: el valor `Application Server Key`.
+   - `VAPID_PRIVATE_KEY`: el contenido completo de `private_key.pem`.
+   - `VAPID_SUBJECT`: un `mailto:correo@dominio.com` o una URL propia.
+
+3. No subir los archivos PEM al repositorio. Estan ignorados por `.gitignore`.
+4. Desplegar, abrir la PWA en Android y tocar **Activar avisos**.
+
+Para que Supabase despierte Render y envie los avisos todos los dias a las 08:00 de Argentina, habilitar `pg_cron` y `pg_net` y programar una llamada. Reemplazar URL y token:
+
+```sql
+select cron.schedule(
+  'capataz-recordatorios-diarios',
+  '0 11 * * *',
+  $$
+  select net.http_post(
+    url := 'https://TU_APP_RENDER.onrender.com/api/capataz/reminders/dispatch',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'X-Field-App-Token', 'EL_MISMO_FIELD_APP_TOKEN_DE_RENDER'
+    ),
+    body := '{}'::jsonb
+  );
+  $$
+);
+```
+
+`11:00 UTC` equivale a `08:00` de Argentina. El endpoint solo notifica si existen tareas vencidas, tareas para hoy o decisiones pendientes.
 
 ## Supabase Storage para archivos persistentes
 
@@ -193,6 +250,8 @@ create table if not exists public.field_reports (
   informe_markdown text,
   docx_storage_path text,
   docx_public_url text,
+  pdf_storage_path text,
+  pdf_public_url text,
   error text,
   progress_message text,
   started_at timestamptz,
@@ -210,6 +269,8 @@ add column if not exists resumen text,
 add column if not exists informe_markdown text,
 add column if not exists docx_storage_path text,
 add column if not exists docx_public_url text,
+add column if not exists pdf_storage_path text,
+add column if not exists pdf_public_url text,
 add column if not exists error text,
 add column if not exists progress_message text,
 add column if not exists started_at timestamptz,
@@ -258,7 +319,7 @@ Endpoints:
 - `GET /api/field-sessions/{session_id}/report`
 - `GET /api/health/campo`
 
-Las fotos no se interpretan con IA. Solo se insertan en el DOCX como evidencia junto con fecha, campo, sector, GPS, precision, archivo y link publico si existe.
+Las fotos no se interpretan con IA. Se insertan en el PDF y el DOCX como evidencia junto con fecha, campo, sector, GPS, precision, archivo y link publico si existe. El informe incorpora una seccion economica, pero deja explicitamente pendientes los precios, cantidades u horizontes no registrados.
 
 Para generar informes se necesita `OPENAI_API_KEY`. Opcionalmente se puede configurar `FIELD_REPORT_MODEL`; si no esta definido, usa `gpt-4o-mini`.
 

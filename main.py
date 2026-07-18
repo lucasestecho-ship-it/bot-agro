@@ -3,16 +3,18 @@ import json
 import logging
 import tempfile
 import base64
+import html
 import mimetypes
 import shutil
 import uuid
 import re
 import unicodedata
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 import requests
-from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
@@ -27,10 +29,21 @@ from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import Image as PdfImage
+from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 try:
     from PIL import Image
 except ImportError:
     Image = None
+
+from agent_crew import AgentCrew
+from capataz import CapatazStore, PersistentStorageError, analyze_intake, normalize_key
+from push_notifications import PushNotifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,12 +55,23 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET")
+FIELD_APP_TOKEN = str(os.environ.get("FIELD_APP_TOKEN") or "").strip()
+PRIVATE_API_REQUIRES_TOKEN = bool(
+    os.environ.get("RENDER") or SUPABASE_SERVICE_ROLE_KEY or OPENAI_API_KEY
+)
 MY_CHAT_ID = int(os.environ.get("MY_CHAT_ID", "1144480769"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/campo_bot")).resolve()
 FIELD_ITEMS_DIR = DATA_DIR / "field_items"
 FIELD_SESSIONS_DIR = DATA_DIR / "field_sessions"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LEGACY_SESSION_PREFIX = "legacy:"
+SAFE_RECORD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+capataz_store = CapatazStore(
+    supabase_url=SUPABASE_URL,
+    service_role_key=SUPABASE_SERVICE_ROLE_KEY,
+    data_dir=DATA_DIR,
+)
 
 FIELD_ITEMS_COLUMNS = [
     "id", "tipo", "campo", "sector", "fecha_hora", "latitud", "longitud",
@@ -63,7 +87,8 @@ FIELD_SESSIONS_COLUMNS = [
 ]
 FIELD_REPORTS_COLUMNS = [
     "id", "session_id", "estado", "titulo", "resumen", "informe_markdown",
-    "docx_storage_path", "docx_public_url", "error", "progress_message",
+    "docx_storage_path", "docx_public_url", "pdf_storage_path", "pdf_public_url",
+    "error", "progress_message",
     "started_at", "finished_at", "created_at", "updated_at",
 ]
 MAX_REPORT_PHOTOS = 8
@@ -71,9 +96,13 @@ LIGHT_REPORT_ITEM_LIMIT = 30
 PHOTO_PROMPT_LIMIT = 12
 MAX_SOURCE_PHOTO_BYTES = 12 * 1024 * 1024
 REPORT_DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+REPORT_PDF_CONTENT_TYPE = "application/pdf"
+MAX_AUDIO_UPLOAD_BYTES = 30 * 1024 * 1024
+MAX_PHOTO_UPLOAD_BYTES = 20 * 1024 * 1024
 REPORT_SECTION_TITLES = [
     "Diagnostico de situacion",
     "Observaciones principales",
+    "Analisis economico para la decision",
     "Recomendaciones",
 ]
 NOISE_TRANSCRIPTS = {
@@ -88,6 +117,8 @@ NOISE_TRANSCRIPTS = {
 }
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+agent_crew = AgentCrew(capataz_store, openai_client=openai_client)
+push_notifier = PushNotifier(capataz_store)
 
 def get_openai_client():
     if not openai_client:
@@ -395,8 +426,20 @@ def supabase_headers(prefer=None):
 def clean_db_value(value):
     return value if value not in ("", None) else None
 
+def validate_record_id(value, label="id"):
+    cleaned = str(value or "").strip()
+    if label == "session_id" and len(cleaned) <= 512 and is_legacy_session_id(cleaned):
+        return cleaned
+    if not SAFE_RECORD_ID_RE.fullmatch(cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{label} invalido",
+        )
+    return cleaned
+
 def local_session_path(session_id):
-    return FIELD_SESSIONS_DIR / f"{session_id}.json"
+    safe_id = validate_record_id(session_id, "session_id")
+    return FIELD_SESSIONS_DIR / f"{safe_id}.json"
 
 def save_local_session(session):
     FIELD_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -410,6 +453,7 @@ def normalize_field_session(data):
     session_id = (data.get("id") or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="id es obligatorio")
+    session_id = validate_record_id(session_id, "id")
 
     return {
         "id": session_id,
@@ -495,17 +539,61 @@ def upsert_field_item_metadata(metadata):
         "transcript_at": clean_db_value(item.get("transcript_at")),
         "created_at": clean_db_value(metadata.get("received_at")),
     }
+    optional_ai_columns = {
+        "photo_label", "audio_label", "transcript_status", "transcript_text",
+        "transcript_error", "transcript_model", "transcript_at",
+    }
+    optional_storage_columns = {
+        "storage_status", "storage_provider", "storage_path",
+        "storage_public_url", "storage_error",
+    }
+    payload_options = [
+        payload,
+        {key: value for key, value in payload.items() if key not in optional_ai_columns},
+        {
+            key: value for key, value in payload.items()
+            if key not in optional_ai_columns | optional_storage_columns
+        },
+    ]
     url = f"{SUPABASE_URL}/rest/v1/field_items?on_conflict=id"
     logger.info("Guardando metadata en Supabase")
-    response = requests.post(
-        url,
-        headers=supabase_headers("resolution=merge-duplicates,return=minimal"),
-        json=payload,
+    last_error = ""
+    for index, candidate in enumerate(payload_options):
+        response = requests.post(
+            url,
+            headers=supabase_headers("resolution=merge-duplicates,return=minimal"),
+            json=candidate,
+            timeout=30,
+        )
+        if response.ok:
+            if index:
+                logger.warning(
+                    "Metadata guardada con columnas compatibles; falta aplicar la migracion completa de Supabase"
+                )
+            logger.info(f"Metadata OK: {item['id']} session_id={item.get('session_id')}")
+            return True
+        last_error = response.text
+    raise RuntimeError(last_error)
+
+def verify_field_item_session_assignment(item_id, session_id):
+    if not supabase_database_configured():
+        return True
+    response = requests.get(
+        f"{SUPABASE_URL}/rest/v1/field_items",
+        headers=supabase_headers(),
+        params={"id": f"eq.{item_id}", "select": "id,session_id", "limit": 1},
         timeout=30,
     )
     if not response.ok:
-        raise RuntimeError(response.text)
-    logger.info(f"Metadata OK: {item['id']}")
+        raise RuntimeError(f"No se pudo verificar session_id en Supabase: {response.text}")
+    rows = response.json()
+    if not rows:
+        raise RuntimeError("Supabase no devolvio el item recien guardado")
+    assigned = str(rows[0].get("session_id") or "")
+    if assigned != str(session_id or ""):
+        raise RuntimeError(
+            f"Supabase guardo session_id={assigned or 'vacio'} y se esperaba {session_id}"
+        )
     return True
 
 def list_field_items_from_supabase():
@@ -1043,6 +1131,7 @@ def build_basic_report_markdown(session, audios, photos, items, audios_con_error
         "## Resumen ejecutivo\nInforme elaborado con la informacion relevada durante la recorrida. No se agregan conclusiones fuera de los datos disponibles.",
         "## Diagnostico de situacion\nNo registrado en la recorrida.",
         "## Observaciones principales\nLa recorrida cuenta con evidencias documentales, coordenadas y registros de campo asociados.",
+        "## Analisis economico para la decision\nNo se registraron costos ni beneficios cuantificables. Completar precios, cantidades y horizonte antes de decidir una inversion.",
         "## Recomendaciones\nRevisar las evidencias disponibles y completar observaciones manuales si corresponde.",
     ])
 
@@ -1057,6 +1146,7 @@ Redacta un informe profesional, limpio y corto para cliente.
 No inventes datos. Si falta informacion, escribir "No registrado en la recorrida".
 No interpretes fotos ni describas su contenido visual; las fotos son solo evidencia documental.
 Las recomendaciones deben basarse solo en las notas de voz transcriptas y la metadata de campo.
+Integra la dimension economica a la decision: alternativas, costos y beneficios a cuantificar, horizonte y riesgos. No inventes precios ni montos.
 No copies textualmente las transcripciones.
 No muestres IDs de audios, nombres de audios, errores de audios ni frases irrelevantes.
 No escribas secciones llamadas Audios transcriptos, Audios no transcriptos, Anexo tecnico o Informe Tecnico de Consultoria Agronomica.
@@ -1066,7 +1156,8 @@ Estructura requerida:
 1. Resumen ejecutivo
 2. Diagnostico de situacion
 3. Observaciones principales
-4. Recomendaciones
+4. Analisis economico para la decision
+5. Recomendaciones
 
 Recorrida:
 {json.dumps(session, ensure_ascii=False, indent=2)}
@@ -1485,6 +1576,159 @@ def create_report_docx(session, items, audios, photos, markdown_text, output_pat
     document.save(output_path)
     return output_path
 
+def create_report_pdf(session, items, audios, photos, markdown_text, output_path, work_dir):
+    """Crea el PDF entregable sin depender de LibreOffice en Render."""
+    logger.info("Creando PDF")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    styles = getSampleStyleSheet()
+    dark = colors.HexColor(f"#{BRAND_DARK}")
+    beige = colors.HexColor(f"#{BRAND_BEIGE}")
+    brown = colors.HexColor(f"#{BRAND_BROWN}")
+    styles.add(ParagraphStyle(
+        name="CapatazTitle",
+        parent=styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=20,
+        leading=24,
+        textColor=dark,
+        alignment=TA_CENTER,
+        spaceAfter=18,
+    ))
+    styles.add(ParagraphStyle(
+        name="CapatazHeading",
+        parent=styles["Heading1"],
+        fontName="Helvetica-Bold",
+        fontSize=14,
+        leading=17,
+        textColor=dark,
+        spaceBefore=12,
+        spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="CapatazBody",
+        parent=styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=10,
+        leading=14,
+        textColor=colors.HexColor(f"#{BRAND_TEXT}"),
+        spaceAfter=6,
+    ))
+    styles.add(ParagraphStyle(
+        name="CapatazCaption",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Oblique",
+        fontSize=8,
+        leading=10,
+        textColor=brown,
+        alignment=TA_CENTER,
+        spaceAfter=10,
+    ))
+    styles.add(ParagraphStyle(
+        name="CapatazSignature",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Bold",
+        fontSize=10,
+        leading=13,
+        textColor=dark,
+        alignment=TA_RIGHT,
+        spaceBefore=18,
+    ))
+
+    doc = SimpleDocTemplate(
+        str(output_path),
+        pagesize=A4,
+        rightMargin=1.7 * cm,
+        leftMargin=1.7 * cm,
+        topMargin=1.7 * cm,
+        bottomMargin=1.7 * cm,
+        title=f"Informe de recorrida - {session.get('campo') or 'Campo'}",
+        author="Ing. Agr. Lucas Estecho",
+    )
+    story = []
+    title = f"Informe de recorrida<br/>{html.escape(str(session.get('campo') or 'Campo'))}"
+    story.append(Paragraph(title, styles["CapatazTitle"]))
+    details = [
+        ["Campo", session.get("campo") or "No registrado"],
+        ["Sector", session.get("sector") or "No registrado"],
+        ["Recorrida", session.get("nombre") or "No registrado"],
+        ["Inicio", session.get("started_at") or "No registrado"],
+        ["Cierre", session.get("closed_at") or "No registrado"],
+        ["Evidencias", f"{len(audios)} audio(s) y {len(photos)} foto(s)"],
+    ]
+    details_table = Table(
+        [[Paragraph(f"<b>{html.escape(str(label))}</b>", styles["CapatazBody"]),
+          Paragraph(html.escape(str(value)), styles["CapatazBody"])] for label, value in details],
+        colWidths=[4 * cm, 12 * cm],
+    )
+    details_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), beige),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D6C7A8")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D6C7A8")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.extend([details_table, Spacer(1, 12)])
+
+    for section_title in ["Resumen ejecutivo", *REPORT_SECTION_TITLES]:
+        story.append(Paragraph(html.escape(section_title), styles["CapatazHeading"]))
+        section_text = extract_markdown_section(markdown_text, section_title)
+        paragraphs = [line.strip() for line in section_text.splitlines() if line.strip()]
+        if not paragraphs:
+            paragraphs = ["No registrado en la recorrida"]
+        for paragraph in paragraphs:
+            story.append(Paragraph(html.escape(clean_inline_markdown(paragraph)), styles["CapatazBody"]))
+
+    story.append(Paragraph("Evidencias fotograficas", styles["CapatazHeading"]))
+    story.append(Paragraph(
+        "Las fotografias se incorporan como evidencia documental y no fueron interpretadas automaticamente por IA.",
+        styles["CapatazBody"],
+    ))
+    temporary_photos = []
+    for index, photo in enumerate(photos[:MAX_REPORT_PHOTOS], start=1):
+        try:
+            downloaded = download_field_item_file(photo, work_dir, ".jpg")
+            prepared = prepare_photo_for_docx(downloaded, work_dir, index)
+            temporary_photos.extend([downloaded, prepared])
+            image = PdfImage(str(prepared))
+            max_width = 15.5 * cm
+            max_height = 16 * cm
+            scale = min(max_width / image.drawWidth, max_height / image.drawHeight, 1)
+            image.drawWidth *= scale
+            image.drawHeight *= scale
+            label = photo.get("photo_label") or f"Foto {index}"
+            caption = (
+                f"{label} | {photo.get('fecha_hora') or 'sin fecha'} | "
+                f"Sector: {photo.get('sector') or 'sin sector'} | "
+                f"GPS: {photo.get('latitud') or '-'}, {photo.get('longitud') or '-'}"
+            )
+            story.append(KeepTogether([
+                Paragraph(html.escape(str(label)), styles["CapatazHeading"]),
+                image,
+                Paragraph(html.escape(caption), styles["CapatazCaption"]),
+            ]))
+        except Exception as exc:
+            logger.error(f"Foto omitida en PDF: {photo.get('id')}: {exc}")
+
+    story.append(Paragraph(
+        "Nota metodologica: informe elaborado a partir de audios, fotos, coordenadas y datos registrados durante la recorrida.",
+        styles["CapatazBody"],
+    ))
+    story.append(Paragraph(
+        "Elaborado por Ing. Agr. Lucas Estecho<br/>Asesor Ganadero",
+        styles["CapatazSignature"],
+    ))
+    doc.build(story)
+    for path in temporary_photos:
+        try:
+            if path:
+                Path(path).unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning(f"No se pudo borrar temporal de PDF: {exc}")
+    return output_path
+
 def parse_iso_datetime(value):
     if not value:
         return None
@@ -1541,6 +1785,7 @@ def generate_field_report(session_id, force=False):
     work_dir = DATA_DIR / "field_reports" / safe_storage_segment(session_id, "session") / report_id
     work_dir.mkdir(parents=True, exist_ok=True)
     docx_path = None
+    pdf_path = None
     upload_started = False
 
     try:
@@ -1575,30 +1820,44 @@ def generate_field_report(session_id, force=False):
         report_date = (session.get("started_at") or now)[:10]
         campo_filename = clean_report_filename_segment(session.get("campo"), "Sin_Campo")
         docx_name = f"Informe_{campo_filename}_{report_date}.docx"
+        pdf_name = f"Informe_{campo_filename}_{report_date}.pdf"
         docx_path = work_dir / docx_name
+        pdf_path = work_dir / pdf_name
         update_report_progress(report_id, "Creando DOCX")
         try:
             create_report_docx(session, items, audios, photos, markdown_text, docx_path, work_dir)
         except MemoryError:
             raise RuntimeError("Memoria insuficiente generando DOCX; informe demasiado pesado")
+        update_report_progress(report_id, "Creando PDF")
+        try:
+            create_report_pdf(session, items, audios, photos, markdown_text, pdf_path, work_dir)
+        except MemoryError:
+            raise RuntimeError("Memoria insuficiente generando PDF; informe demasiado pesado")
 
         campo_segment = safe_storage_segment(session.get("campo"), "sin-campo")
         session_segment = safe_storage_segment(session_id, "session")
-        storage_path = f"reports/{campo_segment}/{session_segment}/{docx_name}"
-        logger.info(f"Subiendo DOCX a Supabase: {storage_path}")
-        update_report_progress(report_id, "Subiendo DOCX")
+        docx_storage_path = f"reports/{campo_segment}/{session_segment}/{docx_name}"
+        pdf_storage_path = f"reports/{campo_segment}/{session_segment}/{pdf_name}"
+        logger.info(f"Subiendo informe a Supabase: {docx_storage_path} y {pdf_storage_path}")
+        update_report_progress(report_id, "Subiendo DOCX y PDF")
         upload_started = True
         try:
-            supabase_file = upload_field_file_to_supabase(
+            docx_file = upload_field_file_to_supabase(
                 docx_path,
-                storage_path,
+                docx_storage_path,
                 content_type=REPORT_DOCX_CONTENT_TYPE,
                 upsert=True,
             )
+            pdf_file = upload_field_file_to_supabase(
+                pdf_path,
+                pdf_storage_path,
+                content_type=REPORT_PDF_CONTENT_TYPE,
+                upsert=True,
+            )
         except Exception as e:
-            logger.error(f"DOCX creado, falló subida a Supabase. docx_path={docx_path}")
-            update_report_progress(report_id, "DOCX creado, falló subida a Supabase", estado="error")
-            raise RuntimeError(f"{e} | docx_path={docx_path}")
+            logger.error(f"Informe creado, falló subida a Supabase. docx={docx_path} pdf={pdf_path}")
+            update_report_progress(report_id, "Informe creado, falló subida a Supabase", estado="error")
+            raise RuntimeError(f"{e} | docx_path={docx_path} | pdf_path={pdf_path}")
         report = {
             "id": report_id,
             "session_id": session_id,
@@ -1606,8 +1865,10 @@ def generate_field_report(session_id, force=False):
             "titulo": title,
             "resumen": summary,
             "informe_markdown": markdown_text,
-            "docx_storage_path": supabase_file.get("path", ""),
-            "docx_public_url": supabase_file.get("public_url", ""),
+            "docx_storage_path": docx_file.get("path", ""),
+            "docx_public_url": docx_file.get("public_url", ""),
+            "pdf_storage_path": pdf_file.get("path", ""),
+            "pdf_public_url": pdf_file.get("public_url", ""),
             "error": None,
             "created_at": now,
             "progress_message": "Informe listo",
@@ -1618,12 +1879,14 @@ def generate_field_report(session_id, force=False):
         logger.info(f"Informe OK: {report_id}")
         return report
     except Exception as e:
-        progress_message = "DOCX creado, falló subida a Supabase" if upload_started and docx_path else "Error al generar informe"
+        progress_message = "Informe creado, falló subida a Supabase" if upload_started and docx_path else "Error al generar informe"
         error_message = str(e) or "Error desconocido generando informe"
         if isinstance(e, MemoryError):
             error_message = "Memoria insuficiente generando DOCX; informe demasiado pesado"
         if docx_path and docx_path.exists():
             logger.error(f"Copia local temporal del DOCX: {docx_path}")
+        if pdf_path and pdf_path.exists():
+            logger.error(f"Copia local temporal del PDF: {pdf_path}")
         error_report = {
             "id": report_id,
             "session_id": session_id,
@@ -2720,14 +2983,51 @@ def main():
 
 def safe_field_extension(upload: UploadFile, item_type: str) -> str:
     extension = Path(upload.filename or "").suffix.lower()
-    if extension:
-        return extension[:12]
+    allowed = {
+        "foto": {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"},
+        "audio": {".webm", ".m4a", ".mp3", ".wav", ".ogg", ".mp4", ".aac"},
+    }.get(item_type, set())
+    if extension in allowed:
+        return extension
 
     guessed = mimetypes.guess_extension(upload.content_type or "")
-    if guessed:
+    if guessed in allowed:
         return guessed
 
     return ".webm" if item_type == "audio" else ".jpg"
+
+def validate_field_upload(upload: UploadFile, item_type: str):
+    content_type = str(upload.content_type or "").lower()
+    extension = Path(upload.filename or "").suffix.lower()
+    if item_type == "foto":
+        allowed_extensions = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+        if not content_type.startswith("image/") and extension not in allowed_extensions:
+            raise HTTPException(status_code=415, detail="El archivo no parece ser una foto valida")
+        return MAX_PHOTO_UPLOAD_BYTES
+    allowed_extensions = {".webm", ".m4a", ".mp3", ".wav", ".ogg", ".mp4", ".aac"}
+    if not content_type.startswith("audio/") and extension not in allowed_extensions:
+        raise HTTPException(status_code=415, detail="El archivo no parece ser un audio valido")
+    return MAX_AUDIO_UPLOAD_BYTES
+
+def save_upload_with_limit(upload: UploadFile, destination: Path, max_bytes: int):
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while True:
+                chunk = upload.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Archivo demasiado grande; limite {max_bytes // (1024 * 1024)} MB",
+                    )
+                output.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    return total
 
 @asynccontextmanager
 async def fastapi_lifespan(app: FastAPI):
@@ -2752,8 +3052,31 @@ async def fastapi_lifespan(app: FastAPI):
             await telegram_app.stop()
             await telegram_app.shutdown()
 
-fastapi_app = FastAPI(title="Bot Agro Campo", lifespan=fastapi_lifespan)
+fastapi_app = FastAPI(title="Capataz Campo", lifespan=fastapi_lifespan)
 fastapi_app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+@fastapi_app.middleware("http")
+async def protect_private_api(request: Request, call_next):
+    is_private_api = (
+        request.url.path.startswith("/api/")
+        and request.url.path != "/api/health/campo"
+    )
+    if is_private_api and PRIVATE_API_REQUIRES_TOKEN and not FIELD_APP_TOKEN:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "detail": "FIELD_APP_TOKEN no configurado en el servidor"},
+        )
+    if is_private_api and FIELD_APP_TOKEN:
+        supplied = request.headers.get("X-Field-App-Token", "")
+        authorization = request.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+        if not supplied or not secrets.compare_digest(supplied, FIELD_APP_TOKEN):
+            return JSONResponse(
+                status_code=401,
+                content={"ok": False, "detail": "Token de Capataz Campo requerido"},
+            )
+    return await call_next(request)
 
 @fastapi_app.get("/")
 async def root():
@@ -2782,7 +3105,202 @@ async def health_campo():
         },
         "storage": check_supabase_storage_health(),
         "tables": tables,
+        "capataz_tables": capataz_store.schema_health(),
+        "push": push_notifier.status(),
     }
+
+@fastapi_app.post("/share-target")
+async def share_target(
+    title: str = Form(""),
+    text: str = Form(""),
+    url: str = Form(""),
+):
+    """Recibe texto compartido desde Android y lo entrega a la PWA para confirmar."""
+    shared_text = "\n".join(part.strip() for part in (title, text, url) if part and part.strip())
+    encoded = base64.b64encode(shared_text.encode("utf-8")).decode("ascii")
+    return HTMLResponse(
+        "<!doctype html><html lang='es'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Capataz Campo</title><body><p>Abriendo Capataz Campo...</p>"
+        "<script>"
+        f"const bytes=Uint8Array.from(atob('{encoded}'),c=>c.charCodeAt(0));"
+        "localStorage.setItem('capataz.sharedText',new TextDecoder().decode(bytes));"
+        "location.replace('/campo?shared=1');"
+        "</script></body></html>"
+    )
+
+@fastapi_app.post("/api/capataz/analyze")
+async def analyze_capataz_intake(payload: dict = Body(...)):
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text es obligatorio")
+    draft = analyze_intake(
+        text,
+        field_name=str(payload.get("field_name") or payload.get("campo") or "").strip(),
+        source=str(payload.get("source") or "app").strip(),
+        openai_client=openai_client,
+    )
+    return {"ok": True, "draft": draft}
+
+@fastapi_app.post("/api/capataz/confirm")
+async def confirm_capataz_intake(background_tasks: BackgroundTasks, payload: dict = Body(...)):
+    draft = payload.get("draft") or {}
+    if not isinstance(draft, dict):
+        raise HTTPException(status_code=400, detail="draft invalido")
+    source_text = str(payload.get("source_text") or "")
+    try:
+        result = capataz_store.confirm_intake(draft, source_text=source_text)
+    except PersistentStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    try:
+        plan = agent_crew.queue_event(result["event"], draft, source_text=source_text)
+    except PersistentStorageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "La entrada quedo guardada, pero la cuadrilla no pudo iniciar. "
+                "El borrador se conserva para reintentar."
+            ),
+        ) from exc
+    queued = plan.get("storage") in {"supabase", "local"} and not (
+        capataz_store.supabase_configured and plan.get("storage") != "supabase"
+    )
+    if capataz_store.supabase_configured and not queued:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "La entrada quedo guardada, pero la cuadrilla no pudo iniciar. "
+                "El borrador se conserva para reintentar."
+            ),
+        )
+    if queued:
+        background_tasks.add_task(
+            agent_crew.process_event,
+            result["event"],
+            draft,
+            source_text,
+        )
+    return {"ok": True, **result, "crew_plan": plan, "crew_queued": queued}
+
+@fastapi_app.get("/api/capataz/dashboard")
+async def get_capataz_dashboard():
+    dashboard = capataz_store.dashboard()
+    if capataz_store.supabase_configured and dashboard.get("warnings"):
+        raise HTTPException(status_code=503, detail="No se pudo leer el seguimiento desde Supabase")
+    return {"ok": True, **dashboard}
+
+@fastapi_app.get("/api/capataz/crew")
+async def get_capataz_crew():
+    return {"ok": True, "agents": agent_crew.registry()}
+
+@fastapi_app.get("/api/capataz/daily-review")
+async def get_capataz_daily_review():
+    return {"ok": True, **agent_crew.daily_review()}
+
+@fastapi_app.get("/api/capataz/push/public-key")
+async def get_capataz_push_public_key():
+    if not push_notifier.configured:
+        raise HTTPException(status_code=503, detail="Notificaciones push no configuradas")
+    return {"ok": True, "public_key": push_notifier.public_key}
+
+@fastapi_app.post("/api/capataz/push/subscribe")
+async def subscribe_capataz_push(payload: dict = Body(...)):
+    try:
+        subscription = push_notifier.subscribe(payload.get("subscription") or payload)
+        return {"ok": True, "subscription_id": subscription["id"]}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PersistentStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+@fastapi_app.post("/api/capataz/reminders/dispatch")
+async def dispatch_capataz_reminders():
+    try:
+        return {"ok": True, **push_notifier.dispatch_due()}
+    except (PersistentStorageError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+@fastapi_app.get("/api/capataz/events/{event_id}/runs")
+async def get_capataz_event_runs(event_id: str):
+    event_id = validate_record_id(event_id, "event_id")
+    runs, source, warning = capataz_store.list_rows("agent_runs", order="created_at.desc")
+    return {
+        "ok": True,
+        "runs": [run for run in runs if run.get("event_id") == event_id],
+        "source": source,
+        "warning": warning,
+    }
+
+@fastapi_app.post("/api/capataz/events/{event_id}/dispatch")
+async def dispatch_capataz_event(event_id: str):
+    event_id = validate_record_id(event_id, "event_id")
+    events, source, warning = capataz_store.list_rows("client_events", order="created_at.desc")
+    event = next((row for row in events if row.get("id") == event_id), None)
+    if not event:
+        raise HTTPException(status_code=404, detail="evento no encontrado")
+    if capataz_store.supabase_configured and source != "supabase":
+        raise HTTPException(status_code=503, detail=warning or "evento no disponible en Supabase")
+    draft = {
+        "draft_id": event_id.removeprefix("event-"),
+        "client_name": event.get("client_name") or "",
+        "summary": event.get("summary") or "",
+        "event_type": event.get("event_type") or "nota",
+        "agents": event.get("agents") or ["Cartera"],
+        "economic_review": bool(event.get("economic_review")),
+        "water_project": bool(event.get("water_project")),
+        "field_name": event.get("field_name") or "",
+        "source": event.get("source") or "app",
+        "tasks": [],
+    }
+    try:
+        result = agent_crew.process_event(event, draft, source_text=event.get("source_text") or "")
+        return {"ok": True, **result}
+    except PersistentStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+@fastapi_app.post("/api/capataz/decisions/{decision_id}/approve")
+async def approve_capataz_decision(decision_id: str):
+    decision_id = validate_record_id(decision_id, "decision_id")
+    try:
+        result = agent_crew.approve_decision(decision_id)
+        return {"ok": True, **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PersistentStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+@fastapi_app.post("/api/capataz/decisions/{decision_id}/reject")
+async def reject_capataz_decision(decision_id: str):
+    decision_id = validate_record_id(decision_id, "decision_id")
+    try:
+        decision = capataz_store.update_row(
+            "decisions",
+            decision_id,
+            {"status": "rejected", "updated_at": datetime.utcnow().isoformat() + "Z"},
+        )
+        return {"ok": True, "decision": decision}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+@fastapi_app.patch("/api/capataz/tasks/{task_id}")
+async def update_capataz_task(task_id: str, payload: dict = Body(...)):
+    task_id = validate_record_id(task_id, "task_id")
+    try:
+        task = capataz_store.update_task(task_id, payload)
+        return {"ok": True, "task": task}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+@fastapi_app.patch("/api/capataz/clients/{client_id}")
+async def update_capataz_client(client_id: str, payload: dict = Body(...)):
+    client_id = validate_record_id(client_id, "client_id")
+    try:
+        client = capataz_store.update_client(client_id, payload)
+        return {"ok": True, "client": client}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PersistentStorageError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 @fastapi_app.post("/api/field-sessions")
 async def create_field_session(payload: dict = Body(...)):
@@ -2797,10 +3315,14 @@ async def create_field_session(payload: dict = Body(...)):
         supabase_error = str(e)
         logger.error(f"Recorrida ERROR: {e}")
 
+    if supabase_database_configured() and supabase_error:
+        raise HTTPException(status_code=503, detail=f"Supabase no guardo la recorrida: {supabase_error}")
+
     return {"ok": True, "id": session["id"], "supabase_error": supabase_error}
 
 @fastapi_app.post("/api/field-sessions/{session_id}/close")
 async def close_field_session(session_id: str, payload: dict = Body(default={})):
+    session_id = validate_record_id(session_id, "session_id")
     closed_at = clean_db_value(payload.get("closed_at")) or datetime.utcnow().isoformat() + "Z"
     logger.info(f"Cerrando recorrida: {session_id}")
     session = load_local_session(session_id) or {
@@ -2827,6 +3349,9 @@ async def close_field_session(session_id: str, payload: dict = Body(default={}))
         supabase_error = str(e)
         logger.error(f"Recorrida ERROR: {e}")
 
+    if supabase_database_configured() and supabase_error:
+        raise HTTPException(status_code=503, detail=f"Supabase no cerro la recorrida: {supabase_error}")
+
     return {"ok": True, "id": session_id, "supabase_error": supabase_error}
 
 @fastapi_app.get("/api/field-sessions")
@@ -2840,6 +3365,9 @@ async def list_field_sessions():
         supabase_error = str(e)
         logger.error(f"Recorrida ERROR: {e}")
 
+    if supabase_database_configured() and supabase_error:
+        raise HTTPException(status_code=503, detail="No se pudieron leer las recorridas desde Supabase")
+
     sessions = load_local_sessions()
     item_counts = count_items_by_session(load_local_field_items())
     for session in sessions:
@@ -2848,18 +3376,34 @@ async def list_field_sessions():
     return {"ok": True, "sessions": sessions, "source": "local", "supabase_error": supabase_error}
 
 @fastapi_app.post("/api/field-sessions/{session_id}/generate-report")
-async def generate_field_session_report(session_id: str, force: bool = Query(False)):
+async def generate_field_session_report(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    force: bool = Query(False),
+):
+    session_id = validate_record_id(session_id, "session_id")
+    if not supabase_database_configured():
+        raise HTTPException(status_code=503, detail="Supabase Database no configurado")
     try:
-        report = generate_field_report(session_id, force=force)
-        return {"ok": True, "report": report}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Informe ERROR: {e}")
-        return {"ok": False, "error": str(e)}
+        session, _items = get_items_for_session_from_supabase(session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="No se pudo leer la recorrida desde Supabase") from exc
+    if not session:
+        raise HTTPException(status_code=404, detail="recorrida no encontrada")
+    background_tasks.add_task(generate_field_report, session_id, force)
+    return {
+        "ok": True,
+        "queued": True,
+        "report": {
+            "session_id": session_id,
+            "estado": "generando",
+            "progress_message": "Informe en cola",
+        },
+    }
 
 @fastapi_app.get("/api/field-sessions/{session_id}/report")
 async def get_field_session_report(session_id: str):
+    session_id = validate_record_id(session_id, "session_id")
     session = None
     supabase_error = ""
     try:
@@ -2870,6 +3414,7 @@ async def get_field_session_report(session_id: str):
             "session": session,
             "report": report,
             "docx_public_url": report.get("docx_public_url") if report else "",
+            "pdf_public_url": report.get("pdf_public_url") if report else "",
             "informe_markdown": report.get("informe_markdown") if report else "",
             "estado": report.get("estado") if report else "sin informe",
             "progress_message": report.get("progress_message") if report else "",
@@ -2886,6 +3431,7 @@ async def get_field_session_report(session_id: str):
         "session": session,
         "report": None,
         "docx_public_url": "",
+        "pdf_public_url": "",
         "informe_markdown": "",
         "estado": "sin informe",
         "progress_message": "",
@@ -2896,6 +3442,7 @@ async def get_field_session_report(session_id: str):
 
 @fastapi_app.get("/api/field-sessions/{session_id}")
 async def get_field_session(session_id: str):
+    session_id = validate_record_id(session_id, "session_id")
     supabase_error = ""
     try:
         session, items = get_items_for_session_from_supabase(session_id)
@@ -2933,7 +3480,67 @@ async def list_field_items():
         supabase_error = str(e)
         logger.error(f"Metadata ERROR: {e}")
 
+    if supabase_database_configured() and supabase_error:
+        raise HTTPException(status_code=503, detail="No se pudieron leer los items desde Supabase")
+
     return {"ok": True, "items": load_local_field_items(), "source": "local", "supabase_error": supabase_error}
+
+@fastapi_app.post("/api/field-items/{item_id}/assign-session")
+async def assign_field_item_session(item_id: str, payload: dict = Body(...)):
+    item_id = validate_record_id(item_id, "item_id")
+    session_id = str(payload.get("session_id") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id es obligatorio")
+    session_id = validate_record_id(session_id, "session_id")
+
+    linked_session = None
+    if supabase_database_configured():
+        try:
+            linked_session = get_field_session_from_supabase(session_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"No se pudo validar la recorrida: {e}") from e
+    else:
+        linked_session = load_local_session(session_id)
+    if not linked_session:
+        raise HTTPException(status_code=404, detail="recorrida no encontrada")
+
+    local_updated = False
+    if FIELD_ITEMS_DIR.exists():
+        for metadata_path in FIELD_ITEMS_DIR.rglob("*.json"):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if str(metadata.get("id") or "") != item_id:
+                continue
+            metadata["session_id"] = session_id
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            local_updated = True
+            break
+
+    if supabase_database_configured():
+        response = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/field_items",
+            headers=supabase_headers("return=minimal"),
+            params={"id": f"eq.{item_id}"},
+            json={"session_id": session_id},
+            timeout=30,
+        )
+        if not response.ok:
+            raise HTTPException(status_code=500, detail=response.text)
+        try:
+            verify_field_item_session_assignment(item_id, session_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+    elif not local_updated:
+        raise HTTPException(status_code=404, detail="item no encontrado")
+
+    return {
+        "ok": True,
+        "item_id": item_id,
+        "assigned_session_id": session_id,
+        "session_name": linked_session.get("nombre") or linked_session.get("campo") or session_id,
+    }
 
 @fastapi_app.post("/api/field-items")
 async def create_field_item(
@@ -2955,19 +3562,50 @@ async def create_field_item(
         raise HTTPException(status_code=400, detail="item_type debe ser audio o foto")
     if not campo.strip():
         raise HTTPException(status_code=400, detail="campo es obligatorio")
+    session_id = validate_record_id(session_id.strip(), "session_id")
+    if not session_id:
+        raise HTTPException(
+            status_code=400,
+            detail="La foto o el audio deben pertenecer a una recorrida activa",
+        )
+
+    linked_session = None
+    if supabase_database_configured():
+        try:
+            linked_session = get_field_session_from_supabase(session_id)
+        except Exception as e:
+            logger.warning(f"No se pudo validar la recorrida {session_id} en Supabase: {e}")
+    else:
+        linked_session = load_local_session(session_id)
+    if linked_session is None:
+        raise HTTPException(
+            status_code=409,
+            detail="La recorrida no existe en el servidor. Sincronizala antes de subir archivos.",
+        )
+    linked_campo = str(linked_session.get("campo") or "").strip()
+    if linked_campo and normalize_key(campo) != normalize_key(linked_campo):
+        logger.warning(
+            f"Campo del item corregido por la recorrida: recibido={campo!r} recorrido={linked_campo!r}"
+        )
+        campo = linked_campo
 
     now = datetime.utcnow()
-    item_id = uuid.uuid4().hex
-    item_dir = FIELD_ITEMS_DIR / now.strftime("%Y-%m-%d")
+    try:
+        captured_datetime = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        captured_datetime = now
+    requested_item_id = re.sub(r"[^A-Za-z0-9_-]", "", client_id.strip())[:80]
+    item_id = requested_item_id or uuid.uuid4().hex
+    item_dir = FIELD_ITEMS_DIR / captured_datetime.strftime("%Y-%m-%d")
     item_dir.mkdir(parents=True, exist_ok=True)
 
     extension = safe_field_extension(file, item_type)
-    stored_filename = f"{now.strftime('%H%M%S')}_{item_id}_{item_type}{extension}"
+    stored_filename = f"{item_id}_{item_type}{extension}"
     file_path = item_dir / stored_filename
 
     logger.info(f"Archivo recibido: {stored_filename}")
-    with file_path.open("wb") as output:
-        shutil.copyfileobj(file.file, output)
+    max_upload_bytes = validate_field_upload(file, item_type)
+    uploaded_bytes = save_upload_with_limit(file, file_path, max_upload_bytes)
 
     metadata = {
         "ok": True,
@@ -2982,27 +3620,28 @@ async def create_field_item(
         "gps_accuracy": gps_accuracy,
         "original_filename": file.filename,
         "content_type": file.content_type,
+        "size_bytes": uploaded_bytes,
         "stored_file": str(file_path),
         "received_at": now.isoformat() + "Z",
         "ai_processed": False,
         "storage_status": "local_only",
         "storage_provider": "local",
-        "session_id": session_id.strip(),
+        "session_id": session_id,
         "photo_label": photo_label.strip(),
         "audio_label": audio_label.strip(),
     }
-    if session_id.strip():
-        logger.info(f"Item asociado a session_id: {session_id.strip()}")
+    logger.info(f"Item asociado a session_id: {session_id}")
 
     if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_BUCKET:
         campo_segment = safe_storage_segment(campo, "sin-campo")
         sector_segment = safe_storage_segment(sector, "sin-sector")
-        storage_path = f"{campo_segment}/{sector_segment}/{now.strftime('%Y-%m-%d')}/{stored_filename}"
+        storage_path = f"{campo_segment}/{sector_segment}/{captured_datetime.strftime('%Y-%m-%d')}/{stored_filename}"
         try:
             supabase_file = upload_field_file_to_supabase(
                 file_path,
                 storage_path,
-                content_type=file.content_type
+                content_type=file.content_type,
+                upsert=True,
             )
             metadata["storage_status"] = "supabase_uploaded"
             metadata["storage_provider"] = "supabase"
@@ -3016,22 +3655,62 @@ async def create_field_item(
             metadata["storage_error"] = str(e)
             logger.error(f"Supabase ERROR: {e}")
 
+    capataz_draft = None
+    capataz_error = ""
+    source_text = audio_label.strip() if item_type == "audio" else photo_label.strip()
+    if item_type == "audio" and openai_client:
+        try:
+            source_text = transcribe_audio(file_path)
+            metadata.update({
+                "ai_processed": True,
+                "transcript_status": "done",
+                "transcript_text": source_text,
+                "transcript_model": "whisper-1",
+                "transcript_at": datetime.utcnow().isoformat() + "Z",
+                "transcript_error": "",
+            })
+        except Exception as e:
+            capataz_error = f"No se pudo transcribir el audio: {e}"
+            metadata.update({
+                "transcript_status": "error",
+                "transcript_error": str(e),
+                "transcript_at": datetime.utcnow().isoformat() + "Z",
+            })
+            logger.error(f"Capataz audio ERROR: {e}")
+
+    if source_text:
+        try:
+            capataz_draft = analyze_intake(
+                source_text,
+                field_name=campo.strip(),
+                source=f"{item_type}_campo",
+                openai_client=openai_client,
+            )
+        except Exception as e:
+            capataz_error = str(e)
+            logger.error(f"Capataz analisis ERROR: {e}")
+
     metadata_path = file_path.with_suffix(file_path.suffix + ".json")
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
     metadata_error = ""
     try:
         upsert_field_item_metadata(metadata)
+        verify_field_item_session_assignment(item_id, session_id)
     except Exception as e:
         metadata_error = str(e)
         logger.error(f"Metadata ERROR: {e}")
 
     return {
-        "ok": True,
+        "ok": not metadata_error and not metadata.get("storage_error"),
         "id": item_id,
         "storage_status": metadata.get("storage_status", ""),
         "storage_error": metadata.get("storage_error", ""),
         "metadata_error": metadata_error,
+        "assigned_session_id": session_id,
+        "transcript_text": metadata.get("transcript_text", ""),
+        "capataz_draft": capataz_draft,
+        "capataz_error": capataz_error,
     }
 
 if __name__ == "__main__":

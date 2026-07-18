@@ -1,9 +1,29 @@
 {
-  "name": "Bot Agro Campo",
-  "short_name": "Campo",
+  "name": "Capataz Campo",
+  "short_name": "Capataz",
+  "description": "Recorridas, clientes, tareas y proyectos de agua del estudio de Lucas Estecho.",
+  "id": "/campo",
   "start_url": "/campo",
+  "scope": "/",
   "display": "standalone",
   "background_color": "#f4f0e8",
-  "theme_color": "#1f7a4f",
-  "icons": []
+  "theme_color": "#1f593f",
+  "icons": [
+    {
+      "src": "/static/logo.png",
+      "sizes": "1200x1200",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ],
+  "share_target": {
+    "action": "/share-target",
+    "method": "POST",
+    "enctype": "application/x-www-form-urlencoded",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url"
+    }
+  }
 }

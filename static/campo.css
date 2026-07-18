@@ -16,7 +16,9 @@ body {
 }
 
 button,
-input {
+input,
+textarea,
+select {
   font: inherit;
 }
 
@@ -32,6 +34,10 @@ input {
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 16px;
+}
+
+.topbar > div {
+  min-width: 0;
 }
 
 .eyebrow {
@@ -87,13 +93,20 @@ label {
   font-weight: 700;
 }
 
-input {
+input,
+textarea,
+select {
   width: 100%;
   border: 1px solid #bac7bc;
   border-radius: 8px;
   padding: 12px;
   background: #fff;
   color: #17231c;
+}
+
+textarea {
+  resize: vertical;
+  line-height: 1.4;
 }
 
 .gps-row,
@@ -124,10 +137,62 @@ button,
   text-decoration: none;
 }
 
+button:disabled,
+.photo-button.disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+  filter: grayscale(0.25);
+}
+
 .secondary-button {
   width: 100%;
   margin-top: 12px;
   background: #6a5842;
+}
+
+.compact-button {
+  width: auto;
+  min-height: 42px;
+  margin-top: 0;
+  padding: 9px 11px;
+  white-space: nowrap;
+}
+
+.primary-wide {
+  width: 100%;
+  margin-top: 10px;
+  background: #1f7a4f;
+}
+
+.section-copy {
+  margin: 5px 0 0;
+  color: #5b6b60;
+  font-size: 0.88rem;
+}
+
+.quick-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.today-panel {
+  border-color: #a9c5b1;
+  background: rgba(248, 255, 249, 0.94);
+}
+
+.intake-panel h2 {
+  margin-bottom: 12px;
+}
+
+.notice {
+  margin: 10px 0 0;
+  border-left: 4px solid #d68a22;
+  padding: 9px 11px;
+  background: #fff3d9;
+  color: #6d4b13;
+  font-size: 0.88rem;
 }
 
 .session-actions {
@@ -211,6 +276,140 @@ button,
   font-size: 0.86rem;
 }
 
+.task-list li {
+  border-left: 5px solid #7e927f;
+}
+
+.task-list li.overdue {
+  border-left-color: #a43b2f;
+  background: #fff8f7;
+}
+
+.task-list li.today {
+  border-left-color: #d68a22;
+  background: #fffdf7;
+}
+
+.task-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 5px;
+}
+
+.task-actions button {
+  min-height: 38px;
+  padding: 8px 11px;
+  background: #476255;
+}
+
+.assign-session-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 7px;
+  padding-top: 9px;
+  border-top: 1px solid #ead4cf;
+}
+
+.assign-session-controls button {
+  padding: 9px 11px;
+  background: #8b4c42;
+}
+
+.agent-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 14px;
+}
+
+.agent-badge {
+  border-radius: 999px;
+  padding: 4px 9px;
+  background: #e0ebe2;
+  color: #24553a;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.agent-badge.economic {
+  background: #f1e6c9;
+  color: #694e12;
+}
+
+.agent-badge.water {
+  background: #dcebf2;
+  color: #285a72;
+}
+
+.water-projects {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #d1ded4;
+}
+
+.decisions-box {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #d1ded4;
+}
+
+.uncovered-clients {
+  margin-top: 16px;
+  color: #4d5d52;
+}
+
+.uncovered-clients > summary {
+  cursor: pointer;
+  font-weight: 800;
+}
+
+.client-frequency-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.client-frequency-controls button {
+  padding: 8px 12px;
+}
+
+.decisions-box h3,
+.agent-details summary {
+  font-weight: 800;
+}
+
+.decision-card {
+  border-left: 5px solid #b97922 !important;
+  background: #fffdf7 !important;
+}
+
+.decision-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.decision-actions .reject-decision {
+  background: #7b5c55;
+}
+
+.agent-details {
+  margin: 8px 0 14px;
+}
+
+.agent-details summary {
+  cursor: pointer;
+  color: #647166;
+  font-size: 0.86rem;
+}
+
+.water-projects h3 {
+  margin: 0;
+  font-size: 0.98rem;
+}
+
 .pill {
   border-radius: 999px;
   padding: 3px 8px;
@@ -263,6 +462,90 @@ button,
   font: 0.84rem/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
+.technical-details {
+  margin-top: 14px;
+}
+
+.technical-details > summary {
+  cursor: pointer;
+  padding: 12px 14px;
+  border: 1px solid #cad3c9;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.72);
+  color: #4d5d52;
+  font-weight: 800;
+}
+
+.technical-details[open] > summary {
+  margin-bottom: 14px;
+}
+
+.draft-dialog {
+  width: min(680px, calc(100% - 24px));
+  max-height: calc(100vh - 28px);
+  overflow: auto;
+  border: 0;
+  border-radius: 12px;
+  padding: 18px;
+  box-shadow: 0 24px 80px rgba(12, 30, 20, 0.35);
+}
+
+.draft-dialog::backdrop {
+  background: rgba(14, 27, 20, 0.65);
+}
+
+.draft-dialog h2 {
+  margin-bottom: 16px;
+}
+
+.draft-task-header {
+  margin: 12px 0 8px;
+}
+
+.draft-task-header h3 {
+  margin: 0;
+  font-size: 0.98rem;
+}
+
+.draft-tasks {
+  display: grid;
+  gap: 10px;
+}
+
+.draft-task {
+  border: 1px solid #d3ddd4;
+  border-radius: 8px;
+  padding: 10px;
+  background: #f8faf7;
+}
+
+.draft-task-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.draft-task label {
+  margin-bottom: 8px;
+}
+
+.remove-draft-task {
+  width: 100%;
+  padding: 8px;
+  background: #8f4d44;
+}
+
+.dialog-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.dialog-actions .secondary-button {
+  margin-top: 0;
+}
+
 @media (max-width: 520px) {
   .actions {
     grid-template-columns: 1fr;
@@ -274,5 +557,16 @@ button,
 
   .session-actions {
     grid-template-columns: 1fr;
+  }
+
+  .draft-task-grid,
+  .dialog-actions,
+  .decision-actions,
+  .assign-session-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .list-header {
+    align-items: flex-start;
   }
 }
