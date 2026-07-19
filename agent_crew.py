@@ -478,6 +478,21 @@ Salidas: {json.dumps(worker_payload, ensure_ascii=False)}
             )
         except Exception:
             pass  # la ficha es acumulativa: si falla hoy, se completa con el proximo evento
+        try:
+            # Registro agricola: lotes, labores y cosechas con cita textual.
+            from agriculture import extract_agriculture, save_agriculture
+
+            save_agriculture(
+                self.store,
+                extract_agriculture(
+                    event,
+                    source_text,
+                    openai_client=self.openai_client,
+                    completion_request=self._completion_request,
+                ),
+            )
+        except Exception:
+            pass
         selected = self.route(draft, source_text=source_text)
         existing_decisions, decision_source, decision_warning = self.store.list_rows(
             "decisions",

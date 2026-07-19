@@ -3204,6 +3204,25 @@ async def cmd_client_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+async def cmd_agriculture(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
+        return
+    from agriculture import build_agriculture_overview, format_agriculture_overview
+
+    name = " ".join(context.args or []).strip()
+    try:
+        overview = await asyncio.to_thread(build_agriculture_overview, capataz_store, name)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=format_agriculture_overview(overview)[:4000],
+        )
+    except Exception as exc:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"No pude armar el resumen agricola: {str(exc)[:500]}",
+        )
+
+
 async def cmd_cleanup_storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
         return
@@ -3905,6 +3924,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("informes", cmd_report_catalog))
     app.add_handler(CommandHandler("limpiar", cmd_cleanup_storage))
     app.add_handler(CommandHandler("cliente", cmd_client_profile))
+    app.add_handler(CommandHandler("agro", cmd_agriculture))
     app.add_handler(CommandHandler("enviar_correo", cmd_send_confirmed_email))
     app.add_handler(MessageHandler(
         filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | filters.Document.ALL,
