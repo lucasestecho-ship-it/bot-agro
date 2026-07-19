@@ -124,7 +124,18 @@ Las notas simples de seguimiento no generan una segunda aprobacion innecesaria. 
 
 ## Entrada por Telegram desde WhatsApp
 
-Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto y PDF. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo.
+Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto, PDF y paquetes geoespaciales KML/GeoTIFF. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo.
+
+Los documentos de un mismo envio geoespacial se agrupan antes de crear el trabajo. El DEM se procesa localmente con Rasterio/Numpy para obtener cotas, relieve, resolucion, pendientes y candidatos topograficos preliminares. Nunca se manda el TIFF a OpenAI como si fuera una foto. Si el pedido incluye NDVI y hay un perimetro KML, el backend puede solicitar y calcular un mosaico Sentinel-2 L2A mediante Copernicus Data Space:
+
+```text
+CDSE_CLIENT_ID
+CDSE_CLIENT_SECRET
+CDSE_NDVI_LOOKBACK_DAYS=45
+CDSE_MAX_CLOUD_PERCENT=30
+```
+
+Sin credenciales CDSE, el analisis topografico del DEM se completa igual y el resultado indica de forma explicita que el NDVI no pudo descargarse. Los puntos altos y bajos son candidatos para inspeccion, no un proyecto ejecutivo: deben cruzarse con fuente, demanda, potreros, accesos, suelo, anegamiento y cotas verificadas.
 
 Solo se atiende el chat configurado en `MY_CHAT_ID`. El handler nuevo no depende de Google Sheets ni de Google Drive.
 
@@ -193,4 +204,4 @@ Durante la migracion se deja apagado; se cambia a `true` despues de ejecutar el 
 ENABLE_TELEGRAM_BOT=false
 ```
 
-Los comandos disponibles son `/start` y `/status`. El flujo normal consiste en compartirle texto, audio, foto o PDF.
+Los comandos disponibles son `/start` y `/status`. El flujo normal consiste en compartirle texto, audio, foto, PDF o un paquete KML/GeoTIFF.
