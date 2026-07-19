@@ -56,6 +56,9 @@ from capataz import (
 from gmail_drafts import EmailDraftManager, GmailDraftService
 from geospatial_worker import GeoAsset, analyze_geospatial_package, is_geospatial_filename
 from push_notifications import PushNotifier
+from consulting_reports import generate_consulting_report
+from report_playbooks import public_report_catalog
+from document_intake import extract_office_document
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -156,6 +159,10 @@ recorridas_activas = {}
 # media group. Se mantienen solo los segundos necesarios para agruparlos; los
 # originales persistentes se suben a Supabase una vez creado el evento.
 telegram_geo_batches = {}
+# Documentos comunes (presupuestos, propuestas, informes) tambien pueden llegar
+# en varios mensajes. Se agrupan para que Tero/Margen comparen el conjunto y no
+# procesen cada oferta como si fuera un trabajo aislado.
+telegram_document_batches = {}
 
 TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
 
@@ -2119,6 +2126,7 @@ def transcribe_pdf(pdf_path):
         document.close()
     return "\n\n".join(scanned_pages)[:100000]
 
+
 def clasificar_mensaje(text):
     prompt = (
         "Clasifica el siguiente mensaje en UNA de estas categorias:\n"
@@ -3141,10 +3149,64 @@ async def cmd_capataz_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Capataz Campo activo.\n"
             f"Agentes recientes: {len(dashboard.get('agent_activity') or [])}.\n"
             f"Borradores de correo: {len(dashboard.get('email_drafts') or [])}.\n"
-            "Compartime desde WhatsApp texto, audio, foto, PDF o un paquete geoespacial "
-            "(KML + GeoTIFF)."
+            "Compartime desde WhatsApp texto, audio, foto, PDF, Word, Excel o un paquete geoespacial "
+            "(ZIP con SHP/SHX/DBF/PRJ + DEM GeoTIFF).\n"
+            "Usa /informes para ver los entregables que la cuadrilla puede producir."
         ),
     )
+
+
+async def cmd_report_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
+        return
+    catalog = public_report_catalog()
+    lines = ["Entregables profesionales disponibles:"]
+    for item in catalog:
+        agents = ", ".join(item["agents"])
+        lines.append(f"- {item['title']}\n  Cuadrilla: {agents}")
+    lines.extend([
+        "",
+        "Pedi el resultado en lenguaje normal. Ejemplos:",
+        '"Compara estos tres presupuestos y devolveme PDF y Word."',
+        '"Arma una propuesta tecnica para La Susana; deja honorarios pendientes."',
+        '"Evalua la compra de esta isla contra La Tigra, sin inventar precios."',
+        '"Prepara un dossier tecnico para vender este campo."',
+    ])
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="\n".join(lines)[:4000])
+
+
+async def cmd_send_confirmed_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send only the exact draft id explicitly confirmed by Lucas."""
+    if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
+        return
+    draft_id = str((context.args or [""])[0]).strip()
+    if not draft_id:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=(
+                "No envie nada. Para confirmar necesito el comando completo que aparece "
+                "debajo del borrador, por ejemplo: /enviar_correo email-..."
+            ),
+        )
+        return
+    try:
+        sent = await asyncio.to_thread(email_draft_manager.send_confirmed, draft_id)
+    except Exception as exc:
+        logger.exception("No se pudo enviar el borrador confirmado %s", draft_id)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"No envie el correo: {str(exc)[:800]}",
+        )
+        return
+    if sent.get("already_sent"):
+        message = f"Ese correo ya habia sido enviado: {sent.get('subject') or draft_id}"
+    else:
+        message = (
+            "Correo enviado por confirmacion explicita.\n"
+            f"Para: {sent.get('to_email')}\n"
+            f"Asunto: {sent.get('subject')}"
+        )
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=message)
 
 
 def telegram_asset_type(file_name, content_type=""):
@@ -3156,6 +3218,12 @@ def telegram_asset_type(file_name, content_type=""):
         return "kml"
     if name.endswith((".geojson", ".json")):
         return "geojson"
+    if name.endswith(".zip"):
+        return "paquete_geoespacial"
+    if name.endswith(".shp"):
+        return "shapefile"
+    if name.endswith((".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx", ".qix")):
+        return "shapefile_componente"
     if name.endswith(".xml"):
         return "metadata"
     if content_type.startswith("image/"):
@@ -3163,11 +3231,18 @@ def telegram_asset_type(file_name, content_type=""):
     if content_type.startswith("audio/"):
         return "audio"
     if name.endswith(".pdf") or content_type == "application/pdf":
-        return "pdf"
+        return "informe_pdf" if name.startswith("informe_") else "pdf"
     return "archivo"
 
 
-async def execute_capataz_telegram_work(chat_id, context, text, assets=None, preface=""):
+async def execute_capataz_telegram_work(
+    chat_id,
+    context,
+    text,
+    assets=None,
+    preface="",
+    allow_consulting_report=True,
+):
     """Confirma una sola entrada y ejecuta la cuadrilla con todos sus archivos."""
     assets = list(assets or [])
     if not str(text or "").strip():
@@ -3207,6 +3282,61 @@ async def execute_capataz_telegram_work(chat_id, context, text, assets=None, pre
         draft,
         text,
     )
+    generated_report = None
+    if allow_consulting_report:
+        generated_report = await asyncio.to_thread(
+            generate_consulting_report,
+            event=confirmed["event"],
+            draft=draft,
+            crew_result=processed,
+            source_text=text,
+            assets=assets,
+            output_dir=DATA_DIR / "consulting_reports",
+            logo_path=str(logo_path()),
+            openai_client=openai_client,
+        )
+    if generated_report:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"{generated_report.title}: armando y entregando PDF + Word. "
+                f"Estado tecnico: {generated_report.status}."
+            ),
+        )
+        generated_files = [
+            (generated_report.pdf_path, "application/pdf", "informe_pdf"),
+            (generated_report.docx_path, REPORT_DOCX_CONTENT_TYPE, "informe_docx"),
+        ]
+        for generated_path, generated_content_type, generated_type in generated_files:
+            file_name = Path(generated_path).name
+            await asyncio.to_thread(
+                persist_telegram_asset,
+                generated_path,
+                event=confirmed["event"],
+                asset_type=generated_type,
+                file_name=file_name,
+                content_type=generated_content_type,
+                transcript_text=f"Entregable generado: {generated_report.title}",
+            )
+            with Path(generated_path).open("rb") as report_file:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=report_file,
+                    filename=file_name,
+                    caption=(
+                        f"{generated_report.title}\n"
+                        f"Estado: {generated_report.status}. "
+                        "Los datos faltantes quedan marcados; no se completaron con supuestos."
+                    ),
+                )
+        processed["generated_report"] = {
+            "playbook": generated_report.playbook_key,
+            "title": generated_report.title,
+            "status": generated_report.status,
+            "pdf_path": generated_report.pdf_path,
+            "docx_path": generated_report.docx_path,
+            "missing_data": list(generated_report.missing_data),
+        }
     runs = processed.get("runs") or []
     decision = processed.get("decision") or {}
     summaries = [
@@ -3215,6 +3345,15 @@ async def execute_capataz_telegram_work(chat_id, context, text, assets=None, pre
         if (run.get("output") or {}).get("summary")
     ]
     response_lines = [value for value in [preface, "Trabajo terminado."] if value]
+    if generated_report:
+        response_lines.append(
+            f"Entregable real: PDF + Word ({generated_report.playbook_key}, {generated_report.status})."
+        )
+        if generated_report.missing_data:
+            response_lines.append(
+                "No invente lo que falta. Pendientes principales:\n- "
+                + "\n- ".join(generated_report.missing_data[:5])
+            )
     response_lines.extend(summaries[:6])
     if decision:
         response_lines.append("Decision lista para revisar en Capataz Campo.")
@@ -3225,7 +3364,12 @@ async def execute_capataz_telegram_work(chat_id, context, text, assets=None, pre
             if email_draft.get("status") == "gmail_created"
             else "preparado en Capataz"
         )
-        response_lines.append(f"Correo {email_status}: {email_draft.get('subject')}")
+        response_lines.append(
+            f"Correo {email_status}: {email_draft.get('subject')}\n"
+            f"Para: {email_draft.get('to_email') or 'FALTA DESTINATARIO'}\n"
+            "No fue enviado. Revisalo en Gmail y, solo si esta correcto, confirma con:\n"
+            f"/enviar_correo {email_draft.get('id')}"
+        )
     response_lines.append("Abrir: https://bot-agro-campo.onrender.com/campo")
     await context.bot.send_message(chat_id=chat_id, text="\n\n".join(response_lines)[:4000])
     return processed
@@ -3235,6 +3379,14 @@ def _cancel_geo_batch_jobs(context, chat_id):
     if not context.job_queue:
         return
     for name in (f"geo-batch-{chat_id}", f"geo-expire-{chat_id}"):
+        for job in context.job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+
+
+def _cancel_document_batch_jobs(context, chat_id):
+    if not context.job_queue:
+        return
+    for name in (f"doc-batch-{chat_id}", f"doc-expire-{chat_id}"):
         for job in context.job_queue.get_jobs_by_name(name):
             job.schedule_removal()
 
@@ -3276,7 +3428,7 @@ async def process_telegram_geo_batch(chat_id, context):
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Paquete completo. Calculando cotas, pendientes y productos geoespaciales...",
+            text="Paquete completo. Calculando series NDVI, lotes, relieve y productos geoespaciales...",
         )
         package = await asyncio.to_thread(
             analyze_geospatial_package,
@@ -3294,6 +3446,22 @@ async def process_telegram_geo_batch(chat_id, context):
                 "asset_type": telegram_asset_type(asset.file_name, asset.content_type),
             })
         calculated_text = package["summary_text"]
+        reports = [asset for asset in generated_assets if asset.get("asset_type") == "informe_pdf"]
+        for report in reports:
+            is_ndvi_report = "ndvi" in str(report.get("file_name") or "").lower()
+            with Path(report["path"]).open("rb") as report_file:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=report_file,
+                    filename=report["file_name"],
+                    caption=(
+                        "Informe NDVI multianual por lote listo. Incluye forestaciones separadas, "
+                        "estabilidad, cambio reciente, ranking y limitaciones."
+                        if is_ndvi_report
+                        else "Informe topografico profesional listo. Incluye elevacion, pendientes, "
+                        "cuencas, vias de escurrimiento, alternativas, economia y limitaciones."
+                    ),
+                )
         await context.bot.send_message(
             chat_id=chat_id,
             text=("Calculos terminados:\n\n" + calculated_text)[:3900],
@@ -3307,6 +3475,7 @@ async def process_telegram_geo_batch(chat_id, context):
             full_text,
             assets=source_assets + generated_assets,
             preface="El motor geoespacial termino los calculos y la cuadrilla audito el resultado.",
+            allow_consulting_report=False,
         )
     except Exception as exc:
         logger.exception("Error procesando paquete geoespacial de Telegram")
@@ -3335,6 +3504,76 @@ async def expire_telegram_geo_batch_job(context):
     )
 
 
+async def process_telegram_document_batch(chat_id, context):
+    batch = telegram_document_batches.get(chat_id)
+    if not batch or batch.get("processing"):
+        return
+    instruction = str(batch.get("instruction") or "").strip()
+    if not instruction:
+        if not batch.get("asked_for_instruction"):
+            batch["asked_for_instruction"] = True
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"Lei {len(batch.get('assets') or [])} archivo(s). Decime ahora que queres que haga "
+                    "con el conjunto: comparar, auditar, preparar propuesta, informe, presupuesto, etc."
+                ),
+            )
+            if context.job_queue:
+                context.job_queue.run_once(
+                    expire_telegram_document_batch_job,
+                    when=900,
+                    data={"chat_id": chat_id},
+                    name=f"doc-expire-{chat_id}",
+                    chat_id=chat_id,
+                )
+        return
+    batch["processing"] = True
+    assets = list(batch.get("assets") or [])
+    try:
+        blocks = [f"PEDIDO DE LUCAS:\n{instruction}"]
+        for asset in assets:
+            blocks.append(
+                f"--- ARCHIVO: {asset.get('file_name') or 'sin nombre'} ---\n"
+                f"{asset.get('extracted_text') or 'Sin texto extraido'}"
+            )
+        combined_text = "\n\n".join(blocks)[:280000]
+        for asset in assets:
+            asset["transcript_text"] = combined_text
+        await execute_capataz_telegram_work(
+            chat_id,
+            context,
+            combined_text,
+            assets=assets,
+            preface=f"La cuadrilla trabajo sobre {len(assets)} archivo(s) como un solo expediente.",
+        )
+    except Exception as exc:
+        logger.exception("Error procesando expediente documental de Telegram")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"No pude terminar el expediente: {str(exc)[:1000]}",
+        )
+    finally:
+        telegram_document_batches.pop(chat_id, None)
+        _cleanup_telegram_assets(assets)
+
+
+async def process_telegram_document_batch_job(context):
+    await process_telegram_document_batch(context.job.data["chat_id"], context)
+
+
+async def expire_telegram_document_batch_job(context):
+    chat_id = context.job.data["chat_id"]
+    batch = telegram_document_batches.pop(chat_id, None)
+    if not batch or batch.get("processing"):
+        return
+    _cleanup_telegram_assets(batch.get("assets") or [])
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="El expediente vencio despues de 15 minutos sin instrucciones. Volve a compartir los archivos cuando quieras.",
+    )
+
+
 async def handle_capataz_telegram_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
@@ -3351,7 +3590,31 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
         if message.text and pending_geo:
             pending_geo["instruction"] = text
             _cancel_geo_batch_jobs(context, chat_id)
-            await process_telegram_geo_batch(chat_id, context)
+            if context.job_queue:
+                context.job_queue.run_once(
+                    process_telegram_geo_batch_job,
+                    when=8,
+                    data={"chat_id": chat_id},
+                    name=f"geo-batch-{chat_id}",
+                    chat_id=chat_id,
+                )
+            else:
+                await process_telegram_geo_batch(chat_id, context)
+            return
+        pending_documents = telegram_document_batches.get(chat_id)
+        if message.text and pending_documents:
+            pending_documents["instruction"] = text
+            _cancel_document_batch_jobs(context, chat_id)
+            if context.job_queue:
+                context.job_queue.run_once(
+                    process_telegram_document_batch_job,
+                    when=8,
+                    data={"chat_id": chat_id},
+                    name=f"doc-batch-{chat_id}",
+                    chat_id=chat_id,
+                )
+            else:
+                await process_telegram_document_batch(chat_id, context)
             return
 
         assets = []
@@ -3391,6 +3654,7 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
             })
         elif message.document:
             document = message.document
+            document_instruction = text
             telegram_file = await context.bot.get_file(document.file_id)
             file_name = document.file_name or f"documento_{uuid.uuid4().hex[:8]}"
             content_type = document.mime_type or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
@@ -3423,7 +3687,7 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
                 if context.job_queue:
                     context.job_queue.run_once(
                         process_telegram_geo_batch_job,
-                        when=3,
+                        when=8,
                         data={"chat_id": chat_id},
                         name=f"geo-batch-{chat_id}",
                         chat_id=chat_id,
@@ -3439,15 +3703,58 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
                 extracted = await asyncio.to_thread(transcribe_audio, temp_path)
             elif content_type == "application/pdf" or suffix.lower() == ".pdf":
                 extracted = await asyncio.to_thread(transcribe_pdf, temp_path)
+            elif suffix.lower() in {".docx", ".xlsx", ".xlsm", ".csv", ".tsv", ".txt", ".md"}:
+                extracted = await asyncio.to_thread(
+                    extract_office_document,
+                    temp_path,
+                    file_name,
+                )
             else:
-                raise ValueError("Formato no soportado. Compartime texto, audio, imagen, PDF, KML o GeoTIFF.")
+                raise ValueError(
+                    "Formato no soportado. Compartime texto, audio, imagen, PDF, DOCX, XLSX, CSV "
+                    "o un ZIP geoespacial con SHP/SHX/DBF/PRJ y DEM GeoTIFF."
+                )
             text = "\n\n".join(value for value in (text, extracted) if value).strip()
             assets.append({
                 "path": temp_path,
                 "file_name": file_name,
                 "content_type": content_type,
                 "asset_type": telegram_asset_type(file_name, content_type),
+                "extracted_text": extracted,
             })
+            batch = telegram_document_batches.setdefault(chat_id, {
+                "assets": [],
+                "instruction": "",
+                "processing": False,
+                "asked_for_instruction": False,
+            })
+            batch["assets"].extend(assets)
+            assets = []
+            temp_path = None  # el expediente se hace responsable del temporal
+            if document_instruction:
+                batch["instruction"] = document_instruction
+            _cancel_document_batch_jobs(context, chat_id)
+            if batch.get("instruction"):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"Expediente: {len(batch['assets'])} archivo(s) leido(s). "
+                        "Espero unos segundos por si compartis otro y despues trabaja la cuadrilla."
+                    ),
+                )
+                if context.job_queue:
+                    context.job_queue.run_once(
+                        process_telegram_document_batch_job,
+                        when=8,
+                        data={"chat_id": chat_id},
+                        name=f"doc-batch-{chat_id}",
+                        chat_id=chat_id,
+                    )
+                else:
+                    await process_telegram_document_batch(chat_id, context)
+            else:
+                await process_telegram_document_batch(chat_id, context)
+            return
         await execute_capataz_telegram_work(chat_id, context, text, assets=assets)
     except Exception as exc:
         logger.exception("Error procesando entrada de Telegram")
@@ -3462,6 +3769,8 @@ def build_telegram_application():
 
     app.add_handler(CommandHandler("start", cmd_capataz_status))
     app.add_handler(CommandHandler("status", cmd_capataz_status))
+    app.add_handler(CommandHandler("informes", cmd_report_catalog))
+    app.add_handler(CommandHandler("enviar_correo", cmd_send_confirmed_email))
     app.add_handler(MessageHandler(
         filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | filters.Document.ALL,
         handle_capataz_telegram_message,

@@ -91,6 +91,16 @@ class GmailDraftService:
             body={"message": {"raw": raw}},
         ).execute()
 
+    def send_draft(self, gmail_draft_id):
+        """Send one existing Gmail draft. Callers must enforce user confirmation."""
+        draft_id = str(gmail_draft_id or "").strip()
+        if not draft_id:
+            raise ValueError("Falta el identificador del borrador de Gmail")
+        return self._service().users().drafts().send(
+            userId="me",
+            body={"id": draft_id},
+        ).execute()
+
 
 class EmailDraftManager:
     def __init__(self, store, gmail_service=None, openai_client=None, model=None):
@@ -285,6 +295,54 @@ Contexto: {json.dumps(payload, ensure_ascii=False)}
                     {"status": "error", "error": str(exc)[:2000], "updated_at": iso_now()},
                 )
         return {"created": created_count, "failed": failed, "configured": True}
+
+    def send_confirmed(self, draft_id):
+        """Send exactly one named draft after an explicit command from Lucas.
+
+        No daily job or agent calls this method. Keeping the Gmail draft id in
+        the request makes a repeated command safe: Gmail removes that draft
+        after sending and the local row is marked as sent.
+        """
+        requested_id = str(draft_id or "").strip()
+        if not requested_id:
+            raise ValueError("Falta indicar el ID del borrador")
+        rows, source, warning = self.store.list_rows("email_drafts", order="created_at.desc")
+        if self.store.supabase_configured and source != "supabase":
+            raise PersistentStorageError(warning or "No se pudieron leer los borradores de correo")
+        row = next((item for item in rows if str(item.get("id") or "") == requested_id), None)
+        if not row:
+            raise ValueError("No encontre ese borrador")
+        if row.get("status") == "sent":
+            return {**row, "already_sent": True}
+        if row.get("status") != "gmail_created" or not row.get("gmail_draft_id"):
+            raise ValueError("El correo todavia no tiene un borrador valido en Gmail")
+        if not str(row.get("to_email") or "").strip():
+            raise ValueError("El borrador no tiene destinatario")
+        if not self.gmail.configured:
+            raise RuntimeError("Gmail todavia no esta conectado")
+
+        self.store.update_row(
+            "email_drafts",
+            requested_id,
+            {"status": "sending", "error": "", "updated_at": iso_now()},
+        )
+        try:
+            sent = self.gmail.send_draft(row["gmail_draft_id"])
+        except Exception as exc:
+            self.store.update_row(
+                "email_drafts",
+                requested_id,
+                {"status": "gmail_created", "error": str(exc)[:2000], "updated_at": iso_now()},
+            )
+            raise
+        updated = {
+            "status": "sent",
+            "gmail_message_id": sent.get("id") or row.get("gmail_message_id"),
+            "error": "",
+            "updated_at": iso_now(),
+        }
+        self.store.update_row("email_drafts", requested_id, updated)
+        return {**row, **updated, "already_sent": False}
 
     def prepare_due_followups(self, limit=10):
         clients, source, warning = self.store.list_clients()

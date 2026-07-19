@@ -39,6 +39,14 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn('request.headers.get("X-Telegram-Bot-Api-Secret-Token"', main_source)
         self.assertIn("await telegram_app.update_queue.put(update)", main_source)
 
+    def test_telegram_returns_geospatial_pdf_and_requires_explicit_email_id(self):
+        main_source = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
+        self.assertIn("await context.bot.send_document(", main_source)
+        self.assertIn("Informe NDVI multianual por lote listo", main_source)
+        self.assertIn('CommandHandler("enviar_correo", cmd_send_confirmed_email)', main_source)
+        self.assertIn('name.endswith(".shp")', main_source)
+        self.assertIn('name.endswith(".zip")', main_source)
+
 
 if __name__ == "__main__":
     unittest.main()

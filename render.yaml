@@ -46,5 +46,11 @@ services:
         sync: false
       - key: CDSE_NDVI_LOOKBACK_DAYS
         value: "45"
+      - key: CDSE_NDVI_YEARS
+        value: "9"
+      - key: CDSE_NDVI_WIDTH
+        value: "768"
+      - key: CDSE_NDVI_HEIGHT
+        value: "768"
       - key: CDSE_MAX_CLOUD_PERCENT
-        value: "30"
+        value: "60"
