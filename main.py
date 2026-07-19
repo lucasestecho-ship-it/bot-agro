@@ -416,6 +416,39 @@ def check_supabase_storage_health():
             pass
     return result
 
+def purge_storage_health_leftovers(max_age_hours=24):
+    """Borra restos de chequeos de salud en Supabase Storage."""
+    return archive_manager.purge_health_leftovers(max_age_hours=max_age_hours)
+
+
+def prune_local_data_dir(max_age_days=7):
+    """Libera el disco efimero de Render: borra archivos locales viejos ya resguardados.
+
+    Los originales viven en Supabase desde el momento de la subida y luego pasan a la
+    PC de Lucas via el archivador; aca solo se limpia la copia temporal local.
+    """
+    from archive_manager import prune_directory
+
+    return prune_directory(DATA_DIR, max_age_days=max_age_days)
+
+
+def run_storage_cleanup():
+    """Limpieza combinada: candidatos de archivado, restos de salud y disco local."""
+    summary = {}
+    try:
+        summary["archive_candidates"] = (
+            archive_manager.sync_candidates() if archive_manager.configured else 0
+        )
+    except Exception as exc:
+        summary["archive_candidates_error"] = str(exc)
+    summary["health_purge"] = purge_storage_health_leftovers()
+    summary["local_prune"] = prune_local_data_dir(
+        max_age_days=int(os.environ.get("LOCAL_PRUNE_MAX_AGE_DAYS", "7") or 7)
+    )
+    summary["archive_status"] = archive_manager.status()
+    return summary
+
+
 def check_supabase_table_health(table, columns):
     result = {
         "exists": False,
@@ -3144,6 +3177,48 @@ def persist_telegram_asset(
     return row
 
 
+async def cmd_cleanup_storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
+        return
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Limpiando almacenamiento (Supabase + disco de Render)...",
+    )
+    summary = await asyncio.to_thread(run_storage_cleanup)
+    archive_status = summary.get("archive_status") or {}
+    counts = archive_status.get("counts") or {}
+    health = summary.get("health_purge") or {}
+    prune = summary.get("local_prune") or {}
+    lines = ["Limpieza terminada."]
+    lines.append(
+        f"Archivos marcados para pasar a la PC: {summary.get('archive_candidates', 0)} "
+        f"(pendientes {counts.get('pending', 0)}, ya archivados {counts.get('archived', 0)})."
+    )
+    lines.append(f"Restos de chequeos borrados de Supabase: {health.get('deleted', 0)}.")
+    lines.append(
+        f"Disco de Render liberado: {prune.get('deleted', 0)} archivos, "
+        f"{prune.get('freed_mb', 0)} MB."
+    )
+    if counts.get("pending"):
+        lines.append(
+            "Los pendientes bajan a tu PC cuando corre el archivador de Windows "
+            "(tarea diaria o al iniciar sesion). Recien despues de verificar la copia "
+            "se borran de Supabase."
+        )
+    errors = [
+        text for text in (
+            summary.get("archive_candidates_error"),
+            health.get("error"),
+            prune.get("error"),
+        ) if text
+    ]
+    if errors:
+        lines.append("Advertencias: " + " | ".join(errors)[:500])
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id, text="\n".join(lines)[:4000]
+    )
+
+
 async def cmd_capataz_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
         return
@@ -3801,6 +3876,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("start", cmd_capataz_status))
     app.add_handler(CommandHandler("status", cmd_capataz_status))
     app.add_handler(CommandHandler("informes", cmd_report_catalog))
+    app.add_handler(CommandHandler("limpiar", cmd_cleanup_storage))
     app.add_handler(CommandHandler("enviar_correo", cmd_send_confirmed_email))
     app.add_handler(MessageHandler(
         filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | filters.Document.ALL,
@@ -4145,12 +4221,14 @@ async def dispatch_capataz_reminders():
             else {"sent": 0, "failed": 0, "skipped": "Web Push no configurado"}
         )
         email_sync = await asyncio.to_thread(email_draft_manager.sync_prepared)
+        storage_cleanup = await asyncio.to_thread(run_storage_cleanup)
         return {
             "ok": True,
             **reminders,
             "daily_review": daily_review,
             "followup_drafts": followup_drafts,
             "email_sync": email_sync,
+            "storage_cleanup": storage_cleanup,
         }
     except (PersistentStorageError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
