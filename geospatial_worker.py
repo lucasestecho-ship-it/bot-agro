@@ -888,6 +888,63 @@ function evaluatePixel(samples) {{
     raise RuntimeError(last_error or "CDSE no devolvio el raster NDVI")
 
 
+def download_cdse_dem(geometry: dict, output_path: str) -> dict:
+    """Descarga el DEM Copernicus GLO-30 (30 m) desde el Process API de CDSE."""
+    if requests is None:
+        raise RuntimeError("Falta instalar requests en el servidor")
+    token = _cdse_access_token()
+    bbox = _geometry_bbox(geometry)
+    # Resolucion objetivo ~30 m: se calcula el tamano en pixeles desde el bbox.
+    mid_lat = (bbox[1] + bbox[3]) / 2.0
+    metres_x = abs(bbox[2] - bbox[0]) * 111320.0 * max(0.2, math.cos(math.radians(mid_lat)))
+    metres_y = abs(bbox[3] - bbox[1]) * 111320.0
+    width = int(min(1200, max(64, round(metres_x / 30.0))))
+    height = int(min(1200, max(64, round(metres_y / 30.0))))
+    evalscript = """//VERSION=3
+function setup() {
+  return {input: ["DEM"], output: {bands: 1, sampleType: "FLOAT32"}};
+}
+function evaluatePixel(s) {
+  return [s.DEM];
+}
+"""
+    payload = {
+        "input": {
+            "bounds": {
+                "geometry": {"type": geometry["type"], "coordinates": geometry["coordinates"]},
+                "properties": {"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"},
+            },
+            "data": [{
+                "type": "dem",
+                "dataFilter": {"demInstance": "COPERNICUS_30"},
+            }],
+        },
+        "output": {
+            "width": width,
+            "height": height,
+            "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
+        },
+        "evalscript": evalscript,
+    }
+    last_error = None
+    for attempt in range(3):
+        response = requests.post(
+            "https://sh.dataspace.copernicus.eu/process/v1",
+            headers={"Authorization": f"Bearer {token}", "Accept": "image/tiff"},
+            json=payload,
+            timeout=180,
+        )
+        if response.ok:
+            Path(output_path).write_bytes(response.content)
+            return {"source": "Copernicus DEM GLO-30", "resolution_m": 30, "width": width, "height": height}
+        last_error = f"CDSE Process API {response.status_code}: {response.text[:500]}"
+        if response.status_code not in {429, 500, 502, 503, 504}:
+            break
+        retry_after = float(response.headers.get("Retry-After") or (2 ** attempt))
+        time.sleep(min(20.0, max(1.0, retry_after)))
+    raise RuntimeError(last_error or "CDSE no devolvio el DEM")
+
+
 def _seasonal_year_ranges(today: date, years: int = 9) -> list[tuple[date, date]]:
     start_year = max(2015, today.year - max(2, int(years)) + 1)
     ranges = []
@@ -1157,6 +1214,41 @@ def build_multiyear_ndvi_analysis(
         high_threshold = np.nan
         has_soil = False
 
+    zoning = None
+    if len(lot_rows) == 1 and pasture_rows:
+        # Un solo poligono: el ranking entre lotes no aporta nada. Se ambienta el
+        # campo por NDVI estable en tres zonas relativas (terciles del propio campo).
+        single = pasture_rows[0]
+        single_valid = single["_mask"] & np.isfinite(stable)
+        single_values = stable[single_valid]
+        if single_values.size >= 30:
+            t_low = float(np.percentile(single_values, 33))
+            t_high = float(np.percentile(single_values, 67))
+            zone_map = np.full(stable.shape, np.nan)
+            zone_map[single_valid & (stable < t_low)] = 0
+            zone_map[single_valid & (stable >= t_low) & (stable < t_high)] = 1
+            zone_map[single_valid & (stable >= t_high)] = 2
+            zone_rows = []
+            total_cells = max(1, int(single_valid.sum()))
+            for code, zone_name in ((2, "Ambiente alto"), (1, "Ambiente medio"), (0, "Ambiente bajo")):
+                zone_mask = single_valid & (zone_map == code)
+                cells = int(zone_mask.sum())
+                zone_values = stable[zone_mask]
+                zone_rows.append({
+                    "code": int(code),
+                    "name": zone_name,
+                    "area_ha": float(cells * cell_area_ha),
+                    "pct": float(cells / total_cells * 100.0),
+                    "ndvi_mean": float(np.mean(zone_values)) if zone_values.size else float("nan"),
+                    "ndvi_min": float(np.min(zone_values)) if zone_values.size else float("nan"),
+                    "ndvi_max": float(np.max(zone_values)) if zone_values.size else float("nan"),
+                })
+            zoning = {
+                "thresholds": [t_low, t_high],
+                "rows": zone_rows,
+                "_zone_values": zone_map,
+            }
+
     union_mask = np.zeros(stable.shape, dtype=bool)
     for mask in masks:
         union_mask |= mask
@@ -1170,6 +1262,7 @@ def build_multiyear_ndvi_analysis(
         "years": years,
         "period_from": annual_rasters[0].get("from"),
         "period_to": annual_rasters[-1].get("to"),
+        "zoning": zoning,
         "lot_rows": lot_rows,
         "pasture_rows": sorted(
             pasture_rows, key=lambda row: row.get("potential_index", 0), reverse=True
@@ -1290,13 +1383,41 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
         wants_ndvi = "ndvi" in instruction_key or "sentinel" in instruction_key
         wants_topography = any(
             token in instruction_key
-            for token in ("topograf", "pendiente", "drenaje", "escurr", "cota", "relieve", "agua")
+            for token in (
+                "topograf", "pendiente", "drenaje", "escurr", "cota", "relieve", "agua",
+                "inunda", "anega", "zona baja", "zonas bajas", "altimetr",
+            )
         ) or bool(dem and not wants_ndvi)
         if wants_topography and not dem:
-            raise ValueError(
-                "Falta un DEM GeoTIFF. Para el informe envia un ZIP con SHP, SHX, DBF y PRJ, "
-                "mas el archivo DEM .tif."
-            )
+            # Sin DEM subido: se intenta descargar Copernicus GLO-30 con las credenciales CDSE.
+            client_id, client_secret = _cdse_credentials()
+            if boundary and client_id and client_secret:
+                dem_path = str(Path(stage_dir) / "dem_copernicus_glo30.tif")
+                try:
+                    download_cdse_dem(
+                        {"type": boundary["type"], "coordinates": boundary["coordinates"]},
+                        dem_path,
+                    )
+                    dem = analyze_raster(
+                        dem_path,
+                        "dem_copernicus_glo30.tif",
+                        clip_geometries=boundary.get("source_geometries") or None,
+                        clip_crs=boundary.get("source_crs") or "EPSG:4326",
+                    )
+                    results.append(dem)
+                    warnings.append(
+                        "DEM Copernicus GLO-30 (30 m) descargado automaticamente: util para zonas "
+                        "bajas, pendientes y escurrimiento; su precision vertical no reemplaza una "
+                        "nivelacion de campo."
+                    )
+                except Exception as exc:
+                    warnings.append(f"DEM automatico no disponible: {exc}")
+            if not dem:
+                raise ValueError(
+                    "Falta un DEM GeoTIFF y no pude descargarlo automaticamente. Envia un ZIP con "
+                    "SHP, SHX, DBF y PRJ, mas el archivo DEM .tif, o revisa las credenciales CDSE. "
+                    + " | ".join(warnings[-1:])
+                )
 
         overlay_geometries = []
         if boundary and dem:

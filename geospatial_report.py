@@ -72,12 +72,16 @@ def infer_field_name(instruction: str, assets) -> str:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             candidate = re.split(
-                r"\b(?:donde|hacer|analizar|con|para|y\s+hacer|topograf)\b",
+                r"\b(?:donde|hacer|analizar|con|para|topograf|y|e|que|necesito|quiero|"
+                r"tambien|también|importante|urgente|inunda\w*|anega\w*|ndvi|analisis|"
+                r"análisis|informe|dame|hace)\b",
                 match.group(1),
                 maxsplit=1,
                 flags=re.IGNORECASE,
             )[0]
             candidate = _clean_name(candidate, "")
+            # Nombres reales rara vez superan las 4 palabras: evita titulos con el mensaje entero.
+            candidate = " ".join(candidate.split()[:4])
             if candidate and candidate.lower() not in {"este", "el", "un", "mi"}:
                 return candidate.title()
     for asset in assets or []:
