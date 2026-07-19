@@ -124,7 +124,7 @@ Las notas simples de seguimiento no generan una segunda aprobacion innecesaria. 
 
 ## Entrada por Telegram desde WhatsApp
 
-Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto, PDF y paquetes geoespaciales KML/GeoTIFF. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo.
+Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto, PDF y paquetes geoespaciales KML/GeoTIFF. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo. En Render usa automáticamente un webhook basado en `RENDER_EXTERNAL_HOSTNAME`, de modo que un mensaje de Telegram puede despertar una instancia gratuita. Fuera de Render conserva polling para desarrollo local; `TELEGRAM_WEBHOOK_URL` permite indicar manualmente el origen HTTPS si el proveedor no expone esa variable.
 
 Los documentos de un mismo envio geoespacial se agrupan antes de crear el trabajo. El DEM se procesa localmente con Rasterio/Numpy para obtener cotas, relieve, resolucion, pendientes y candidatos topograficos preliminares. Nunca se manda el TIFF a OpenAI como si fuera una foto. Si el pedido incluye NDVI y hay un perimetro KML, el backend puede solicitar y calcular un mosaico Sentinel-2 L2A mediante Copernicus Data Space:
 

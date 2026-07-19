@@ -1,5 +1,6 @@
 import os
 import asyncio
+import hashlib
 import json
 import logging
 import tempfile
@@ -155,6 +156,32 @@ recorridas_activas = {}
 # media group. Se mantienen solo los segundos necesarios para agruparlos; los
 # originales persistentes se suben a Supabase una vez creado el evento.
 telegram_geo_batches = {}
+
+TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
+
+
+def telegram_webhook_base_url():
+    """Return the public HTTPS origin used by Telegram to wake the web service."""
+    configured = str(os.environ.get("TELEGRAM_WEBHOOK_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    render_url = str(os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+    if render_url:
+        return render_url
+    render_hostname = str(os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip().strip("/")
+    if render_hostname:
+        return f"https://{render_hostname}"
+    return ""
+
+
+def telegram_webhook_secret():
+    """Use an explicit secret or derive a stable one without exposing the bot token."""
+    configured = str(os.environ.get("TELEGRAM_WEBHOOK_SECRET") or "").strip()
+    if configured:
+        return configured
+    if not TELEGRAM_TOKEN:
+        return ""
+    return hashlib.sha256(f"capataz-campo:{TELEGRAM_TOKEN}".encode("utf-8")).hexdigest()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -3498,6 +3525,7 @@ def save_upload_with_limit(upload: UploadFile, destination: Path, max_bytes: int
 @asynccontextmanager
 async def fastapi_lifespan(app: FastAPI):
     telegram_app = None
+    telegram_mode = "disabled"
     enable_bot = os.environ.get("ENABLE_TELEGRAM_BOT", "false").lower() in {"1", "true", "yes", "si"}
 
     if enable_bot:
@@ -3507,14 +3535,35 @@ async def fastapi_lifespan(app: FastAPI):
             telegram_app = build_telegram_application()
             await telegram_app.initialize()
             await telegram_app.start()
-            await telegram_app.updater.start_polling()
-            logger.info("Bot de Telegram iniciado junto con FastAPI.")
+            app.state.telegram_app = telegram_app
+            webhook_base_url = telegram_webhook_base_url()
+            if webhook_base_url:
+                webhook_url = f"{webhook_base_url}{TELEGRAM_WEBHOOK_PATH}"
+                webhook_registered = await telegram_app.bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=telegram_webhook_secret(),
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                )
+                if not webhook_registered:
+                    raise RuntimeError("Telegram rechazo el registro del webhook")
+                telegram_mode = "webhook"
+                logger.info("Bot de Telegram iniciado en modo webhook: %s", webhook_url)
+            else:
+                await telegram_app.updater.start_polling(drop_pending_updates=False)
+                telegram_mode = "polling"
+                logger.info("Bot de Telegram iniciado en modo polling local.")
+
+    app.state.telegram_mode = telegram_mode
 
     try:
         yield
     finally:
+        app.state.telegram_app = None
+        app.state.telegram_mode = "stopped"
         if telegram_app:
-            await telegram_app.updater.stop()
+            if telegram_mode == "polling":
+                await telegram_app.updater.stop()
             await telegram_app.stop()
             await telegram_app.shutdown()
 
@@ -3559,6 +3608,27 @@ async def campo_service_worker():
     response.headers["Cache-Control"] = "no-cache"
     return response
 
+
+@fastapi_app.post(TELEGRAM_WEBHOOK_PATH, include_in_schema=False)
+async def receive_telegram_webhook(request: Request):
+    """Acknowledge Telegram quickly and let Application process the update in its queue."""
+    expected_secret = telegram_webhook_secret()
+    supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not expected_secret or not secrets.compare_digest(supplied_secret, expected_secret):
+        raise HTTPException(status_code=403, detail="Webhook de Telegram no autorizado")
+
+    telegram_app = getattr(request.app.state, "telegram_app", None)
+    if telegram_app is None:
+        raise HTTPException(status_code=503, detail="Bot de Telegram iniciando")
+    try:
+        payload = await request.json()
+        update = Update.de_json(payload, telegram_app.bot)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Actualizacion de Telegram invalida") from exc
+    if update is not None:
+        await telegram_app.update_queue.put(update)
+    return {"ok": True}
+
 @fastapi_app.get("/api/health/campo")
 async def health_campo():
     tables = {
@@ -3586,6 +3656,12 @@ async def health_campo():
             "cdse_configured": bool(
                 os.environ.get("CDSE_CLIENT_ID") and os.environ.get("CDSE_CLIENT_SECRET")
             ),
+        },
+        "telegram": {
+            "enabled": os.environ.get("ENABLE_TELEGRAM_BOT", "false").lower()
+            in {"1", "true", "yes", "si"},
+            "mode": getattr(fastapi_app.state, "telegram_mode", "not_started"),
+            "webhook_origin_configured": bool(telegram_webhook_base_url()),
         },
         "archive": archive_manager.status(),
     }
