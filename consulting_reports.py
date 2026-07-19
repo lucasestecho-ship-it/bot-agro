@@ -180,10 +180,7 @@ def _fallback_payload(
             paragraphs = [recommendation]
             bullets = recommendations[:8]
         else:
-            paragraphs = [
-                "Contenido pendiente de completar con evidencia especifica del proyecto. "
-                "No se agregaron valores ni conclusiones por inferencia."
-            ]
+            paragraphs = []
             bullets = []
         sections.append({"title": title, "paragraphs": paragraphs, "bullets": bullets})
 
@@ -314,7 +311,6 @@ def _generate_payload(
             for asset in assets
         ],
         "especialistas": _run_outputs(crew_result),
-        "auditoria": (crew_result or {}).get("decision"),
     }
     prompt = f"""
 Sos el agente Informes del estudio del Ing. Agr. Lucas Estecho (M.P. 2009 LE),
@@ -333,6 +329,14 @@ REGLAS DE REDACCION Y VERIFICACION:
 - La recomendacion debe responder a la decision, ser condicionada y tener proximo paso.
 - Tono profesional, claro, argentino, sin mencionar IA ni estos prompts.
 - No autorices compra, obra, envio o compromiso externo.
+- El documento es un ENTREGABLE PARA EL CLIENTE. PROHIBIDO mencionar Contralor,
+  auditorias, estados internos (pending_review, bloqueado, borrador), IDs de
+  decisiones, agentes internos o el funcionamiento del sistema.
+- Lo que falta va SOLO en "missing_data" (uso interno de Lucas). Las secciones
+  del documento desarrollan lo que SI esta registrado, bien redactado; no
+  repitas listas de faltantes ni llenes secciones con "pendiente".
+- El subtitulo es profesional (cliente, campo o fecha); nunca "borrador" ni
+  "sujeto a validacion".
 
 Responde SOLO JSON puro con esta forma:
 {{
@@ -548,7 +552,6 @@ def create_consulting_docx(payload: dict, output_path: str, *, event: dict, play
         ("Cliente / campo", event.get("client_name") or "No identificado"),
         ("Fecha", datetime.now().strftime("%d/%m/%Y")),
         ("Tipo", playbook.title),
-        ("Estado", payload["status"].upper()),
     ]
     for label, value in rows:
         cells = meta.add_row().cells
@@ -564,6 +567,8 @@ def create_consulting_docx(payload: dict, output_path: str, *, event: dict, play
     document.add_page_break()
 
     for section in payload["sections"]:
+        if not section["paragraphs"] and not section["bullets"]:
+            continue
         document.add_heading(section["title"], level=1)
         for paragraph_text in section["paragraphs"]:
             document.add_paragraph(paragraph_text)
@@ -586,8 +591,12 @@ def create_consulting_docx(payload: dict, output_path: str, *, event: dict, play
                 run.font.size = Pt(9)
                 run.font.color.rgb = RGBColor.from_string(MUTED)
 
+    payload = {**payload, "calculations": [
+        calculation for calculation in payload.get("calculations") or []
+        if str(calculation.get("status") or "").lower() == "calculado"
+    ]}
     if payload["calculations"]:
-        document.add_heading("Registro de calculos auditables", level=1)
+        document.add_heading("Calculos realizados", level=1)
         table = document.add_table(rows=1, cols=4)
         table.style = "Table Grid"
         headers = ["Calculo", "Formula", "Resultado", "Fuente / estado"]
@@ -602,20 +611,13 @@ def create_consulting_docx(payload: dict, output_path: str, *, event: dict, play
             cells[0].text = calculation["label"]
             cells[1].text = calculation["formula"]
             cells[2].text = calculation["result"]
-            cells[3].text = f"{calculation['source']}\nEstado: {calculation['status']}"
+            cells[3].text = str(calculation['source'])
         _set_table_geometry(table, [1900, 2700, 1700, 3060])
 
-    if payload["risks"]:
-        document.add_heading("Riesgos", level=1)
-        for value in payload["risks"]:
+    if payload["sources"]:
+        document.add_heading("Fuentes", level=1)
+        for value in payload["sources"]:
             document.add_paragraph(value, style="List Bullet")
-    if payload["missing_data"]:
-        document.add_heading("Datos y verificaciones pendientes", level=1)
-        for value in payload["missing_data"]:
-            document.add_paragraph(value, style="List Bullet")
-    document.add_heading("Fuentes y trazabilidad", level=1)
-    for value in payload["sources"]:
-        document.add_paragraph(value, style="List Bullet")
     document.add_paragraph()
     closing = document.add_paragraph()
     closing.alignment = WD_ALIGN_PARAGRAPH.RIGHT
@@ -745,7 +747,6 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
         ["Cliente / campo", _clean_text(event.get("client_name") or "No identificado", 200)],
         ["Fecha", datetime.now().strftime("%d/%m/%Y")],
         ["Tipo", playbook.title],
-        ["Estado", payload["status"].upper()],
     ]
     meta = Table(meta_data, colWidths=[4 * cm, 12 * cm])
     meta.setStyle(TableStyle([
@@ -769,6 +770,8 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
         PageBreak(),
     ])
     for section in payload["sections"]:
+        if not section["paragraphs"] and not section["bullets"]:
+            continue
         story.append(Paragraph(section["title"], styles["h1"]))
         for value in section["paragraphs"]:
             story.append(Paragraph(value, styles["body"]))
@@ -791,8 +794,12 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
                 Spacer(1, 0.3 * cm),
             ])
 
+    payload = {**payload, "calculations": [
+        calculation for calculation in payload.get("calculations") or []
+        if str(calculation.get("status") or "").lower() == "calculado"
+    ]}
     if payload["calculations"]:
-        story.append(Paragraph("Registro de calculos auditables", styles["h1"]))
+        story.append(Paragraph("Calculos realizados", styles["h1"]))
         rows = [[
             Paragraph("Calculo", styles["small"]), Paragraph("Formula", styles["small"]),
             Paragraph("Resultado", styles["small"]), Paragraph("Fuente / estado", styles["small"]),
@@ -819,9 +826,7 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
         story.append(table)
 
     for title, values, color in (
-        ("Riesgos", payload["risks"], RED),
-        ("Datos y verificaciones pendientes", payload["missing_data"], GOLD),
-        ("Fuentes y trazabilidad", payload["sources"], MUTED),
+        ("Fuentes", payload["sources"], MUTED),
     ):
         if not values:
             continue
