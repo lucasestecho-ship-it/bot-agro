@@ -5,6 +5,7 @@ import uuid
 from dataclasses import asdict, dataclass
 
 from capataz import PersistentStorageError, argentina_now, extract_json_object, iso_now, normalize_key
+from report_playbooks import agent_keys_for_playbook, detect_report_playbook, playbook_prompt
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,15 @@ class AgentCrew:
                 ]
             )
         )
+        playbook = detect_report_playbook(text_key)
+        if playbook:
+            # Los entregables tienen una cuadrilla explicita. No se deja que el
+            # limite historico de seis agentes quite Informes o Margen por haber
+            # agregado Cartera de manera automatica.
+            return [
+                key for key in agent_keys_for_playbook(playbook)
+                if key != "contralor"
+            ][:6]
         selected = ["cartera"]
         for name in draft.get("agents") or []:
             key = AGENT_ALIASES.get(normalize_key(name))
@@ -299,6 +309,17 @@ class AgentCrew:
             if self.openai_client is None:
                 output = self._fallback_output(spec, context["draft"])
             else:
+                playbook = detect_report_playbook(
+                    context.get("source_text") or context["draft"].get("summary") or ""
+                )
+                deliverable_contract = (
+                    playbook_prompt(playbook)
+                    if playbook
+                    else "No hay un entregable documental solicitado en esta entrada."
+                )
+                source_excerpt = str(
+                    context.get("source_text") or context["draft"].get("summary") or ""
+                )[:180000]
                 prompt = f"""
 Sos {spec.name}, empleado especialista dentro de Capataz Campo.
 Responsabilidad: {spec.purpose}
@@ -307,6 +328,13 @@ Instrucciones: {spec.instructions}
 Trabajas para el Ing. Agr. Lucas Estecho en Argentina. Usa solamente los datos entregados.
 Separa hechos, inferencias y datos faltantes. No inventes mediciones, fechas, precios ni dosis.
 No comuniques nada a clientes y no ejecutes acciones externas.
+
+Contrato del trabajo solicitado:
+{deliverable_contract}
+
+Si el contrato pide un calculo y faltan operandos, unidades o fuente, NO lo completes:
+incluilo en missing_data. Si hay datos suficientes, mostra formula, operandos, unidad y
+resultado en findings o economic_points para que Contralor pueda recalcularlo.
 
 Responde SOLO JSON puro:
 {{
@@ -324,7 +352,7 @@ Responde SOLO JSON puro:
 Cliente: {context['event'].get('client_name') or 'no identificado'}
 Campo: {context['draft'].get('field_name') or 'no indicado'}
 Tipo: {context['draft'].get('event_type') or 'nota'}
-Nota original: {context.get('source_text') or context['draft'].get('summary') or ''}
+Nota original: {source_excerpt}
 Borrador confirmado: {json.dumps(context['draft'], ensure_ascii=False)}
 """.strip()
                 response = self.openai_client.chat.completions.create(
@@ -372,6 +400,14 @@ Borrador confirmado: {json.dumps(context['draft'], ensure_ascii=False)}
             if self.openai_client is None:
                 output = normalize_control_output({}, worker_payload)
             else:
+                playbook = detect_report_playbook(
+                    context.get("source_text") or context["draft"].get("summary") or ""
+                )
+                deliverable_contract = (
+                    playbook_prompt(playbook)
+                    if playbook
+                    else "No hay un entregable documental solicitado en esta entrada."
+                )
                 prompt = f"""
 Sos Contralor de Capataz Campo. Audita la salida de los especialistas antes de que Lucas decida.
 Busca contradicciones, datos inventados, riesgos, fechas o costos no respaldados y tareas prematuras.
@@ -386,6 +422,12 @@ No apruebes ejecucion automatica. Responde SOLO JSON puro:
   "next_actions": [{{"title":"accion","due_date":null,"priority":"media","agent":"Cartera","notes":""}}],
   "confidence": "alta|media|baja"
 }}
+
+Contrato que tambien debes auditar:
+{deliverable_contract}
+
+Bloquea cualquier numero sin unidad/fuente, total no recomponible, comparacion no normalizada,
+precio inventado o recomendacion definitiva basada solo en una inferencia.
 
 Entrada confirmada: {json.dumps(context['draft'], ensure_ascii=False)}
 Salidas: {json.dumps(worker_payload, ensure_ascii=False)}

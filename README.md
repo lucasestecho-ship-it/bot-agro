@@ -2,6 +2,8 @@
 
 PWA Android y cuadrilla de agentes para recorridas, audios, fotos, clientes, decisiones, informes y borradores de correo. FastAPI corre en Render; Supabase conserva temporalmente los datos y una tarea de Windows archiva los archivos pesados en la computadora.
 
+La cuadrilla tambien produce proyectos de agua, propuestas, presupuestos, comparativos, evaluaciones de compra, dossiers de venta e informes tecnicos en PDF y DOCX. El catalogo, las reglas de calculo y ejemplos de pedidos estan en [GUIA_ENTREGABLES_AGENTES.md](GUIA_ENTREGABLES_AGENTES.md).
+
 La aplicacion anterior se llamaba internamente Bot Agro. La interfaz y el manifiesto ahora usan exclusivamente **Capataz Campo**.
 
 ## Entrypoint actual
