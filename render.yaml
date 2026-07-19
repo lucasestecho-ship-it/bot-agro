@@ -23,7 +23,13 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: CAPATAZ_AGENT_MODEL
-        value: gpt-4o-mini
+        value: gpt-5.6-terra
+      - key: CAPATAZ_AGENT_REASONING
+        value: medium
+      - key: CAPATAZ_REPORT_MODEL
+        value: gpt-5.6-sol
+      - key: CAPATAZ_REPORT_REASONING
+        value: high
       - key: VAPID_PUBLIC_KEY
         sync: false
       - key: VAPID_PRIVATE_KEY

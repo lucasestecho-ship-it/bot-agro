@@ -31,6 +31,12 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("sync: false", telegram_setting)
         self.assertNotIn('value: "false"', telegram_setting)
 
+    def test_render_uses_terra_for_workers_and_sol_for_final_reports(self):
+        render_config = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
+        self.assertIn("- key: CAPATAZ_AGENT_MODEL\n        value: gpt-5.6-terra", render_config)
+        self.assertIn("- key: CAPATAZ_REPORT_MODEL\n        value: gpt-5.6-sol", render_config)
+        self.assertIn("- key: CAPATAZ_REPORT_REASONING\n        value: high", render_config)
+
     def test_telegram_uses_a_render_waking_webhook(self):
         main_source = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
         self.assertIn('TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"', main_source)
@@ -46,6 +52,8 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn('CommandHandler("enviar_correo", cmd_send_confirmed_email)', main_source)
         self.assertIn('name.endswith(".shp")', main_source)
         self.assertIn('name.endswith(".zip")', main_source)
+        self.assertIn('@fastapi_app.get("/api/health/cdse")', main_source)
+        self.assertIn("BLOQUEADO - faltan credenciales CDSE", main_source)
 
 
 if __name__ == "__main__":

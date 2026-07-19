@@ -679,13 +679,22 @@ def _cdse_credentials() -> tuple[str, str]:
     )
 
 
+def _cdse_missing_credentials_message() -> str:
+    return (
+        "El Shapefile fue recibido correctamente, pero el NDVI esta bloqueado: "
+        "faltan CDSE_CLIENT_ID y CDSE_CLIENT_SECRET en Render > bot-agro-campo > Environment. "
+        "Copia alli los valores del OAuth Client de Copernicus Sentinel Hub, guarda los cambios, "
+        "espera 'Deploy live' y luego reenvia el paquete."
+    )
+
+
 def _cdse_access_token() -> str:
     global _CDSE_TOKEN, _CDSE_TOKEN_EXPIRES_AT
     if _CDSE_TOKEN and time.time() < _CDSE_TOKEN_EXPIRES_AT - 60:
         return _CDSE_TOKEN
     client_id, client_secret = _cdse_credentials()
     if not client_id or not client_secret:
-        raise RuntimeError("Faltan CDSE_CLIENT_ID y CDSE_CLIENT_SECRET en Render")
+        raise RuntimeError(_cdse_missing_credentials_message())
     token_response = requests.post(
         "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token",
         data={
@@ -700,6 +709,37 @@ def _cdse_access_token() -> str:
     _CDSE_TOKEN = payload["access_token"]
     _CDSE_TOKEN_EXPIRES_AT = time.time() + int(payload.get("expires_in") or 3000)
     return _CDSE_TOKEN
+
+
+def cdse_configuration_status(validate: bool = False) -> dict:
+    """Expose only safe credential state; never return the ID, secret or token."""
+    client_id, client_secret = _cdse_credentials()
+    configured = bool(client_id and client_secret)
+    result = {
+        "configured": configured,
+        "authenticated": None,
+        "message": "Credenciales cargadas; autenticacion no probada.",
+    }
+    if not configured:
+        result["message"] = _cdse_missing_credentials_message()
+        return result
+    if not validate:
+        return result
+    try:
+        _cdse_access_token()
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        result.update({
+            "authenticated": False,
+            "message": (
+                "Copernicus rechazo el Client ID o el Client Secret. Crea un OAuth Client nuevo y reemplaza ambos valores."
+                if status_code in {400, 401, 403}
+                else "Las credenciales estan cargadas, pero Copernicus no pudo autenticarlas en este momento."
+            ),
+        })
+        return result
+    result.update({"authenticated": True, "message": "Copernicus autentico correctamente."})
+    return result
 
 
 def download_cdse_ndvi(geometry: dict, output_path: str, *, lookback_days: int = 45) -> dict:
@@ -1274,9 +1314,7 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
                 raise ValueError("Para el informe NDVI falta un Shapefile, KML o GeoJSON con los lotes")
             client_id, client_secret = _cdse_credentials()
             if not client_id or not client_secret:
-                warnings.append(
-                    "NDVI multianual no calculado: faltan CDSE_CLIENT_ID y CDSE_CLIENT_SECRET en Render"
-                )
+                raise RuntimeError(_cdse_missing_credentials_message())
             else:
                 annual_rasters = []
                 year_count = int(os.environ.get("CDSE_NDVI_YEARS", "9"))

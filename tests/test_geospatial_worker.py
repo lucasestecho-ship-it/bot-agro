@@ -356,6 +356,38 @@ class GeospatialWorkerTests(unittest.TestCase):
             "2025-01-01T00:00:00Z",
         )
 
+    def test_cdse_status_is_safe_and_can_validate_authentication(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"access_token": "token", "expires_in": 3600}
+
+        class FakeRequests:
+            @staticmethod
+            def post(url, **kwargs):
+                return Response()
+
+        with patch.dict("os.environ", {}, clear=True):
+            missing = geospatial_worker.cdse_configuration_status(validate=True)
+        self.assertFalse(missing["configured"])
+        self.assertIsNone(missing["authenticated"])
+        self.assertIn("Shapefile fue recibido correctamente", missing["message"])
+        with patch.dict(
+            "os.environ", {"CDSE_CLIENT_ID": "id", "CDSE_CLIENT_SECRET": "secret"}, clear=True
+        ), patch.object(geospatial_worker, "requests", FakeRequests), patch.object(
+            geospatial_worker, "_CDSE_TOKEN", ""
+        ), patch.object(geospatial_worker, "_CDSE_TOKEN_EXPIRES_AT", 0):
+            authenticated = geospatial_worker.cdse_configuration_status(validate=True)
+        self.assertEqual(authenticated, {
+            "configured": True,
+            "authenticated": True,
+            "message": "Copernicus autentico correctamente.",
+        })
+        self.assertNotIn("id", str(authenticated).lower())
+        self.assertNotIn("secret", str(authenticated).lower())
+
     def test_multiyear_windows_compare_the_same_seasonal_cut(self):
         ranges = geospatial_worker._seasonal_year_ranges(date(2026, 7, 19), years=4)
         self.assertEqual(ranges, [
