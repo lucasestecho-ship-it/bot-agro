@@ -1,9 +1,10 @@
 import hashlib
 import mimetypes
+import os
 import re
 import unicodedata
-from datetime import datetime
-from pathlib import PurePosixPath
+from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urljoin
 
 try:
@@ -26,6 +27,38 @@ def safe_segment(value, fallback="sin-dato", max_length=90):
     )
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-._")
     return (text or fallback)[:max_length]
+
+
+def prune_directory(root, max_age_days=7):
+    """Borra archivos mas viejos que max_age_days y directorios vacios bajo root."""
+    result = {"deleted": 0, "freed_mb": 0.0, "error": ""}
+    try:
+        root = Path(root)
+        cutoff = datetime.now(timezone.utc).timestamp() - max(1, int(max_age_days)) * 86400
+        freed = 0
+        if root.exists():
+            for path in sorted(root.rglob("*")):
+                try:
+                    if not path.is_file():
+                        continue
+                    stat = path.stat()
+                    if stat.st_mtime >= cutoff:
+                        continue
+                    freed += stat.st_size
+                    path.unlink()
+                    result["deleted"] += 1
+                except OSError:
+                    continue
+            for directory in sorted(root.rglob("*"), reverse=True):
+                try:
+                    if directory.is_dir() and not any(directory.iterdir()):
+                        directory.rmdir()
+                except OSError:
+                    continue
+        result["freed_mb"] = round(freed / (1024 * 1024), 2)
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
 
 
 def archive_id(source_table, source_id, object_role, object_path):
@@ -188,13 +221,34 @@ class ArchiveManager:
             ],
             order="fecha_hora.asc.nullslast",
         )
+        try:
+            max_age_days = int(os.environ.get("ARCHIVE_MAX_AGE_DAYS", "45"))
+        except (TypeError, ValueError):
+            max_age_days = 45
+        age_cutoff = datetime.now(timezone.utc) - timedelta(days=max(7, max_age_days))
+
+        def _older_than_cutoff(value):
+            text = str(value or "").strip()
+            if not text:
+                return False
+            try:
+                stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return False
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return stamp < age_cutoff
+
         for item in items:
             if not item.get("storage_path"):
                 continue
             if str(item.get("storage_status") or "") == "local_archived":
                 continue
             session_id = str(item.get("session_id") or "")
-            if session_id not in closed_session_ids or session_id not in completed_report_session_ids:
+            ready = session_id in closed_session_ids and session_id in completed_report_session_ids
+            # Fallback por antiguedad: el almacenamiento es limitado, asi que un
+            # archivo viejo pasa a la PC aunque la recorrida nunca se haya cerrado.
+            if not ready and not _older_than_cutoff(item.get("fecha_hora")):
                 continue
             candidate = self._candidate(
                 source_table="field_items",
@@ -415,6 +469,48 @@ class ArchiveManager:
         row.update({"status": "verified", "sha256": sha256, "size_bytes": size_bytes})
         self._delete_verified(row)
         return {"id": row["id"], "status": "archived", "storage_deleted": True}
+
+    def purge_health_leftovers(self, max_age_hours=24):
+        """Borra restos de chequeos de salud (_health/) en Supabase Storage."""
+        result = {"deleted": 0, "error": ""}
+        if not self.configured:
+            return result
+        try:
+            self._require_requests()
+            response = requests.post(
+                f"{self.supabase_url}/storage/v1/object/list/{quote(self.bucket, safe='')}",
+                headers=self._headers(),
+                json={"prefix": "_health", "limit": 1000},
+                timeout=30,
+            )
+            response.raise_for_status()
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(max_age_hours)))
+            stale = []
+            for entry in response.json() or []:
+                name = str(entry.get("name") or "")
+                if not name:
+                    continue
+                created = str(entry.get("created_at") or "")
+                try:
+                    stamp = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if stamp.tzinfo is None:
+                        stamp = stamp.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    stamp = None
+                if stamp is None or stamp < cutoff:
+                    stale.append(f"_health/{name}")
+            if stale:
+                delete = requests.delete(
+                    f"{self.supabase_url}/storage/v1/object/{quote(self.bucket, safe='')}",
+                    headers=self._headers(),
+                    json={"prefixes": stale},
+                    timeout=60,
+                )
+                delete.raise_for_status()
+                result["deleted"] = len(stale)
+        except Exception as exc:
+            result["error"] = str(exc)
+        return result
 
     def status(self):
         if not self.configured:
