@@ -173,10 +173,15 @@ class ConsultingReportGenerationTests(unittest.TestCase):
             docx_text = "\n".join(
                 paragraph.text for paragraph in Document(report.docx_path).paragraphs
             )
-            self.assertIn("Datos y verificaciones pendientes", pdf_text)
-            self.assertIn("Honorarios y forma de pago", pdf_text)
-            self.assertIn("Honorarios y forma de pago", docx_text)
+            # El entregable es para el cliente: nada de auditoria interna.
+            self.assertNotIn("Datos y verificaciones pendientes", pdf_text)
+            self.assertNotIn("Riesgos", pdf_text)
+            self.assertNotIn("PRELIMINAR", pdf_text)
+            self.assertNotIn("Contenido pendiente de completar", pdf_text)
+            self.assertNotIn("Datos y verificaciones pendientes", docx_text)
             self.assertNotIn("$1.650.000", pdf_text)
+            # Lo interno sigue disponible para Lucas en el payload.
+            self.assertTrue(report.missing_data)
 
     def test_report_fails_closed_without_openai(self):
         with tempfile.TemporaryDirectory() as temp_dir:
