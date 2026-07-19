@@ -1,4 +1,4 @@
-"""Informe NDVI multianual por lote, inspirado en la entrega de Don Policarpo."""
+"""Informe NDVI multianual por lote para cualquier campo de la consultora."""
 
 from __future__ import annotations
 
@@ -553,8 +553,8 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
                     "La capa de suelos fue reconocida, pero faltan aptitudes válidas para cubrir todos "
                     "los lotes. No se fuerza el 65/35: el ranking queda exclusivamente satelital."
                     if analysis.get("soil_layer_present") else
-                    "Sin una capa de suelos no se calcula el índice pastoril integrado 65/35 del informe "
-                    "Don Policarpo. Este ranking es exclusivamente satelital y debe calibrarse con aforos."
+                    "Sin una capa de suelos no se calcula el índice pastoril integrado 65/35. "
+                    "Este ranking es exclusivamente satelital y debe calibrarse con aforos."
                 )
             )
             _box(pdf, ranking_note, LEFT, 76, CONTENT_W - 75)
