@@ -18,7 +18,7 @@ import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 from xml.etree import ElementTree
@@ -401,6 +401,7 @@ def analyze_raster(
             "_values": values,
             "_bounds": [float(value) for value in dataset.bounds],
             "_crs_wkt": dataset.crs.to_wkt() if dataset.crs else "",
+            "_transform": dataset.transform,
         }
         if raster_type == "dem":
             result["_slope_pct"] = _slope_percent_array(values, x_res_m, y_res_m)
@@ -537,7 +538,8 @@ def read_shapefile(path: str) -> dict:
             ". Envia un ZIP con SHP, SHX, DBF y PRJ."
         )
     reader = shapefile.Reader(str(shp_path))
-    geometries = [shape.__geo_interface__ for shape in reader.shapes() if shape.points]
+    shape_records = [item for item in reader.iterShapeRecords() if item.shape.points]
+    geometries = [item.shape.__geo_interface__ for item in shape_records]
     if not geometries:
         raise ValueError("El Shapefile no contiene geometria")
     prj_path = shp_path.with_suffix(".prj")
@@ -552,11 +554,47 @@ def read_shapefile(path: str) -> dict:
     if not polygons:
         raise ValueError("El Shapefile no contiene poligonos para delimitar el campo")
     wgs84_geometries = [_transform_geometry(geometry, source_crs, "EPSG:4326") for geometry in geometries]
-    boundary_geometry = max(
-        [_transform_geometry(geometry, source_crs, "EPSG:4326") for geometry in polygons],
-        key=lambda geometry: len(str(geometry.get("coordinates") or [])),
-    )
+    wgs84_polygons = [
+        _transform_geometry(geometry, source_crs, "EPSG:4326") for geometry in polygons
+    ]
+    multipolygon_coordinates = []
+    for geometry in wgs84_polygons:
+        if geometry.get("type") == "Polygon":
+            multipolygon_coordinates.append(geometry.get("coordinates") or [])
+        elif geometry.get("type") == "MultiPolygon":
+            multipolygon_coordinates.extend(geometry.get("coordinates") or [])
+    boundary_geometry = {
+        "type": "MultiPolygon",
+        "coordinates": multipolygon_coordinates,
+    }
     bbox_wgs84 = _geometry_bbox(boundary_geometry)
+    preferred_name_keys = ("name", "nombre", "lote", "potrero", "sector", "id")
+    features = []
+    for position, (shape_record, source_geometry, wgs84_geometry) in enumerate(
+        zip(shape_records, geometries, wgs84_geometries),
+        start=1,
+    ):
+        properties = {
+            str(key): value
+            for key, value in shape_record.record.as_dict().items()
+        }
+        normalized_properties = {str(key).strip().lower(): value for key, value in properties.items()}
+        raw_name = next(
+            (
+                normalized_properties[key]
+                for key in preferred_name_keys
+                if key in normalized_properties and str(normalized_properties[key] or "").strip()
+            ),
+            "",
+        )
+        lot_name = str(raw_name or f"Lote {position}").strip()
+        features.append({
+            "name": lot_name[:120],
+            "properties": properties,
+            "source_geometry": source_geometry,
+            "wgs84_geometry": wgs84_geometry,
+            "is_forest": bool(re.search(r"forest|monte|eucalipt|pino", lot_name, re.IGNORECASE)),
+        })
     return {
         **boundary_geometry,
         "bbox": bbox_wgs84,
@@ -564,6 +602,8 @@ def read_shapefile(path: str) -> dict:
         "source_crs": source_crs,
         "source_geometries": geometries,
         "wgs84_geometries": wgs84_geometries,
+        "features": features,
+        "file_name": shp_path.name,
     }
 
 
@@ -723,6 +763,403 @@ function evaluatePixel(s) {
     }
 
 
+def download_cdse_ndvi_percentile(
+    geometry: dict,
+    output_path: str,
+    *,
+    start_date: date,
+    end_date: date,
+    percentile: int = 90,
+) -> dict:
+    """Descarga el percentil temporal de NDVI para un mismo periodo estacional."""
+    if requests is None:
+        raise RuntimeError("Falta instalar requests en el servidor")
+    percentile = max(50, min(int(percentile), 100))
+    token = _cdse_access_token()
+    evalscript = f"""//VERSION=3
+function setup() {{
+  return {{
+    input: [{{bands: [\"B04\", \"B08\", \"SCL\", \"dataMask\"]}}],
+    output: {{bands: 1, sampleType: \"FLOAT32\"}},
+    mosaicking: \"ORBIT\"
+  }};
+}}
+function evaluatePixel(samples) {{
+  const values = [];
+  for (const s of samples) {{
+    if (!s.dataMask || [0, 1, 3, 8, 9, 10, 11].includes(s.SCL) || (s.B08 + s.B04) === 0) continue;
+    const value = (s.B08 - s.B04) / (s.B08 + s.B04);
+    if (value >= -1 && value <= 1) values.push(value);
+  }}
+  if (values.length === 0) return [NaN];
+  values.sort((a, b) => a - b);
+  const position = Math.min(values.length - 1, Math.round(({percentile} / 100) * (values.length - 1)));
+  return [values[position]];
+}}
+"""
+    payload = {
+        "input": {
+            "bounds": {
+                "geometry": {"type": geometry["type"], "coordinates": geometry["coordinates"]},
+                "properties": {"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"},
+            },
+            "data": [{
+                "type": "sentinel-2-l2a",
+                "dataFilter": {
+                    "timeRange": {
+                        "from": f"{start_date.isoformat()}T00:00:00Z",
+                        "to": f"{end_date.isoformat()}T23:59:59Z",
+                    },
+                    "maxCloudCoverage": int(os.environ.get("CDSE_MAX_CLOUD_PERCENT", "60")),
+                },
+                "processing": {"harmonizeValues": True},
+            }],
+        },
+        "output": {
+            "width": int(os.environ.get("CDSE_NDVI_WIDTH", "768")),
+            "height": int(os.environ.get("CDSE_NDVI_HEIGHT", "768")),
+            "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
+        },
+        "evalscript": evalscript,
+    }
+    url = "https://sh.dataspace.copernicus.eu/process/v1"
+    last_error = None
+    for attempt in range(3):
+        response = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Accept": "image/tiff"},
+            json=payload,
+            timeout=240,
+        )
+        if response.ok:
+            Path(output_path).write_bytes(response.content)
+            return {
+                "year": start_date.year,
+                "from": start_date.isoformat(),
+                "to": end_date.isoformat(),
+                "percentile": percentile,
+                "max_cloud_percent": payload["input"]["data"][0]["dataFilter"]["maxCloudCoverage"],
+            }
+        last_error = f"CDSE Process API {response.status_code}: {response.text[:500]}"
+        if response.status_code not in {429, 500, 502, 503, 504}:
+            break
+        retry_after = float(response.headers.get("Retry-After") or (2 ** attempt))
+        time.sleep(min(20.0, max(1.0, retry_after)))
+    raise RuntimeError(last_error or "CDSE no devolvio el raster NDVI")
+
+
+def _seasonal_year_ranges(today: date, years: int = 9) -> list[tuple[date, date]]:
+    start_year = max(2015, today.year - max(2, int(years)) + 1)
+    ranges = []
+    for year in range(start_year, today.year + 1):
+        try:
+            end = date(year, today.month, today.day)
+        except ValueError:
+            end = date(year, today.month, 28)
+        ranges.append((date(year, 1, 1), end))
+    return ranges
+
+
+def _normalized_scores(values, *, higher_is_better=True) -> np.ndarray:
+    array = np.asarray(values, dtype="float64")
+    valid = np.isfinite(array)
+    result = np.full(array.shape, 0.5, dtype="float64")
+    if valid.any():
+        minimum, maximum = float(np.min(array[valid])), float(np.max(array[valid]))
+        if maximum > minimum:
+            result[valid] = (array[valid] - minimum) / (maximum - minimum)
+    if not higher_is_better:
+        result = 1.0 - result
+    return result
+
+
+def build_multiyear_ndvi_analysis(
+    boundary: dict,
+    annual_rasters: list[dict],
+    stable_output_path: str,
+    *,
+    dem_result: dict | None = None,
+    soil_layer: dict | None = None,
+) -> dict:
+    """Integra rasters P90 estacionales y calcula estadisticas reproducibles por lote."""
+    try:
+        import rasterio
+        from rasterio.features import geometry_mask
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("Falta rasterio para calcular NDVI por lote") from exc
+    if len(annual_rasters) < 2:
+        raise ValueError("Se necesitan al menos dos periodos comparables para el informe multianual")
+    arrays, years, profile = [], [], None
+    raster_crs = None
+    raster_transform = None
+    raster_bounds = None
+    for item in sorted(annual_rasters, key=lambda value: value["year"]):
+        with rasterio.open(item["path"]) as dataset:
+            values = dataset.read(1, masked=True).filled(np.nan).astype("float64")
+            values[(values < -1) | (values > 1)] = np.nan
+            if arrays and values.shape != arrays[0].shape:
+                raise ValueError("Los periodos NDVI no comparten la misma grilla")
+            arrays.append(values)
+            years.append(int(item["year"]))
+            if profile is None:
+                profile = dataset.profile.copy()
+                raster_crs = dataset.crs
+                raster_transform = dataset.transform
+                raster_bounds = [float(value) for value in dataset.bounds]
+    stack = np.stack(arrays, axis=0)
+    with np.errstate(all="ignore"):
+        stable = np.nanmedian(stack, axis=0)
+    profile.update(dtype="float32", count=1, nodata=-9999.0, compress="deflate")
+    with rasterio.open(stable_output_path, "w", **profile) as output:
+        output.write(np.where(np.isfinite(stable), stable, -9999.0).astype("float32"), 1)
+
+    features = boundary.get("features") or []
+    if not features:
+        features = [{
+            "name": "Campo",
+            "is_forest": False,
+            "wgs84_geometry": {"type": boundary["type"], "coordinates": boundary["coordinates"]},
+            "properties": {},
+        }]
+    lot_rows = []
+    masks = []
+    x_res_m, y_res_m = _resolution_in_metres(raster_transform, raster_crs, stable.shape[0])
+    cell_area_ha = x_res_m * y_res_m / 10000.0
+    soil_parts = []
+    soil_aptitude_map = {"UC 40": 100.0, "UC 9": 35.0, "UC 37": 20.0}
+    try:
+        configured_map = json.loads(os.environ.get("SOIL_APTITUDE_MAP_JSON", "{}") or "{}")
+        for key, value in configured_map.items():
+            score = float(value)
+            if 0 <= score <= 1:
+                score *= 100.0
+            if 0 <= score <= 100:
+                soil_aptitude_map[str(key).strip().upper()] = score
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    for feature in (soil_layer or {}).get("features") or []:
+        properties = feature.get("properties") or {}
+        normalized_properties = {
+            str(key).strip().lower(): value for key, value in properties.items()
+        }
+        properties_text = " ".join(
+            str(value or "") for value in properties.values()
+        )
+        code_match = re.search(r"\b(?:UC\s*)?(40|37|9)\b", properties_text, re.IGNORECASE)
+        code = f"UC {code_match.group(1)}" if code_match else (feature.get("name") or "Otra")
+        aptitude_value = next(
+            (
+                normalized_properties[key]
+                for key in ("aptitud", "aptitud_pct", "aptitude", "aptitude_pct", "indice", "score")
+                if key in normalized_properties and str(normalized_properties[key] or "").strip()
+            ),
+            None,
+        )
+        try:
+            aptitude_pct = float(str(aptitude_value).replace(",", "."))
+            if 0 <= aptitude_pct <= 1:
+                aptitude_pct *= 100.0
+            if not 0 <= aptitude_pct <= 100:
+                aptitude_pct = None
+        except (TypeError, ValueError):
+            aptitude_pct = None
+        if aptitude_pct is None:
+            candidates = [str(code).strip().upper(), str(feature.get("name") or "").strip().upper()]
+            aptitude_pct = next(
+                (soil_aptitude_map[candidate] for candidate in candidates if candidate in soil_aptitude_map),
+                None,
+            )
+        geometry = _transform_geometry(feature["wgs84_geometry"], "EPSG:4326", raster_crs)
+        soil_mask = geometry_mask(
+            [geometry], out_shape=stable.shape, transform=raster_transform, invert=True
+        )
+        soil_parts.append({
+            "code": code,
+            "aptitude": (float(aptitude_pct) / 100.0 if aptitude_pct is not None else None),
+            "mask": soil_mask,
+        })
+    for feature in features:
+        raster_geometry = _transform_geometry(feature["wgs84_geometry"], "EPSG:4326", raster_crs)
+        mask = geometry_mask(
+            [raster_geometry], out_shape=stable.shape, transform=raster_transform, invert=True
+        )
+        valid = mask & np.isfinite(stable)
+        if valid.sum() < 1:
+            continue
+        stable_values = stable[valid]
+        annual_means, annual_p90 = [], []
+        for values in arrays:
+            annual_values = values[mask & np.isfinite(values)]
+            annual_means.append(float(np.mean(annual_values)) if annual_values.size else np.nan)
+            annual_p90.append(float(np.percentile(annual_values, 90)) if annual_values.size else np.nan)
+        finite_means = _finite(annual_means)
+        cv = (
+            float(np.std(finite_means) / np.mean(finite_means) * 100)
+            if finite_means.size >= 2 and abs(float(np.mean(finite_means))) > 1e-9
+            else np.nan
+        )
+        row = {
+            "name": feature["name"],
+            "is_forest": bool(feature.get("is_forest")),
+            "area_ha": float(mask.sum() * cell_area_ha),
+            "ndvi_mean": float(np.mean(stable_values)),
+            "ndvi_p10": float(np.percentile(stable_values, 10)),
+            "ndvi_p90": float(np.percentile(stable_values, 90)),
+            "ndvi_min": float(np.min(stable_values)),
+            "ndvi_max": float(np.max(stable_values)),
+            "cv_interannual_pct": cv,
+            "recent_change": (
+                float(annual_p90[-1] - annual_p90[-2])
+                if len(annual_p90) >= 2 and np.isfinite(annual_p90[-1]) and np.isfinite(annual_p90[-2])
+                else np.nan
+            ),
+            "annual_means": dict(zip(years, annual_means)),
+            "annual_p90": dict(zip(years, annual_p90)),
+            "_geometry_raster": raster_geometry,
+            "_geometry_wgs84": feature["wgs84_geometry"],
+            "_mask": mask,
+        }
+        if soil_parts:
+            class_counts = {}
+            weighted_score = 0.0
+            covered = 0
+            scored = 0
+            for part in soil_parts:
+                count = int(np.sum(mask & part["mask"]))
+                if not count:
+                    continue
+                class_counts[part["code"]] = class_counts.get(part["code"], 0) + count
+                covered += count
+                if part["aptitude"] is not None:
+                    weighted_score += count * part["aptitude"]
+                    scored += count
+            if covered:
+                row["soil_coverage_pct"] = min(
+                    100.0, covered / max(1, int(mask.sum())) * 100.0
+                )
+                row["soil_classes_pct"] = {
+                    code: count / covered * 100.0 for code, count in class_counts.items()
+                }
+            if scored:
+                row["soil_aptitude_pct"] = weighted_score / scored * 100.0
+                row["soil_score_coverage_pct"] = min(
+                    100.0, scored / max(1, int(mask.sum())) * 100.0
+                )
+        if dem_result and "_values" in dem_result:
+            dem_geometry = _transform_geometry(
+                feature["wgs84_geometry"], "EPSG:4326", dem_result.get("_crs_wkt") or dem_result.get("crs")
+            )
+            dem_values = np.asarray(dem_result["_values"], dtype="float64")
+            # El transform del DEM se conserva en analyze_raster para aplicar la mascara por lote.
+            dem_transform = dem_result.get("_transform")
+            if dem_transform is not None:
+                dem_mask = geometry_mask(
+                    [dem_geometry], out_shape=dem_values.shape, transform=dem_transform, invert=True
+                )
+                dem_valid = dem_mask & np.isfinite(dem_values)
+                slope_values = np.asarray(dem_result.get("_slope_pct"), dtype="float64")
+                if dem_valid.any():
+                    row["elevation_mean_m"] = float(np.mean(dem_values[dem_valid]))
+                    row["slope_mean_pct"] = float(np.mean(slope_values[dem_valid]))
+                    row["area_slope_gt_2_pct"] = float(np.mean(slope_values[dem_valid] > 2) * 100)
+        lot_rows.append(row)
+        masks.append(mask)
+
+    pasture_rows = [row for row in lot_rows if not row["is_forest"]]
+    if pasture_rows:
+        pasture_mask = np.zeros(stable.shape, dtype=bool)
+        for row in pasture_rows:
+            pasture_mask |= row["_mask"]
+        pasture_values = stable[pasture_mask & np.isfinite(stable)]
+        high_threshold = float(np.percentile(pasture_values, 67)) if pasture_values.size else np.nan
+        for row in lot_rows:
+            values = stable[row["_mask"] & np.isfinite(stable)]
+            row["high_environment_pct"] = float(np.mean(values >= high_threshold) * 100) if values.size else 0.0
+        means = [row["ndvi_mean"] for row in pasture_rows]
+        p10s = [row["ndvi_p10"] for row in pasture_rows]
+        cvs = [row["cv_interannual_pct"] for row in pasture_rows]
+        highs = [row["high_environment_pct"] for row in pasture_rows]
+        satellite_scores = (
+            0.35 * _normalized_scores(means)
+            + 0.20 * _normalized_scores(p10s)
+            + 0.20 * _normalized_scores(cvs, higher_is_better=False)
+            + 0.25 * _normalized_scores(highs)
+        ) * 100
+        for row, score in zip(pasture_rows, satellite_scores.tolist()):
+            row["satellite_index"] = float(score)
+        has_soil = bool(
+            soil_parts
+            and pasture_rows
+            and all(
+                "soil_aptitude_pct" in row and row.get("soil_score_coverage_pct", 0) >= 90
+                for row in pasture_rows
+            )
+        )
+        combined_scores = [
+            (
+                0.65 * row["satellite_index"] + 0.35 * row.get("soil_aptitude_pct", 50.0)
+                if has_soil
+                else row["satellite_index"]
+            )
+            for row in pasture_rows
+        ]
+        ranked = sorted(
+            zip(pasture_rows, combined_scores), key=lambda item: item[1], reverse=True
+        )
+        high_count = max(1, math.ceil(len(ranked) / 3))
+        medium_count = max(1, math.ceil((len(ranked) - high_count) / 2)) if len(ranked) > 1 else 0
+        for position, (row, score) in enumerate(ranked):
+            row["potential_index"] = int(round(score))
+            row["potential_class"] = (
+                "Alto" if position < high_count else "Medio" if position < high_count + medium_count else "Bajo"
+            )
+    else:
+        high_threshold = np.nan
+        has_soil = False
+
+    union_mask = np.zeros(stable.shape, dtype=bool)
+    for mask in masks:
+        union_mask |= mask
+    # La respuesta de Process API usa una caja envolvente. Fuera de los lotes
+    # no hay superficie del establecimiento y esos pixeles no deben aparecer
+    # coloreados ni quedar en el GeoTIFF estable entregado.
+    stable = np.where(union_mask, stable, np.nan)
+    with rasterio.open(stable_output_path, "w", **profile) as output:
+        output.write(np.where(np.isfinite(stable), stable, -9999.0).astype("float32"), 1)
+    return {
+        "years": years,
+        "period_from": annual_rasters[0].get("from"),
+        "period_to": annual_rasters[-1].get("to"),
+        "lot_rows": lot_rows,
+        "pasture_rows": sorted(
+            pasture_rows, key=lambda row: row.get("potential_index", 0), reverse=True
+        ),
+        "forest_rows": sorted(
+            [row for row in lot_rows if row["is_forest"]], key=lambda row: row["ndvi_mean"], reverse=True
+        ),
+        "stable_ndvi": {
+            "_values": stable,
+            "_bounds": raster_bounds,
+            "_crs_wkt": raster_crs.to_wkt() if raster_crs else "",
+            "_transform": raster_transform,
+            "file_name": Path(stable_output_path).name,
+        },
+        "mapped_area_ha": float(union_mask.sum() * cell_area_ha),
+        "forest_area_ha": float(sum(row["area_ha"] for row in lot_rows if row["is_forest"])),
+        "pasture_area_ha": float(sum(row["area_ha"] for row in pasture_rows)),
+        "high_threshold": high_threshold,
+        "soil_layer_present": bool(soil_parts),
+        "has_soil": has_soil,
+        "score_method": (
+            "Indice pastoril relativo: 65% respuesta satelital (NDVI medio, P10, estabilidad y "
+            "ambiente alto) + 35% aptitud edafica relativa. No equivale a kg MS/ha."
+            if has_soil
+            else "Indice satelital relativo: 35% NDVI medio, 20% P10, 20% estabilidad interanual "
+            "y 25% superficie en ambiente NDVI alto. No incluye aptitud de suelo."
+        ),
+    }
+
+
 def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = "") -> dict:
     original_assets = list(assets)
     if not original_assets:
@@ -734,13 +1171,43 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
     with tempfile.TemporaryDirectory(prefix="capataz-geo-") as stage_dir:
         staged_assets = _stage_geospatial_assets(original_assets, Path(stage_dir))
         shapefiles = [asset for asset in staged_assets if Path(asset.file_name).suffix.lower() == ".shp"]
+        vector_layers = []
         if shapefiles:
-            try:
-                boundary = read_shapefile(shapefiles[0].path)
-            except Exception as exc:
-                raise ValueError(f"No pude reconstruir el Shapefile: {exc}") from exc
+            for shapefile_asset in shapefiles:
+                try:
+                    vector_layers.append(read_shapefile(shapefile_asset.path))
+                except Exception as exc:
+                    warnings.append(f"Shapefile {shapefile_asset.file_name}: {exc}")
+            if not vector_layers:
+                raise ValueError("No pude reconstruir ningun Shapefile completo del paquete")
+            def layer_keys(layer):
+                return {
+                    str(key).strip().lower()
+                    for feature in layer.get("features") or []
+                    for key in (feature.get("properties") or {}).keys()
+                }
+
+            def is_soil_layer(layer):
+                name = str(layer.get("file_name") or "").lower()
+                keys = layer_keys(layer)
+                return bool(
+                    re.search(r"suelo|soil|edaf|carta", name)
+                    or keys.intersection({"uc", "unidad", "unidad_ca", "mapunit", "soil", "suelo"})
+                )
+
+            lot_layers = [layer for layer in vector_layers if not is_soil_layer(layer)]
+            boundary = max(
+                lot_layers or vector_layers,
+                key=lambda layer: (
+                    bool(layer_keys(layer).intersection({"name", "nombre", "lote", "potrero", "sector"})),
+                    len(layer.get("features") or []),
+                ),
+            )
+            soil_layer = next((layer for layer in vector_layers if is_soil_layer(layer)), None)
         elif any(Path(asset.file_name).suffix.lower() in SHAPEFILE_EXTENSIONS for asset in staged_assets):
             raise ValueError("Shapefile incompleto: falta el archivo .shp. Envia un ZIP con SHP, SHX, DBF y PRJ.")
+        else:
+            soil_layer = None
 
         if not boundary:
             for asset in staged_assets:
@@ -780,14 +1247,19 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
                 continue
 
         dem = next((result for result in results if result.get("type") == "dem"), None)
-        if not dem:
+        wants_ndvi = "ndvi" in instruction_key or "sentinel" in instruction_key
+        wants_topography = any(
+            token in instruction_key
+            for token in ("topograf", "pendiente", "drenaje", "escurr", "cota", "relieve", "agua")
+        ) or bool(dem and not wants_ndvi)
+        if wants_topography and not dem:
             raise ValueError(
                 "Falta un DEM GeoTIFF. Para el informe envia un ZIP con SHP, SHX, DBF y PRJ, "
                 "mas el archivo DEM .tif."
             )
 
         overlay_geometries = []
-        if boundary:
+        if boundary and dem:
             try:
                 overlay_geometries = [
                     _transform_geometry(geometry, boundary.get("source_crs") or "EPSG:4326", dem.get("_crs_wkt"))
@@ -796,31 +1268,60 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
             except Exception as exc:
                 warnings.append(f"El perimetro no pudo superponerse sobre el DEM: {exc}")
 
-        has_ndvi = any(result.get("type") == "ndvi" for result in results)
-        wants_ndvi = "ndvi" in instruction_key or "sentinel" in instruction_key
-        if wants_ndvi and not has_ndvi:
-            if boundary:
-                with tempfile.NamedTemporaryFile(suffix="_ndvi_cdse.tif", delete=False) as temp:
-                    ndvi_path = temp.name
-                try:
-                    wgs84_geometry = {
-                        "type": boundary["type"],
-                        "coordinates": boundary["coordinates"],
-                    }
-                    request_meta = download_cdse_ndvi(
-                        wgs84_geometry,
-                        ndvi_path,
-                        lookback_days=int(os.environ.get("CDSE_NDVI_LOOKBACK_DAYS", "45")),
-                    )
-                    ndvi_result = analyze_raster(ndvi_path, "ndvi_cdse.tif")
-                    ndvi_result["request"] = request_meta
-                    results.append(ndvi_result)
-                    generated_assets.append(GeoAsset(ndvi_path, "ndvi_cdse.tif", "image/tiff"))
-                except Exception as exc:
-                    Path(ndvi_path).unlink(missing_ok=True)
-                    warnings.append(f"NDVI Sentinel no calculado: {exc}")
+        ndvi_analysis = None
+        if wants_ndvi:
+            if not boundary:
+                raise ValueError("Para el informe NDVI falta un Shapefile, KML o GeoJSON con los lotes")
+            client_id, client_secret = _cdse_credentials()
+            if not client_id or not client_secret:
+                warnings.append(
+                    "NDVI multianual no calculado: faltan CDSE_CLIENT_ID y CDSE_CLIENT_SECRET en Render"
+                )
             else:
-                warnings.append("NDVI Sentinel no calculado: falta un perimetro KML, GeoJSON o Shapefile")
+                annual_rasters = []
+                year_count = int(os.environ.get("CDSE_NDVI_YEARS", "9"))
+                today = datetime.now(timezone.utc).date()
+                wgs84_geometry = {
+                    "type": boundary["type"],
+                    "coordinates": boundary["coordinates"],
+                }
+                for start_date, end_date in _seasonal_year_ranges(today, years=year_count):
+                    annual_path = str(Path(stage_dir) / f"ndvi_p90_{start_date.year}.tif")
+                    try:
+                        metadata = download_cdse_ndvi_percentile(
+                            wgs84_geometry,
+                            annual_path,
+                            start_date=start_date,
+                            end_date=end_date,
+                            percentile=90,
+                        )
+                        annual_rasters.append({**metadata, "path": annual_path})
+                    except Exception as exc:
+                        warnings.append(f"NDVI {start_date.year} no calculado: {exc}")
+                if len(annual_rasters) >= 2:
+                    with tempfile.NamedTemporaryFile(
+                        prefix="ndvi_estable_multianual_", suffix=".tif", delete=False
+                    ) as temp:
+                        stable_path = temp.name
+                    try:
+                        ndvi_analysis = build_multiyear_ndvi_analysis(
+                            boundary,
+                            annual_rasters,
+                            stable_path,
+                            dem_result=dem,
+                            soil_layer=soil_layer,
+                        )
+                        stable_result = analyze_raster(stable_path, "ndvi_estable_multianual.tif")
+                        stable_result["multiyear"] = True
+                        results.append(stable_result)
+                        generated_assets.append(
+                            GeoAsset(stable_path, "ndvi_estable_multianual.tif", "image/tiff")
+                        )
+                    except Exception:
+                        Path(stable_path).unlink(missing_ok=True)
+                        raise
+                else:
+                    warnings.append("NDVI multianual no calculado: menos de dos periodos validos")
 
         from geospatial_report import generate_geospatial_report, infer_field_name
 
@@ -831,22 +1332,45 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
             "boundary": boundary,
             "overlay_geometries": overlay_geometries,
             "field_name": field_name,
+            "vector_layers": vector_layers,
+            "soil_layer": soil_layer,
+            "ndvi_analysis": ndvi_analysis,
         }
         safe_field = re.sub(r"[^A-Za-z0-9]+", "_", field_name).strip("_") or "Campo"
-        with tempfile.NamedTemporaryFile(prefix="informe_topografico_", suffix=".pdf", delete=False) as temp:
-            report_path = temp.name
-        generate_geospatial_report(
-            package,
-            report_path,
-            instruction=instruction,
-            assets=original_assets,
-            logo_path=str(Path(__file__).parent / "static" / "logo.png"),
-        )
-        generated_assets.append(
-            GeoAsset(report_path, f"Informe_Topografico_{safe_field}.pdf", "application/pdf")
-        )
+        logo_path = str(Path(__file__).parent / "static" / "logo.png")
+        if dem and wants_topography:
+            with tempfile.NamedTemporaryFile(
+                prefix="informe_topografico_", suffix=".pdf", delete=False
+            ) as temp:
+                report_path = temp.name
+            generate_geospatial_report(
+                package,
+                report_path,
+                instruction=instruction,
+                assets=original_assets,
+                logo_path=logo_path,
+            )
+            generated_assets.append(
+                GeoAsset(report_path, f"Informe_Topografico_{safe_field}.pdf", "application/pdf")
+            )
+        if ndvi_analysis:
+            from ndvi_report import generate_ndvi_report
 
-    lines = ["INFORME TOPOGRAFICO CALCULADO Y PDF GENERADO:"]
+            with tempfile.NamedTemporaryFile(prefix="informe_ndvi_", suffix=".pdf", delete=False) as temp:
+                ndvi_report_path = temp.name
+            generate_ndvi_report(
+                ndvi_analysis,
+                ndvi_report_path,
+                field_name=field_name,
+                logo_path=logo_path,
+            )
+            generated_assets.append(
+                GeoAsset(ndvi_report_path, f"Informe_NDVI_por_Lote_{safe_field}.pdf", "application/pdf")
+            )
+        elif wants_ndvi and not (dem and wants_topography):
+            raise RuntimeError("No se pudo construir el informe NDVI multianual. " + " | ".join(warnings))
+
+    lines = ["INFORMES GEOESPACIALES CALCULADOS:"]
     if boundary:
         bbox = boundary["bbox"]
         lines.append(
@@ -855,18 +1379,22 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
         )
     for result in results:
         lines.append(_format_ndvi(result) if result["type"] == "ndvi" else _format_dem(result))
-    topography = dem["_topography"]
-    lines.append(
-        f"Se delimitaron {len(topography.get('basin_table') or [])} cuencas principales y se calcularon "
-        f"vias de escurrimiento para aportes de 10, 50 y 200 ha. Longitud hidraulica maxima estimada: "
-        f"{topography['max_downstream_length_m'] / 1000:.2f} km."
-    )
+    if dem and wants_topography:
+        topography = dem["_topography"]
+        lines.append(
+            f"Topografia: {len(topography.get('basin_table') or [])} cuencas principales; vias de "
+            f"escurrimiento para aportes de 10, 50 y 200 ha; longitud hidraulica maxima "
+            f"{topography['max_downstream_length_m'] / 1000:.2f} km."
+        )
+    if ndvi_analysis:
+        lines.append(
+            f"NDVI multianual por lote: {len(ndvi_analysis['years'])} periodos comparables, "
+            f"{len(ndvi_analysis['pasture_rows'])} lotes pastoriles y "
+            f"{len(ndvi_analysis['forest_rows'])} forestaciones separadas."
+        )
     if warnings:
         lines.append("Advertencias: " + " | ".join(warnings))
-    lines.append(
-        "El PDF adjunto contiene mapas de elevacion, pendientes, cuencas, drenajes, puntos altos/bajos, "
-        "tabla de superficies, criterios economicos, acciones y limitaciones. No es plano de obra."
-    )
+    lines.append("Los PDF adjuntos contienen los mapas, tablas, ranking, recomendaciones y limitaciones correspondientes.")
     return {
         **package,
         "summary_text": "\n".join(lines),

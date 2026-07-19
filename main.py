@@ -3203,7 +3203,7 @@ def telegram_asset_type(file_name, content_type=""):
     if content_type.startswith("audio/"):
         return "audio"
     if name.endswith(".pdf") or content_type == "application/pdf":
-        return "informe_pdf" if "informe_topografico" in name else "pdf"
+        return "informe_pdf" if name.startswith("informe_") else "pdf"
     return "archivo"
 
 
@@ -3321,7 +3321,7 @@ async def process_telegram_geo_batch(chat_id, context):
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Paquete completo. Calculando cotas, pendientes y productos geoespaciales...",
+            text="Paquete completo. Calculando series NDVI, lotes, relieve y productos geoespaciales...",
         )
         package = await asyncio.to_thread(
             analyze_geospatial_package,
@@ -3341,14 +3341,18 @@ async def process_telegram_geo_batch(chat_id, context):
         calculated_text = package["summary_text"]
         reports = [asset for asset in generated_assets if asset.get("asset_type") == "informe_pdf"]
         for report in reports:
+            is_ndvi_report = "ndvi" in str(report.get("file_name") or "").lower()
             with Path(report["path"]).open("rb") as report_file:
                 await context.bot.send_document(
                     chat_id=chat_id,
                     document=report_file,
                     filename=report["file_name"],
                     caption=(
-                        "Informe topografico profesional listo. Incluye elevacion, pendientes, cuencas, "
-                        "vias de escurrimiento, alternativas, economia y limitaciones."
+                        "Informe NDVI multianual por lote listo. Incluye forestaciones separadas, "
+                        "estabilidad, cambio reciente, ranking y limitaciones."
+                        if is_ndvi_report
+                        else "Informe topografico profesional listo. Incluye elevacion, pendientes, "
+                        "cuencas, vias de escurrimiento, alternativas, economia y limitaciones."
                     ),
                 )
         await context.bot.send_message(

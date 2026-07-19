@@ -124,18 +124,20 @@ Las notas simples de seguimiento no generan una segunda aprobacion innecesaria. 
 
 ## Entrada por Telegram desde WhatsApp
 
-Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto, PDF y paquetes geoespaciales. Para Shapefile se recomienda compartir un unico ZIP que contenga `SHP`, `SHX`, `DBF` y `PRJ`, junto con el DEM GeoTIFF. Tambien admite esos componentes por separado, KML y GeoJSON. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo. En Render usa automáticamente un webhook basado en `RENDER_EXTERNAL_HOSTNAME`, de modo que un mensaje de Telegram puede despertar una instancia gratuita. Fuera de Render conserva polling para desarrollo local; `TELEGRAM_WEBHOOK_URL` permite indicar manualmente el origen HTTPS si el proveedor no expone esa variable.
+Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto, PDF y paquetes geoespaciales. Para Shapefile se recomienda compartir un unico ZIP que contenga `SHP`, `SHX`, `DBF` y `PRJ`. El atributo `Name` o `Nombre` identifica cada lote; los nombres Forestal, Monte, Eucalipto o Pino se separan del ranking pastoril. Para un informe equivalente al de Don Policarpo, el ZIP puede incluir ademas un DEM GeoTIFF y un segundo Shapefile de suelos con el atributo `UC` o `Unidad` y `Aptitud` de 0 a 100. UC 40, UC 9 y UC 37 conservan las aptitudes de la referencia; cualquier otra unidad necesita `Aptitud` o una equivalencia explícita en `SOIL_APTITUDE_MAP_JSON`. Tambien admite esos componentes por separado, KML y GeoJSON. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo. En Render usa automáticamente un webhook basado en `RENDER_EXTERNAL_HOSTNAME`, de modo que un mensaje de Telegram puede despertar una instancia gratuita. Fuera de Render conserva polling para desarrollo local; `TELEGRAM_WEBHOOK_URL` permite indicar manualmente el origen HTTPS si el proveedor no expone esa variable.
 
-Los documentos de un mismo envio geoespacial se agrupan antes de crear el trabajo. El DEM se procesa localmente con Rasterio/Numpy para obtener cotas, relieve, pendientes porcentuales, cuencas, vias potenciales de escurrimiento y candidatos topograficos. El motor genera y devuelve por Telegram un PDF A4 de diez paginas con mapas, tablas, alternativas tecnicas/economicas, acciones y limitaciones, firmado por Lucas Estecho. Nunca se manda el TIFF a OpenAI como si fuera una foto. Si el pedido incluye NDVI y hay un perimetro KML, GeoJSON o Shapefile, el backend puede solicitar y calcular un mosaico Sentinel-2 L2A mediante Copernicus Data Space:
+Los documentos de un mismo envio geoespacial se agrupan antes de crear el trabajo. El DEM se procesa localmente con Rasterio/Numpy para obtener cotas, relieve, pendientes porcentuales, cuencas, vias potenciales de escurrimiento y candidatos topograficos. El motor topografico genera un PDF A4 de diez paginas. Si el pedido dice `hacer informe NDVI multianual por lote`, descarga para cada año el P90 temporal Sentinel-2 L2A del mismo corte estacional, calcula la mediana multianual estable, cambio reciente, percentiles, estabilidad y ambientes por lote, y devuelve otro PDF profesional de ocho paginas. Con suelo calcula 65% respuesta satelital + 35% aptitud edafica; sin suelo declara que el ranking es solo satelital. Nunca manda un TIFF a OpenAI como si fuera una foto.
 
 ```text
 CDSE_CLIENT_ID
 CDSE_CLIENT_SECRET
-CDSE_NDVI_LOOKBACK_DAYS=45
-CDSE_MAX_CLOUD_PERCENT=30
+CDSE_NDVI_YEARS=9
+CDSE_NDVI_WIDTH=768
+CDSE_NDVI_HEIGHT=768
+CDSE_MAX_CLOUD_PERCENT=60
 ```
 
-Sin credenciales CDSE, el analisis topografico del DEM se completa igual y el resultado indica de forma explicita que el NDVI no pudo descargarse. Los puntos altos y bajos son candidatos para inspeccion, no un proyecto ejecutivo: deben cruzarse con fuente, demanda, potreros, accesos, suelo, anegamiento y cotas verificadas.
+Sin credenciales CDSE, no se inventa un NDVI. El analisis topografico del DEM puede completarse igual y el resultado indica el faltante. El NDVI es un indice relativo y no equivale a kg MS/ha: debe calibrarse con aforos y recorridas.
 
 Solo se atiende el chat configurado en `MY_CHAT_ID`. El handler nuevo no depende de Google Sheets ni de Google Drive.
 
