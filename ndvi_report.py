@@ -238,6 +238,42 @@ def _save_stable_map(analysis, output_path):
     plt.close(fig)
 
 
+def _save_zoning_map(analysis, output_path):
+    from matplotlib.colors import BoundaryNorm, ListedColormap
+    from matplotlib.patches import Patch
+
+    zoning = analysis["zoning"]
+    stable = analysis["stable_ndvi"]
+    values = np.ma.masked_invalid(np.asarray(zoning["_zone_values"], dtype="float64"))
+    bounds = stable["_bounds"]
+    extent = [bounds[0], bounds[2], bounds[1], bounds[3]]
+    cmap = ListedColormap(["#c94f38", "#e9c46a", "#2c7a3f"])
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
+    fig, ax = plt.subplots(figsize=(9.4, 5.0), dpi=170)
+    ax.imshow(values, extent=extent, origin="upper", cmap=cmap, norm=norm)
+    for row in analysis["lot_rows"]:
+        for ring in _rings(row["_geometry_raster"]):
+            xs, ys = zip(*[(point[0], point[1]) for point in ring])
+            ax.plot(xs, ys, color="#24362b", linewidth=0.8)
+    by_code = {row["code"]: row for row in zoning["rows"]}
+    handles = [
+        Patch(
+            facecolor=color,
+            label=f"{by_code[code]['name']}: {by_code[code]['area_ha']:.0f} ha ({by_code[code]['pct']:.0f}%)",
+        )
+        for code, color in ((2, "#2c7a3f"), (1, "#e9c46a"), (0, "#c94f38"))
+        if code in by_code
+    ]
+    ax.legend(handles=handles, loc="lower right", fontsize=6.5, framealpha=0.9)
+    ax.set_title("Ambientación por NDVI estable multianual", color="#174d2d", fontweight="bold")
+    ax.set_xlabel("Coordenada X")
+    ax.set_ylabel("Coordenada Y")
+    ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout()
+    fig.savefig(output_path, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+
+
 def _save_forest_chart(rows, output_path):
     names = [row["name"] for row in rows][::-1]
     means = [row["ndvi_mean"] for row in rows][::-1]
@@ -325,8 +361,12 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
         potential_map = temp / "potential.png"
         potential_rank = temp / "rank.png"
         change_chart = temp / "change.png"
+        zoning = analysis.get("zoning")
+        zoning_map = temp / "zoning.png"
         _save_use_map(lot_rows, use_map)
         _save_stable_map(analysis, stable_map)
+        if zoning:
+            _save_zoning_map(analysis, zoning_map)
         if forests:
             _save_forest_chart(forests, forest_chart)
         if pasture:
@@ -382,15 +422,31 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
             "separan porque su NDVI representa principalmente vigor de copa y no disponibilidad de pasto.",
             LEFT, PAGE_H - 178, width=CONTENT_W, size=9.2, leading=12,
         )
-        y = _bullets(pdf, [
-            (
-                f"Mejor potencial integrado relativo: {top}." if integrated
-                else f"Mejor respuesta satelital relativa: {top}."
-            ),
-            f"Lotes para diagnóstico prioritario dentro del establecimiento: {low}.",
-            "El ranking es relativo al campo y no equivale a kg de materia seca por hectárea.",
-            "La conversión a oferta forrajera exige aforos de campo y fechas comparables.",
-        ], LEFT, y - 5, width=CONTENT_W, size=8.8, leading=11.5)
+        if zoning:
+            zones_by_code = {row["code"]: row for row in zoning["rows"]}
+            summary_bullets = [
+                "El plano contiene un solo polígono: en lugar de un ranking entre lotes, "
+                "el campo se ambientó por NDVI estable en tres zonas relativas.",
+                "Ambiente alto: {alto:.0f} ha ({alto_pct:.0f}%). Medio: {medio:.0f} ha ({medio_pct:.0f}%). "
+                "Bajo: {bajo:.0f} ha ({bajo_pct:.0f}%).".format(
+                    alto=zones_by_code[2]["area_ha"], alto_pct=zones_by_code[2]["pct"],
+                    medio=zones_by_code[1]["area_ha"], medio_pct=zones_by_code[1]["pct"],
+                    bajo=zones_by_code[0]["area_ha"], bajo_pct=zones_by_code[0]["pct"],
+                ),
+                "Las zonas son relativas al propio campo y no equivalen a kg de materia seca por hectárea.",
+                "La conversión a oferta forrajera exige aforos de campo y fechas comparables.",
+            ]
+        else:
+            summary_bullets = [
+                (
+                    f"Mejor potencial integrado relativo: {top}." if integrated
+                    else f"Mejor respuesta satelital relativa: {top}."
+                ),
+                f"Lotes para diagnóstico prioritario dentro del establecimiento: {low}.",
+                "El ranking es relativo al campo y no equivale a kg de materia seca por hectárea.",
+                "La conversión a oferta forrajera exige aforos de campo y fechas comparables.",
+            ]
+        y = _bullets(pdf, summary_bullets, LEFT, y - 5, width=CONTENT_W, size=8.8, leading=11.5)
         _box(pdf, analysis["score_method"], LEFT, y - 4, CONTENT_W, bold=True)
         _text(
             pdf,
@@ -439,43 +495,70 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
                    "Las zonas rojas y amarillas son brechas relativas que deben cruzarse con suelo, manejo, agua y recorridas.", LEFT, 58, size=8.4)
         pdf.showPage()
 
-        # 5. Ranking
+        # 5. Ranking (o ambientacion si hay un solo poligono)
         _header_footer(pdf, 5, field_name, logo_path)
-        ranking_title = (
-            "4. Potencial pastoril integrado" if analysis.get("has_soil")
-            else "4. Potencial satelital relativo"
-        )
-        y = _title(pdf, ranking_title)
-        y = _text(
-            pdf,
-            "El mapa y el ranking excluyen forestaciones. Alto, Medio y Bajo son clases relativas "
-            "a este establecimiento.", LEFT, y, size=8.6
-        )
-        if pasture:
-            _draw_image(pdf, potential_map, LEFT, y - 4, 365, 340)
-            _draw_image(pdf, potential_rank, LEFT + 385, y - 4, 365, 340)
-            classes = {name: [row["name"] for row in pasture if row.get("potential_class") == name] for name in ("Alto", "Medio", "Bajo")}
-            _text(
+        if zoning:
+            y = _title(pdf, "4. Ambientación intracampo por NDVI estable")
+            y = _text(
                 pdf,
-                "Clase alta: " + ", ".join(classes["Alto"]) + ". Clase media: "
-                + ", ".join(classes["Medio"]) + ". Clase baja: "
-                + ", ".join(classes["Bajo"]) + ".",
-                LEFT, 103, width=CONTENT_W, size=8.2, leading=10.5
+                "Con un único polígono no existe ranking entre lotes. Las zonas alta, media y baja "
+                "son terciles del NDVI estable del propio campo y sirven para dirigir recorridas y aforos.",
+                LEFT, y, size=8.6,
             )
-        ranking_note = (
-            "Índice integrado como en el informe de referencia: 65% respuesta satelital y 35% "
-            "aptitud edáfica relativa. Sigue siendo un ranking del campo y debe calibrarse con aforos."
-            if analysis.get("has_soil") else
-            (
-                "La capa de suelos fue reconocida, pero faltan aptitudes válidas para cubrir todos "
-                "los lotes. No se fuerza el 65/35: el ranking queda exclusivamente satelital."
-                if analysis.get("soil_layer_present") else
-                "Sin una capa de suelos no se calcula el índice pastoril integrado 65/35 del informe "
-                "Don Policarpo. Este ranking es exclusivamente satelital y debe calibrarse con aforos."
+            _draw_image(pdf, zoning_map, LEFT, y - 4, 420, 340)
+            zone_table = [["Zona", "ha", "%", "NDVI medio", "NDVI mín.", "NDVI máx."]]
+            for row in zoning["rows"]:
+                zone_table.append([
+                    row["name"], _fmt(row["area_ha"]), _fmt(row["pct"]),
+                    _fmt(row["ndvi_mean"], 3), _fmt(row["ndvi_min"], 3), _fmt(row["ndvi_max"], 3),
+                ])
+            _table(pdf, zone_table, [80, 44, 34, 56, 52, 52], LEFT + 430, y - 14,
+                   row_height=22, font_size=6.9)
+            thresholds = zoning["thresholds"]
+            _box(
+                pdf,
+                "Cortes de zona: NDVI < {bajo:.3f} (bajo), {bajo:.3f}-{alto:.3f} (medio), "
+                "> {alto:.3f} (alto). Zonas relativas a este campo: verificar con suelo, agua, "
+                "piso y manejo antes de decidir.".format(bajo=thresholds[0], alto=thresholds[1]),
+                LEFT, 76, CONTENT_W - 75,
             )
-        )
-        _box(pdf, ranking_note, LEFT, 76, CONTENT_W - 75)
-        pdf.showPage()
+            pdf.showPage()
+        else:
+            ranking_title = (
+                "4. Potencial pastoril integrado" if analysis.get("has_soil")
+                else "4. Potencial satelital relativo"
+            )
+            y = _title(pdf, ranking_title)
+            y = _text(
+                pdf,
+                "El mapa y el ranking excluyen forestaciones. Alto, Medio y Bajo son clases relativas "
+                "a este establecimiento.", LEFT, y, size=8.6
+            )
+            if pasture:
+                _draw_image(pdf, potential_map, LEFT, y - 4, 365, 340)
+                _draw_image(pdf, potential_rank, LEFT + 385, y - 4, 365, 340)
+                classes = {name: [row["name"] for row in pasture if row.get("potential_class") == name] for name in ("Alto", "Medio", "Bajo")}
+                _text(
+                    pdf,
+                    "Clase alta: " + ", ".join(classes["Alto"]) + ". Clase media: "
+                    + ", ".join(classes["Medio"]) + ". Clase baja: "
+                    + ", ".join(classes["Bajo"]) + ".",
+                    LEFT, 103, width=CONTENT_W, size=8.2, leading=10.5
+                )
+            ranking_note = (
+                "Índice integrado como en el informe de referencia: 65% respuesta satelital y 35% "
+                "aptitud edáfica relativa. Sigue siendo un ranking del campo y debe calibrarse con aforos."
+                if analysis.get("has_soil") else
+                (
+                    "La capa de suelos fue reconocida, pero faltan aptitudes válidas para cubrir todos "
+                    "los lotes. No se fuerza el 65/35: el ranking queda exclusivamente satelital."
+                    if analysis.get("soil_layer_present") else
+                    "Sin una capa de suelos no se calcula el índice pastoril integrado 65/35 del informe "
+                    "Don Policarpo. Este ranking es exclusivamente satelital y debe calibrarse con aforos."
+                )
+            )
+            _box(pdf, ranking_note, LEFT, 76, CONTENT_W - 75)
+            pdf.showPage()
 
         # 6. Tabla detallada
         _header_footer(pdf, 6, field_name, logo_path)
@@ -583,7 +666,12 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
         recommendations = [
             "Separar siempre forestación y pastura: el NDVI de copa no estima carga ni producción de pasto.",
             "Calibrar el índice con aforos de kg MS/ha en lotes altos, medios y bajos durante la misma semana del satélite.",
-            "Recorrer primero los cambios negativos: " + (", ".join(declining) if declining else "sin datos suficientes") + ".",
+            (
+                "Recorrer primero el ambiente bajo de la ambientación para separar limitaciones de "
+                "suelo, agua, fertilidad o manejo."
+                if zoning else
+                "Recorrer primero los cambios negativos: " + (", ".join(declining) if declining else "sin datos suficientes") + "."
+            ),
             "Cruzar el ranking con suelos, fertilidad, descansos, distribución del pastoreo, agua y accesibilidad.",
             "Repetir la comparación con el mismo corte estacional; no comparar un año completo contra un año parcial.",
         ]
