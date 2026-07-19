@@ -279,6 +279,50 @@ create table if not exists public.client_facts (
 create index if not exists client_facts_client_name_idx on public.client_facts (client_name);
 create index if not exists client_facts_category_idx on public.client_facts (category);
 
+create table if not exists public.crop_lots (
+  id text primary key,
+  client_id text,
+  client_name text,
+  campo text,
+  lote text,
+  cultivo text,
+  campania text,
+  superficie_ha double precision,
+  fecha_siembra date,
+  estado text,
+  event_id text,
+  source_quote text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create index if not exists crop_lots_client_name_idx on public.crop_lots (client_name);
+
+create table if not exists public.crop_events (
+  id text primary key,
+  client_id text,
+  client_name text,
+  lote text,
+  cultivo text,
+  campania text,
+  tipo text,
+  fecha date,
+  descripcion text,
+  costo_monto double precision,
+  costo_moneda text,
+  rinde double precision,
+  rinde_unidad text,
+  precio_monto double precision,
+  precio_moneda text,
+  superficie_ha double precision,
+  event_id text,
+  source_quote text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create index if not exists crop_events_client_name_idx on public.crop_events (client_name);
+
 create table if not exists public.intake_assets (
   id text primary key,
   event_id text,
