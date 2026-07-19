@@ -41,6 +41,7 @@ CAPATAZ_TABLES = {
     "decisions": ["id", "event_id", "client_id", "client_name", "topic", "agents", "summary", "technical_basis", "economic_summary", "recommendation", "risks", "missing_data", "next_actions", "confidence", "status", "created_at", "updated_at"],
     "push_subscriptions": ["id", "endpoint", "subscription", "active", "last_success_at", "last_error", "created_at", "updated_at"],
     "email_drafts": ["id", "event_id", "client_id", "client_name", "to_email", "subject", "body_text", "status", "gmail_draft_id", "gmail_message_id", "error", "created_at", "updated_at"],
+    "client_facts": ["id", "client_id", "client_name", "category", "variable", "value_number", "value_text", "unit", "fact_date", "event_id", "source_quote", "created_at", "updated_at"],
     "intake_assets": ["id", "event_id", "client_id", "client_name", "source", "asset_type", "file_name", "content_type", "transcript_text", "storage_status", "storage_provider", "storage_path", "storage_public_url", "storage_error", "created_at", "updated_at"],
 }
 

@@ -463,6 +463,21 @@ Salidas: {json.dumps(worker_payload, ensure_ascii=False)}
 
     def process_event(self, event, draft, source_text=""):
         context = {"event": event, "draft": draft or {}, "source_text": source_text or ""}
+        try:
+            # Ficha del cliente: datos concretos con cita textual; nunca inventa.
+            from client_profile import extract_client_facts, save_client_facts
+
+            save_client_facts(
+                self.store,
+                extract_client_facts(
+                    event,
+                    source_text,
+                    openai_client=self.openai_client,
+                    completion_request=self._completion_request,
+                ),
+            )
+        except Exception:
+            pass  # la ficha es acumulativa: si falla hoy, se completa con el proximo evento
         selected = self.route(draft, source_text=source_text)
         existing_decisions, decision_source, decision_warning = self.store.list_rows(
             "decisions",
