@@ -1,12 +1,13 @@
 """Generador de PDF/DOCX para trabajos profesionales de la cuadrilla.
 
-La redaccion con IA es opcional. El catalogo, la validacion, el armado de los
-archivos y el modo de falla son deterministas: si no hay datos suficientes se
-entrega un anteproyecto con pendientes, nunca numeros inventados.
+La redaccion final requiere un modelo configurado y falla de manera visible si
+ese modelo no responde. Los tests pueden habilitar expresamente el borrador
+determinista, pero produccion nunca lo presenta como un informe terminado.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -16,7 +17,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import reportlab
 from capataz import extract_json_object
+from document_intake import extract_docx_embedded_images
 from report_playbooks import ReportPlaybook, detect_report_playbook, playbook_prompt
 
 from docx import Document
@@ -32,6 +35,8 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     Image,
     KeepTogether,
@@ -62,6 +67,7 @@ class GeneratedConsultingReport:
     pdf_path: str
     docx_path: str
     missing_data: tuple[str, ...]
+    model: str
 
 
 def _clean_text(value: Any, limit: int = 8000) -> str:
@@ -89,6 +95,28 @@ def _safe_filename(value: str, fallback: str = "Informe") -> str:
     )
     text = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
     return (text or fallback)[:90]
+
+
+def _materialize_docx_figures(assets: list[dict], root: Path) -> list[dict]:
+    figures = []
+    figure_dir = root / "figuras_fuente"
+    for asset in assets:
+        asset_path = Path(str(asset.get("path") or ""))
+        if asset_path.suffix.lower() != ".docx" or not asset_path.exists():
+            continue
+        for embedded in extract_docx_embedded_images(asset_path):
+            figure_dir.mkdir(parents=True, exist_ok=True)
+            suffix = Path(embedded["name"]).suffix or ".png"
+            output_path = figure_dir / f"figura_{len(figures) + 1:02d}{suffix.lower()}"
+            output_path.write_bytes(embedded["data"])
+            figures.append({
+                "path": str(output_path),
+                "caption": (
+                    f"Figura {len(figures) + 1}. Imagen incorporada en "
+                    f"{asset.get('file_name') or asset_path.name}."
+                ),
+            })
+    return figures
 
 
 def _run_outputs(crew_result: dict) -> list[dict]:
@@ -225,11 +253,11 @@ def _normalize_payload(data: Any, fallback: dict, playbook: ReportPlaybook) -> d
             (section for key, section in section_by_key.items() if required.lower() == key),
             None,
         )
-        ordered_sections.append(matched or {
-            "title": required,
-            "paragraphs": ["No hay datos suficientes para completar esta seccion."],
-            "bullets": [],
-        })
+        fallback_section = next(
+            (section for section in fallback["sections"] if section["title"].lower() == required.lower()),
+            {"title": required, "paragraphs": [], "bullets": []},
+        )
+        ordered_sections.append(matched or fallback_section)
     calculations = []
     for raw in data.get("calculations") or []:
         normalized = _normalize_calculation(raw)
@@ -263,11 +291,18 @@ def _generate_payload(
     source_text: str,
     assets: list[dict],
     openai_client=None,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-5.6-sol",
+    reasoning_effort: str = "high",
+    allow_fallback: bool = False,
 ) -> dict:
     fallback = _fallback_payload(playbook, event, draft, crew_result, source_text, assets)
     if openai_client is None:
-        return fallback
+        if allow_fallback:
+            return fallback
+        raise RuntimeError(
+            "No se genero el informe: falta un cliente OpenAI activo. "
+            "Verifica OPENAI_API_KEY y CAPATAZ_REPORT_MODEL."
+        )
     evidence = {
         "cliente": event.get("client_name"),
         "campo": draft.get("field_name"),
@@ -289,6 +324,9 @@ Entre Rios, Argentina. Debes preparar el contenido de un entregable profesional.
 
 REGLAS DE REDACCION Y VERIFICACION:
 - Usa solo la evidencia incluida abajo. No completes huecos con conocimiento general.
+- Conserva todo el contenido material de las notas; mejora la redaccion y la estructura sin sustituirlo por relleno generico.
+- Los segmentos entre [APORTE DE LUCAS - RESALTADO AMARILLO] y [/APORTE DE LUCAS] fueron agregados por Lucas: identificalos explicitamente como aportes de Lucas. El resto proviene del registro original.
+- Las imagenes adjuntas son evidencia del documento fuente. Interpreta solo lo que sea legible y no inventes valores ocultos.
 - Todo numero debe conservar unidad y fuente. No inventes precios, superficies, fechas ni mediciones.
 - Un calculo con datos insuficientes queda status "pendiente", sin resultado supuesto.
 - Distingui claramente medido/provisto, calculado, inferido y pendiente.
@@ -318,19 +356,41 @@ Responde SOLO JSON puro con esta forma:
 EVIDENCIA:
 {json.dumps(evidence, ensure_ascii=False)}
 """.strip()
+    content: str | list[dict] = prompt
+    image_parts = []
+    for asset in assets:
+        asset_path = Path(str(asset.get("path") or ""))
+        if asset_path.suffix.lower() != ".docx" or not asset_path.exists():
+            continue
+        for embedded in extract_docx_embedded_images(asset_path):
+            encoded = base64.b64encode(embedded["data"]).decode("ascii")
+            image_parts.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{embedded['mime_type']};base64,{encoded}",
+                    "detail": "high",
+                },
+            })
+    if image_parts:
+        content = [{"type": "text", "text": prompt}, *image_parts]
     try:
-        response = openai_client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
+        request = {"model": model, "messages": [{"role": "user", "content": content}]}
+        if str(model).startswith("gpt-5.6"):
+            request["reasoning_effort"] = reasoning_effort
+        else:
+            request["temperature"] = 0
+        response = openai_client.chat.completions.create(**request)
         return _normalize_payload(
             extract_json_object(response.choices[0].message.content),
             fallback,
             playbook,
         )
-    except Exception:
-        return fallback
+    except Exception as exc:
+        if allow_fallback:
+            return fallback
+        raise RuntimeError(
+            f"No se genero el informe: el modelo {model} fallo: {str(exc)[:500]}"
+        ) from exc
 
 
 def _shade_cell(cell, fill: str) -> None:
@@ -510,6 +570,22 @@ def create_consulting_docx(payload: dict, output_path: str, *, event: dict, play
         for bullet in section["bullets"]:
             document.add_paragraph(bullet, style="List Bullet")
 
+    if payload.get("figures"):
+        document.add_heading("Figuras del documento fuente", level=1)
+        for figure in payload["figures"]:
+            figure_path = Path(figure["path"])
+            if not figure_path.exists():
+                continue
+            paragraph = document.add_paragraph()
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.add_run().add_picture(str(figure_path), width=Inches(6.0))
+            caption = document.add_paragraph(figure["caption"])
+            caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in caption.runs:
+                run.italic = True
+                run.font.size = Pt(9)
+                run.font.color.rgb = RGBColor.from_string(MUTED)
+
     if payload["calculations"]:
         document.add_heading("Registro de calculos auditables", level=1)
         table = document.add_table(rows=1, cols=4)
@@ -552,40 +628,60 @@ def create_consulting_docx(payload: dict, output_path: str, *, event: dict, play
     return output_path
 
 
+def _register_pdf_fonts() -> tuple[str, str]:
+    regular = "CapatazSans"
+    bold = "CapatazSans-Bold"
+    if regular not in pdfmetrics.getRegisteredFontNames():
+        fonts = Path(reportlab.__file__).parent / "fonts"
+        pdfmetrics.registerFont(TTFont(regular, str(fonts / "Vera.ttf")))
+        pdfmetrics.registerFont(TTFont(bold, str(fonts / "VeraBd.ttf")))
+        pdfmetrics.registerFont(TTFont("CapatazSans-Italic", str(fonts / "VeraIt.ttf")))
+        pdfmetrics.registerFont(TTFont("CapatazSans-BoldItalic", str(fonts / "VeraBI.ttf")))
+        pdfmetrics.registerFontFamily(
+            regular,
+            normal=regular,
+            bold=bold,
+            italic="CapatazSans-Italic",
+            boldItalic="CapatazSans-BoldItalic",
+        )
+    return regular, bold
+
+
 def _pdf_styles():
+    regular, bold = _register_pdf_fonts()
     styles = getSampleStyleSheet()
     return {
         "title": ParagraphStyle(
-            "CapatazTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+            "CapatazTitle", parent=styles["Title"], fontName=bold,
             fontSize=25, leading=29, textColor=colors.HexColor("#" + GREEN),
             alignment=TA_CENTER, spaceAfter=10,
         ),
         "subtitle": ParagraphStyle(
-            "CapatazSubtitle", parent=styles["Normal"], fontName="Helvetica",
+            "CapatazSubtitle", parent=styles["Normal"], fontName=regular,
             fontSize=12, leading=16, textColor=colors.HexColor("#" + MUTED),
             alignment=TA_CENTER, spaceAfter=18,
         ),
         "h1": ParagraphStyle(
-            "CapatazH1", parent=styles["Heading1"], fontName="Helvetica-Bold",
+            "CapatazH1", parent=styles["Heading1"], fontName=bold,
             fontSize=15, leading=18, textColor=colors.HexColor("#" + GREEN),
             spaceBefore=12, spaceAfter=8, keepWithNext=True,
         ),
         "body": ParagraphStyle(
-            "CapatazBody", parent=styles["BodyText"], fontName="Helvetica",
+            "CapatazBody", parent=styles["BodyText"], fontName=regular,
             fontSize=9.5, leading=13.2, textColor=colors.HexColor("#" + INK),
             spaceAfter=6,
         ),
         "bullet": ParagraphStyle(
-            "CapatazBullet", parent=styles["BodyText"], fontName="Helvetica",
+            "CapatazBullet", parent=styles["BodyText"], fontName=regular,
             fontSize=9.3, leading=12.5, leftIndent=13, firstLineIndent=-7,
             bulletIndent=5, spaceAfter=4, textColor=colors.HexColor("#" + INK),
         ),
         "small": ParagraphStyle(
-            "CapatazSmall", parent=styles["BodyText"], fontName="Helvetica",
+            "CapatazSmall", parent=styles["BodyText"], fontName=regular,
             fontSize=7.5, leading=9.5, textColor=colors.HexColor("#" + MUTED),
         ),
         "callout_label": ParagraphStyle(
-            "CapatazCalloutLabel", parent=styles["BodyText"], fontName="Helvetica-Bold",
+            "CapatazCalloutLabel", parent=styles["BodyText"], fontName=bold,
             fontSize=8, leading=10, textColor=colors.HexColor("#" + GREEN),
             spaceAfter=3,
         ),
@@ -593,17 +689,18 @@ def _pdf_styles():
 
 
 def _pdf_header_footer(canvas, doc, *, logo_path: str | None, report_title: str) -> None:
+    regular, bold = _register_pdf_fonts()
     canvas.saveState()
     width, height = A4
     if logo_path and Path(logo_path).exists():
         canvas.drawImage(str(logo_path), 1.45 * cm, height - 1.35 * cm, width=0.65 * cm,
                          height=0.65 * cm, preserveAspectRatio=True, mask="auto")
-    canvas.setFont("Helvetica-Bold", 8)
+    canvas.setFont(bold, 8)
     canvas.setFillColor(colors.HexColor("#" + GREEN))
     canvas.drawString(2.25 * cm, height - 1.05 * cm, "LUCAS ESTECHO · INGENIERO AGRONOMO")
     canvas.setStrokeColor(colors.HexColor("#C7D8D1"))
     canvas.line(1.45 * cm, height - 1.48 * cm, width - 1.45 * cm, height - 1.48 * cm)
-    canvas.setFont("Helvetica", 7.5)
+    canvas.setFont(regular, 7.5)
     canvas.setFillColor(colors.HexColor("#" + MUTED))
     canvas.drawString(1.45 * cm, 0.72 * cm, "Pasto · Agua · Ganaderia rentable · M.P. 2009 LE")
     canvas.drawRightString(width - 1.45 * cm, 0.72 * cm, f"Pagina {doc.page}")
@@ -629,6 +726,7 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
                           logo_path: str | None = None) -> str:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     styles = _pdf_styles()
+    regular, bold = _register_pdf_fonts()
     doc = SimpleDocTemplate(
         output_path, pagesize=A4, rightMargin=1.55 * cm, leftMargin=1.55 * cm,
         topMargin=1.8 * cm, bottomMargin=1.35 * cm,
@@ -653,8 +751,8 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
     meta.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#D2DDD8")),
         ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#" + LIGHT)),
-        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTNAME", (1, 0), (1, -1), "Helvetica"),
+        ("FONTNAME", (0, 0), (0, -1), bold),
+        ("FONTNAME", (1, 0), (1, -1), regular),
         ("FONTSIZE", (0, 0), (-1, -1), 8.5),
         ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#" + INK)),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -677,6 +775,22 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
         for value in section["bullets"]:
             story.append(Paragraph("• " + value, styles["bullet"]))
 
+    if payload.get("figures"):
+        story.append(Paragraph("Figuras del documento fuente", styles["h1"]))
+        for figure in payload["figures"]:
+            figure_path = Path(figure["path"])
+            if not figure_path.exists():
+                continue
+            image = Image(str(figure_path))
+            image._restrictSize(16 * cm, 10 * cm)
+            image.hAlign = "CENTER"
+            story.extend([
+                image,
+                Spacer(1, 0.12 * cm),
+                Paragraph(figure["caption"], styles["small"]),
+                Spacer(1, 0.3 * cm),
+            ])
+
     if payload["calculations"]:
         story.append(Paragraph("Registro de calculos auditables", styles["h1"]))
         rows = [[
@@ -694,7 +808,7 @@ def create_consulting_pdf(payload: dict, output_path: str, *, event: dict, playb
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#" + GREEN)),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 0), (-1, 0), bold),
             ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#CBD8D2")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
@@ -736,10 +850,13 @@ def generate_consulting_report(
     logo_path: str | None = None,
     openai_client=None,
     model: str | None = None,
+    reasoning_effort: str | None = None,
+    allow_fallback: bool = False,
 ) -> GeneratedConsultingReport | None:
     playbook = detect_report_playbook(source_text or draft.get("summary") or "")
     if playbook is None:
         return None
+    selected_model = model or os.environ.get("CAPATAZ_REPORT_MODEL", "gpt-5.6-sol")
     payload = _generate_payload(
         playbook,
         event,
@@ -748,10 +865,13 @@ def generate_consulting_report(
         source_text,
         list(assets or []),
         openai_client=openai_client,
-        model=model or os.environ.get("CAPATAZ_AGENT_MODEL", "gpt-4o-mini"),
+        model=selected_model,
+        reasoning_effort=reasoning_effort or os.environ.get("CAPATAZ_REPORT_REASONING", "high"),
+        allow_fallback=allow_fallback,
     )
     root = Path(output_dir) / str(event.get("id") or "sin-evento")
     root.mkdir(parents=True, exist_ok=True)
+    payload["figures"] = _materialize_docx_figures(list(assets or []), root)
     stamp = datetime.now().strftime("%Y-%m-%d")
     base = _safe_filename(f"{playbook.title}_{event.get('client_name') or draft.get('field_name') or ''}_{stamp}")
     pdf_path = root / f"{base}.pdf"
@@ -765,4 +885,5 @@ def generate_consulting_report(
         pdf_path=str(pdf_path),
         docx_path=str(docx_path),
         missing_data=tuple(payload["missing_data"]),
+        model=selected_model,
     )

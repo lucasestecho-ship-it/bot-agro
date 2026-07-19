@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import csv
+import mimetypes
 import re
 from pathlib import Path
+from zipfile import BadZipFile, ZipFile
 
 from docx import Document
+from docx.enum.text import WD_COLOR_INDEX
 
 try:
     from openpyxl import load_workbook
@@ -14,18 +17,90 @@ except ImportError:
     load_workbook = None
 
 
+LUCAS_HIGHLIGHT_START = "[APORTE DE LUCAS - RESALTADO AMARILLO]"
+LUCAS_HIGHLIGHT_END = "[/APORTE DE LUCAS]"
+
+
+def _docx_paragraph_text(paragraph):
+    """Preserve yellow authorship instead of flattening every DOCX run."""
+    chunks = []
+    yellow_open = False
+    has_drawing = False
+    for run in paragraph.runs:
+        highlighted = run.font.highlight_color == WD_COLOR_INDEX.YELLOW
+        if highlighted and not yellow_open:
+            chunks.append(LUCAS_HIGHLIGHT_START)
+            yellow_open = True
+        elif yellow_open and not highlighted:
+            chunks.append(LUCAS_HIGHLIGHT_END)
+            yellow_open = False
+        if run.text:
+            chunks.append(run.text)
+        if run._element.xpath(".//a:blip"):
+            has_drawing = True
+    if yellow_open:
+        chunks.append(LUCAS_HIGHLIGHT_END)
+    text = "".join(chunks).strip()
+    if has_drawing:
+        text = "\n".join(value for value in (text, "[IMAGEN INCORPORADA EN EL DOCUMENTO]") if value)
+    return text
+
+
+def extract_docx_embedded_images(file_path, max_images=6, max_bytes=5_000_000):
+    """Return bounded DOCX images for visual grounding and final-report figures."""
+    result = []
+    try:
+        with ZipFile(file_path) as archive:
+            names = sorted(
+                name for name in archive.namelist()
+                if name.startswith("word/media/") and not name.endswith("/")
+            )
+            for name in names:
+                if len(result) >= max_images:
+                    break
+                mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+                if not mime_type.startswith("image/"):
+                    continue
+                info = archive.getinfo(name)
+                if info.file_size <= 0 or info.file_size > max_bytes:
+                    continue
+                result.append({
+                    "name": Path(name).name,
+                    "mime_type": mime_type,
+                    "data": archive.read(name),
+                })
+    except (BadZipFile, KeyError, OSError):
+        return []
+    return result
+
+
 def extract_office_document(file_path, file_name=""):
     """Extract auditable text from DOCX/XLSX/CSV/TXT without model guesses."""
     suffix = Path(file_name or file_path).suffix.lower()
     if suffix == ".docx":
         document = Document(file_path)
-        blocks = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+        blocks = []
+        for paragraph in document.paragraphs:
+            text = _docx_paragraph_text(paragraph)
+            if text:
+                blocks.append(text)
         for table_index, table in enumerate(document.tables, 1):
             blocks.append(f"--- Tabla {table_index} ---")
             for row in table.rows:
-                values = [re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells]
+                values = []
+                for cell in row.cells:
+                    paragraph_values = []
+                    for paragraph in cell.paragraphs:
+                        paragraph_text = _docx_paragraph_text(paragraph)
+                        if paragraph_text:
+                            paragraph_values.append(paragraph_text)
+                    cell_text = " ".join(paragraph_values)
+                    values.append(re.sub(r"\s+", " ", cell_text).strip())
                 if any(values):
                     blocks.append(" | ".join(values))
+        image_count = len(extract_docx_embedded_images(file_path))
+        if image_count:
+            blocks.append(f"[IMAGENES INCORPORADAS DETECTADAS: {image_count}]")
         return "\n".join(blocks)[:100000]
     if suffix in {".xlsx", ".xlsm"}:
         if load_workbook is None:

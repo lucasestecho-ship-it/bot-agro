@@ -107,7 +107,8 @@ class EmailDraftManager:
         self.store = store
         self.gmail = gmail_service or GmailDraftService()
         self.openai_client = openai_client
-        self.model = model or os.environ.get("CAPATAZ_AGENT_MODEL", "gpt-4o-mini")
+        self.model = model or os.environ.get("CAPATAZ_AGENT_MODEL", "gpt-5.6-terra")
+        self.reasoning_effort = os.environ.get("CAPATAZ_AGENT_REASONING", "medium")
 
     def should_prepare(self, draft, source_text=""):
         if str((draft or {}).get("event_type") or "").lower() in {"presupuesto", "comercial", "respuesta"}:
@@ -188,11 +189,15 @@ Responde SOLO JSON puro:
 Contexto: {json.dumps(payload, ensure_ascii=False)}
 """.strip()
         try:
-            response = self.openai_client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
+            request = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if str(self.model).startswith("gpt-5.6"):
+                request["reasoning_effort"] = self.reasoning_effort
+            else:
+                request["temperature"] = 0.2
+            response = self.openai_client.chat.completions.create(**request)
             data = extract_json_object(response.choices[0].message.content)
             subject = str(data.get("subject") or fallback["subject"]).strip()[:240]
             body_text = str(data.get("body_text") or fallback["body_text"]).strip()[:12000]

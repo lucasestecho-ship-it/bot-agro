@@ -69,8 +69,16 @@ Opcional:
 
 ```bash
 FIELD_REPORT_MODEL=gpt-4o-mini
-CAPATAZ_AGENT_MODEL=gpt-4o-mini
+CAPATAZ_AGENT_MODEL=gpt-5.6-terra
+CAPATAZ_AGENT_REASONING=medium
+CAPATAZ_REPORT_MODEL=gpt-5.6-sol
+CAPATAZ_REPORT_REASONING=high
 ```
+
+`CAPATAZ_AGENT_MODEL` corresponde a los especialistas de trabajo diario. La redaccion final de
+los entregables profesionales usa `CAPATAZ_REPORT_MODEL`. Si ese modelo falla o no hay una clave
+OpenAI activa, Capataz bloquea el entregable e informa el error; no disfraza un texto generico como
+informe terminado.
 
 Para Gmail:
 

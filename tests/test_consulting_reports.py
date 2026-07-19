@@ -1,12 +1,35 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from agent_crew import AgentCrew
 from capataz import CapatazStore, heuristic_analysis
 from consulting_reports import generate_consulting_report
 from report_playbooks import detect_report_playbook
-from document_intake import extract_office_document
+from document_intake import (
+    LUCAS_HIGHLIGHT_END,
+    LUCAS_HIGHLIGHT_START,
+    extract_office_document,
+)
+
+
+class _FakeCompletions:
+    def __init__(self, content):
+        self.content = content
+        self.requests = []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        message = type("Message", (), {"content": self.content})()
+        choice = type("Choice", (), {"message": message})()
+        return type("Response", (), {"choices": [choice]})()
+
+
+class _FakeOpenAI:
+    def __init__(self, content):
+        self.chat = type("Chat", (), {})()
+        self.chat.completions = _FakeCompletions(content)
 
 
 class ReportPlaybookTests(unittest.TestCase):
@@ -28,6 +51,10 @@ class ReportPlaybookTests(unittest.TestCase):
         self.assertEqual(
             detect_report_playbook("Comparame estas ofertas y decime cual proveedor conviene").key,
             "comparativo_presupuestos",
+        )
+        self.assertEqual(
+            detect_report_playbook("Haceme un informe mejorando la redaccion de esta recorrida").key,
+            "informe_recorrida",
         )
 
     def test_deliverable_routes_the_complete_specialist_crew(self):
@@ -66,6 +93,26 @@ class ConsultingReportGenerationTests(unittest.TestCase):
             extracted = extract_office_document(xlsx_path, xlsx_path.name)
             self.assertIn("--- Hoja: Ofertas ---", extracted)
             self.assertIn("=B2*0.21", extracted)
+
+    def test_preserves_lucas_yellow_highlights_in_docx(self):
+        try:
+            from docx import Document
+            from docx.enum.text import WD_COLOR_INDEX
+        except ImportError:
+            self.skipTest("Dependencias de documentos no instaladas")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "recorrida.docx"
+            document = Document()
+            paragraph = document.add_paragraph()
+            paragraph.add_run("Dani registro la observacion. ")
+            lucas = paragraph.add_run("Lucas agrego el criterio tecnico.")
+            lucas.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            document.save(path)
+            extracted = extract_office_document(path, path.name)
+            self.assertIn("Dani registro la observacion", extracted)
+            self.assertIn(LUCAS_HIGHLIGHT_START, extracted)
+            self.assertIn("Lucas agrego el criterio tecnico", extracted)
+            self.assertIn(LUCAS_HIGHLIGHT_END, extracted)
 
     def test_generates_real_pdf_and_docx_and_marks_missing_data(self):
         try:
@@ -113,6 +160,7 @@ class ConsultingReportGenerationTests(unittest.TestCase):
                 assets=[],
                 output_dir=root,
                 logo_path=str(Path(__file__).parents[1] / "static" / "logo.png"),
+                allow_fallback=True,
             )
             self.assertIsNotNone(report)
             self.assertEqual(report.playbook_key, "propuesta_comercial")
@@ -129,6 +177,93 @@ class ConsultingReportGenerationTests(unittest.TestCase):
             self.assertIn("Honorarios y forma de pago", pdf_text)
             self.assertIn("Honorarios y forma de pago", docx_text)
             self.assertNotIn("$1.650.000", pdf_text)
+
+    def test_report_fails_closed_without_openai(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(RuntimeError, "falta un cliente OpenAI"):
+                generate_consulting_report(
+                    event={"id": "event-fail", "client_name": "LMM"},
+                    draft=heuristic_analysis("Hacer informe de recorrida LMM"),
+                    crew_result={"runs": [], "decision": None},
+                    source_text="Hacer informe de recorrida LMM",
+                    assets=[],
+                    output_dir=temp_dir,
+                )
+
+    def test_sol_is_used_for_final_report_with_reasoning_and_no_temperature(self):
+        response = {
+            "title": "Informe de recorrida - LMM",
+            "subtitle": "Recorrida auditada",
+            "executive_summary": "Resumen basado en la nota.",
+            "recommendation": "Validar responsables.",
+            "status": "preliminar",
+            "sections": [],
+            "calculations": [],
+            "risks": [],
+            "missing_data": ["Responsables"],
+            "sources": ["Nota de recorrida"],
+        }
+        client = _FakeOpenAI(json.dumps(response))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = generate_consulting_report(
+                event={"id": "event-sol", "client_name": "LMM"},
+                draft=heuristic_analysis("Hacer informe de recorrida LMM"),
+                crew_result={"runs": [], "decision": None},
+                source_text="Hacer informe de recorrida LMM",
+                assets=[],
+                output_dir=temp_dir,
+                openai_client=client,
+            )
+        request = client.chat.completions.requests[0]
+        self.assertEqual(report.model, "gpt-5.6-sol")
+        self.assertEqual(request["model"], "gpt-5.6-sol")
+        self.assertEqual(request["reasoning_effort"], "high")
+        self.assertNotIn("temperature", request)
+
+    def test_docx_image_is_sent_to_sol_and_kept_in_pdf_and_word(self):
+        try:
+            from docx import Document
+            from pypdf import PdfReader
+        except ImportError:
+            self.skipTest("Dependencias de documentos no instaladas")
+        response = {
+            "title": "Informe de recorrida - LMM",
+            "subtitle": "Recorrida auditada",
+            "executive_summary": "Se interpreto la nota y la figura adjunta.",
+            "recommendation": "Validar la lectura.",
+            "status": "preliminar",
+            "sections": [],
+            "calculations": [],
+            "risks": [],
+            "missing_data": ["Validacion"],
+            "sources": ["Word de recorrida"],
+        }
+        client = _FakeOpenAI(json.dumps(response))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_docx = root / "recorrida.docx"
+            document = Document()
+            document.add_paragraph("Informe de recorrida LMM")
+            document.add_picture(str(Path(__file__).parents[1] / "static" / "logo.png"))
+            document.save(source_docx)
+            report = generate_consulting_report(
+                event={"id": "event-image", "client_name": "LMM"},
+                draft=heuristic_analysis("Hacer informe de recorrida LMM"),
+                crew_result={"runs": [], "decision": None},
+                source_text=extract_office_document(source_docx, source_docx.name),
+                assets=[{"path": str(source_docx), "file_name": source_docx.name}],
+                output_dir=root / "out",
+                openai_client=client,
+            )
+            request_content = client.chat.completions.requests[0]["messages"][0]["content"]
+            self.assertIsInstance(request_content, list)
+            self.assertTrue(any(part.get("type") == "image_url" for part in request_content))
+            pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(report.pdf_path).pages)
+            docx_text = "\n".join(
+                paragraph.text for paragraph in Document(report.docx_path).paragraphs
+            )
+            self.assertIn("Figuras del documento fuente", pdf_text)
+            self.assertIn("Figuras del documento fuente", docx_text)
 
     def test_no_document_is_generated_for_a_simple_reminder(self):
         with tempfile.TemporaryDirectory() as temp_dir:

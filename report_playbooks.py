@@ -324,7 +324,10 @@ REPORT_PLAYBOOKS = {
         key="informe_recorrida",
         title="Informe profesional de recorrida",
         purpose="Transformar notas, audios, fotos y coordenadas de una visita en decisiones y seguimiento.",
-        trigger_phrases=("informe de recorrida", "cerrar recorrida", "reporte de visita", "visita a campo"),
+        trigger_phrases=(
+            "informe de recorrida", "informe sobre la recorrida", "informe mejorando la redaccion de esta recorrida",
+            "cerrar recorrida", "reporte de visita", "visita a campo", "recorrida de campo",
+        ),
         agents=("Cartera", "Informes", "Margen", "Contralor"),
         required_data=(
             "campo, fecha, participantes y sectores recorridos",

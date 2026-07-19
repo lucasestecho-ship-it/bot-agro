@@ -228,7 +228,19 @@ class AgentCrew:
     def __init__(self, store, openai_client=None, model=None):
         self.store = store
         self.openai_client = openai_client
-        self.model = model or os.environ.get("CAPATAZ_AGENT_MODEL", "gpt-4o-mini")
+        self.model = model or os.environ.get("CAPATAZ_AGENT_MODEL", "gpt-5.6-terra")
+        self.reasoning_effort = os.environ.get("CAPATAZ_AGENT_REASONING", "medium")
+
+    def _completion_request(self, prompt):
+        request = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if str(self.model).startswith("gpt-5.6"):
+            request["reasoning_effort"] = self.reasoning_effort
+        else:
+            request["temperature"] = 0
+        return request
 
     def registry(self):
         return [asdict(spec) for spec in AGENT_SPECS.values()]
@@ -356,9 +368,7 @@ Nota original: {source_excerpt}
 Borrador confirmado: {json.dumps(context['draft'], ensure_ascii=False)}
 """.strip()
                 response = self.openai_client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
+                    **self._completion_request(prompt)
                 )
                 output = normalize_worker_output(extract_json_object(response.choices[0].message.content))
             run.update({"status": "completed", "output": output, "finished_at": iso_now()})
@@ -433,9 +443,7 @@ Entrada confirmada: {json.dumps(context['draft'], ensure_ascii=False)}
 Salidas: {json.dumps(worker_payload, ensure_ascii=False)}
 """.strip()
                 response = self.openai_client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
+                    **self._completion_request(prompt)
                 )
                 output = normalize_control_output(
                     extract_json_object(response.choices[0].message.content),

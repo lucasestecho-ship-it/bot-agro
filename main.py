@@ -3283,24 +3283,38 @@ async def execute_capataz_telegram_work(
         text,
     )
     generated_report = None
+    report_error = None
     if allow_consulting_report:
-        generated_report = await asyncio.to_thread(
-            generate_consulting_report,
-            event=confirmed["event"],
-            draft=draft,
-            crew_result=processed,
-            source_text=text,
-            assets=assets,
-            output_dir=DATA_DIR / "consulting_reports",
-            logo_path=str(logo_path()),
-            openai_client=openai_client,
-        )
+        try:
+            generated_report = await asyncio.to_thread(
+                generate_consulting_report,
+                event=confirmed["event"],
+                draft=draft,
+                crew_result=processed,
+                source_text=text,
+                assets=assets,
+                output_dir=DATA_DIR / "consulting_reports",
+                logo_path=str(logo_path()),
+                openai_client=openai_client,
+            )
+        except Exception as exc:
+            report_error = str(exc)[:1000]
+            logger.exception("Fallo la generacion del entregable profesional")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "No te entregue un informe de relleno: la redaccion final fallo y quedo bloqueada.\n"
+                    f"Detalle: {report_error}\n"
+                    "La entrada y el trabajo de los agentes quedaron guardados."
+                ),
+            )
     if generated_report:
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
                 f"{generated_report.title}: armando y entregando PDF + Word. "
-                f"Estado tecnico: {generated_report.status}."
+                f"Estado tecnico: {generated_report.status}. "
+                f"Redaccion final: {generated_report.model}."
             ),
         )
         generated_files = [
@@ -3336,7 +3350,10 @@ async def execute_capataz_telegram_work(
             "pdf_path": generated_report.pdf_path,
             "docx_path": generated_report.docx_path,
             "missing_data": list(generated_report.missing_data),
+            "model": generated_report.model,
         }
+    elif report_error:
+        processed["generated_report_error"] = report_error
     runs = processed.get("runs") or []
     decision = processed.get("decision") or {}
     summaries = [
@@ -3347,7 +3364,8 @@ async def execute_capataz_telegram_work(
     response_lines = [value for value in [preface, "Trabajo terminado."] if value]
     if generated_report:
         response_lines.append(
-            f"Entregable real: PDF + Word ({generated_report.playbook_key}, {generated_report.status})."
+            f"Entregable real: PDF + Word ({generated_report.playbook_key}, "
+            f"{generated_report.status}, {generated_report.model})."
         )
         if generated_report.missing_data:
             response_lines.append(
