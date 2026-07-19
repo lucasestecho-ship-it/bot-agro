@@ -65,3 +65,30 @@ class CapatazStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PendingSummaryTests(unittest.TestCase):
+    def test_summary_groups_tasks_and_decisions(self):
+        from capataz import format_pending_summary
+
+        dashboard = {
+            "tasks": {
+                "overdue": [{"title": "Mandar informe de recorrida", "client_name": "La Susana", "due_date": "2026-07-15"}],
+                "today": [{"title": "Llamar por presupuesto", "client_name": "Policarpo", "due_date": "2026-07-19"}],
+                "upcoming": [],
+                "no_date": [],
+            },
+            "pending_decisions": [{"topic": "Compra de bomba", "client_name": "La Susana"}],
+            "clients_without_next_action": [{"name": "Riendas Sueltas"}],
+        }
+        text = format_pending_summary(dashboard)
+        self.assertIn("VENCIDAS", text)
+        self.assertIn("Mandar informe de recorrida", text)
+        self.assertIn("PARA HOY", text)
+        self.assertIn("Compra de bomba", text)
+        self.assertIn("Riendas Sueltas", text)
+
+    def test_summary_empty_when_nothing_pending(self):
+        from capataz import format_pending_summary
+
+        self.assertEqual(format_pending_summary({"tasks": {}}), "")

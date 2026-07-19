@@ -292,6 +292,44 @@ Nota: {cleaned}
         return heuristic_analysis(cleaned, field_name=field_name, source=source)
 
 
+def format_pending_summary(dashboard, max_items=8):
+    """Resumen en texto de todo lo que resta hacer, agrupado y sin inventos."""
+    lines = []
+    tasks = (dashboard or {}).get("tasks") or {}
+
+    def _task_line(task):
+        client = f" [{task.get('client_name')}]" if task.get("client_name") else ""
+        due = f" (vence {str(task.get('due_date'))[:10]})" if task.get("due_date") else ""
+        return f"- {str(task.get('title') or '')[:90]}{client}{due}"
+
+    overdue = tasks.get("overdue") or []
+    if overdue:
+        lines.append("VENCIDAS:")
+        lines.extend(_task_line(task) for task in overdue[:max_items])
+    today = tasks.get("today") or []
+    if today:
+        lines.append("PARA HOY:")
+        lines.extend(_task_line(task) for task in today[:max_items])
+    upcoming = tasks.get("upcoming") or []
+    if upcoming:
+        lines.append("PROXIMAS:")
+        lines.extend(_task_line(task) for task in upcoming[:max_items])
+    decisions = (dashboard or {}).get("pending_decisions") or []
+    if decisions:
+        lines.append("DECISIONES QUE ESPERAN TU OK:")
+        for decision in decisions[:max_items]:
+            client = f" [{decision.get('client_name')}]" if decision.get("client_name") else ""
+            lines.append(f"- {str(decision.get('topic') or decision.get('summary') or '')[:90]}{client}")
+    uncovered = (dashboard or {}).get("clients_without_next_action") or []
+    if uncovered:
+        lines.append("CLIENTES SIN PROXIMO PASO:")
+        for client in uncovered[:max_items]:
+            lines.append(f"- {client.get('name')}")
+    if not lines:
+        return ""
+    return "PENDIENTES DE LA CONSULTORA\n\n" + "\n".join(lines)
+
+
 class CapatazStore:
     def __init__(self, supabase_url="", service_role_key="", data_dir=None):
         self.supabase_url = str(supabase_url or "").rstrip("/")
