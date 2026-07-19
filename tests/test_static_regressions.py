@@ -23,6 +23,22 @@ class StaticRegressionTests(unittest.TestCase):
         body = self._function("safeExternalUrl", "urlBase64ToUint8Array")
         self.assertIn('!value.trim()', body)
 
+    def test_render_keeps_telegram_activation_as_a_secret_setting(self):
+        render_config = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
+        telegram_setting = render_config.split("- key: ENABLE_TELEGRAM_BOT", 1)[1].split(
+            "- key: TELEGRAM_TOKEN", 1
+        )[0]
+        self.assertIn("sync: false", telegram_setting)
+        self.assertNotIn('value: "false"', telegram_setting)
+
+    def test_telegram_uses_a_render_waking_webhook(self):
+        main_source = (Path(__file__).parents[1] / "main.py").read_text(encoding="utf-8")
+        self.assertIn('TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"', main_source)
+        self.assertIn("RENDER_EXTERNAL_HOSTNAME", main_source)
+        self.assertIn("await telegram_app.bot.set_webhook(", main_source)
+        self.assertIn('request.headers.get("X-Telegram-Bot-Api-Secret-Token"', main_source)
+        self.assertIn("await telegram_app.update_queue.put(update)", main_source)
+
 
 if __name__ == "__main__":
     unittest.main()
