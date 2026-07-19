@@ -3204,6 +3204,19 @@ async def cmd_client_profile(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
+        return
+    from capataz import format_pending_summary
+
+    dashboard = await asyncio.to_thread(capataz_store.dashboard)
+    summary = format_pending_summary(dashboard)
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=(summary or "Sin pendientes registrados. Cuando delegues algo en un audio, aparece aca.")[:4000],
+    )
+
+
 async def cmd_agriculture(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
         return
@@ -3925,6 +3938,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("limpiar", cmd_cleanup_storage))
     app.add_handler(CommandHandler("cliente", cmd_client_profile))
     app.add_handler(CommandHandler("agro", cmd_agriculture))
+    app.add_handler(CommandHandler("pendientes", cmd_pending))
     app.add_handler(CommandHandler("enviar_correo", cmd_send_confirmed_email))
     app.add_handler(MessageHandler(
         filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | filters.Document.ALL,
@@ -4259,7 +4273,7 @@ async def subscribe_capataz_push(payload: dict = Body(...)):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 @fastapi_app.post("/api/capataz/reminders/dispatch")
-async def dispatch_capataz_reminders():
+async def dispatch_capataz_reminders(request: Request):
     try:
         daily_review = await asyncio.to_thread(agent_crew.persist_daily_review)
         followup_drafts = await asyncio.to_thread(email_draft_manager.prepare_due_followups)
@@ -4270,7 +4284,20 @@ async def dispatch_capataz_reminders():
         )
         email_sync = await asyncio.to_thread(email_draft_manager.sync_prepared)
         storage_cleanup = await asyncio.to_thread(run_storage_cleanup)
+        telegram_summary_sent = False
+        try:
+            from capataz import format_pending_summary
+
+            telegram_app = getattr(request.app.state, "telegram_app", None)
+            dashboard = await asyncio.to_thread(capataz_store.dashboard)
+            summary = format_pending_summary(dashboard)
+            if summary and telegram_app is not None and MY_CHAT_ID:
+                await telegram_app.bot.send_message(chat_id=MY_CHAT_ID, text=summary[:4000])
+                telegram_summary_sent = True
+        except Exception:
+            logger.exception("No se pudo enviar el resumen diario por Telegram")
         return {
+            "telegram_summary_sent": telegram_summary_sent,
             "ok": True,
             **reminders,
             "daily_review": daily_review,
