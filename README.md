@@ -124,9 +124,9 @@ Las notas simples de seguimiento no generan una segunda aprobacion innecesaria. 
 
 ## Entrada por Telegram desde WhatsApp
 
-Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto, PDF y paquetes geoespaciales KML/GeoTIFF. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo. En Render usa automáticamente un webhook basado en `RENDER_EXTERNAL_HOSTNAME`, de modo que un mensaje de Telegram puede despertar una instancia gratuita. Fuera de Render conserva polling para desarrollo local; `TELEGRAM_WEBHOOK_URL` permite indicar manualmente el origen HTTPS si el proveedor no expone esa variable.
+Con `ENABLE_TELEGRAM_BOT=true`, el bot privado acepta texto, audio, foto, PDF y paquetes geoespaciales. Para Shapefile se recomienda compartir un unico ZIP que contenga `SHP`, `SHX`, `DBF` y `PRJ`, junto con el DEM GeoTIFF. Tambien admite esos componentes por separado, KML y GeoJSON. En Android se puede usar **Compartir** desde WhatsApp, elegir Telegram y seleccionar el chat del bot. La entrada se transcribe o lee, se guarda, se asigna a la cuadrilla y el bot devuelve un resumen del trabajo. En Render usa automáticamente un webhook basado en `RENDER_EXTERNAL_HOSTNAME`, de modo que un mensaje de Telegram puede despertar una instancia gratuita. Fuera de Render conserva polling para desarrollo local; `TELEGRAM_WEBHOOK_URL` permite indicar manualmente el origen HTTPS si el proveedor no expone esa variable.
 
-Los documentos de un mismo envio geoespacial se agrupan antes de crear el trabajo. El DEM se procesa localmente con Rasterio/Numpy para obtener cotas, relieve, resolucion, pendientes y candidatos topograficos preliminares. Nunca se manda el TIFF a OpenAI como si fuera una foto. Si el pedido incluye NDVI y hay un perimetro KML, el backend puede solicitar y calcular un mosaico Sentinel-2 L2A mediante Copernicus Data Space:
+Los documentos de un mismo envio geoespacial se agrupan antes de crear el trabajo. El DEM se procesa localmente con Rasterio/Numpy para obtener cotas, relieve, pendientes porcentuales, cuencas, vias potenciales de escurrimiento y candidatos topograficos. El motor genera y devuelve por Telegram un PDF A4 de diez paginas con mapas, tablas, alternativas tecnicas/economicas, acciones y limitaciones, firmado por Lucas Estecho. Nunca se manda el TIFF a OpenAI como si fuera una foto. Si el pedido incluye NDVI y hay un perimetro KML, GeoJSON o Shapefile, el backend puede solicitar y calcular un mosaico Sentinel-2 L2A mediante Copernicus Data Space:
 
 ```text
 CDSE_CLIENT_ID
@@ -141,7 +141,7 @@ Solo se atiende el chat configurado en `MY_CHAT_ID`. El handler nuevo no depende
 
 ## Borradores de Gmail
 
-Si la entrada pide un correo, una respuesta, una propuesta o un presupuesto, `Comercial` e `Informes` preparan el texto y el backend llama unicamente a `users.drafts.create`. No existe una ruta para enviar el mensaje. Lucas lo revisa y lo envia desde Gmail.
+Si la entrada pide un correo, una respuesta, una propuesta o un presupuesto, `Comercial` e `Informes` preparan el texto y el backend crea un borrador real en Gmail. No se envia automaticamente. La respuesta de Telegram muestra destinatario, asunto e ID. Solo una orden explicita con el ID exacto ejecuta el envio: `/enviar_correo email-...`. La operacion es auditable e idempotente; repetir el comando no vuelve a enviar el mismo borrador.
 
 Variables de Render:
 
@@ -204,4 +204,4 @@ Durante la migracion se deja apagado; se cambia a `true` despues de ejecutar el 
 ENABLE_TELEGRAM_BOT=false
 ```
 
-Los comandos disponibles son `/start` y `/status`. El flujo normal consiste en compartirle texto, audio, foto, PDF o un paquete KML/GeoTIFF.
+Los comandos disponibles son `/start`, `/status` y `/enviar_correo <ID>`. El flujo normal consiste en compartirle texto, audio, foto, PDF o un ZIP con Shapefile y DEM GeoTIFF.

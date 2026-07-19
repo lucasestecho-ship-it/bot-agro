@@ -6,8 +6,11 @@ from pathlib import Path
 import numpy as np
 
 from geospatial_worker import (
+    GeoAsset,
     analyze_dem_array,
     analyze_ndvi_array,
+    analyze_topography,
+    analyze_geospatial_package,
     is_geospatial_filename,
     read_kml_boundary,
 )
@@ -16,7 +19,10 @@ import geospatial_worker
 
 class GeospatialWorkerTests(unittest.TestCase):
     def test_recognizes_geospatial_telegram_documents(self):
-        for name in ["campo.kml", "dem.tif", "DEM.TIFF", "dem.tif.aux.xml", "lote.geojson"]:
+        for name in [
+            "campo.kml", "dem.tif", "DEM.TIFF", "dem.tif.aux.xml", "lote.geojson",
+            "campo.shp", "campo.shx", "campo.dbf", "campo.prj", "paquete.zip",
+        ]:
             self.assertTrue(is_geospatial_filename(name), name)
         self.assertFalse(is_geospatial_filename("informe.pdf"))
 
@@ -41,6 +47,68 @@ class GeospatialWorkerTests(unittest.TestCase):
             "area_ge_0_6_pct",
         ])
         self.assertAlmostEqual(total, 100.0)
+
+    def test_topography_produces_basins_streams_and_lengths(self):
+        y, x = np.mgrid[0:80, 0:100]
+        values = 140 - y * 0.35 + np.sin(x / 10) * 2 + ((x - 50) ** 2) / 1800
+        layers = analyze_topography(values, 30, 30)
+        self.assertTrue(layers["basin_table"])
+        self.assertEqual(layers["basin_labels"].shape, values.shape)
+        self.assertEqual(layers["stream_class"].shape, values.shape)
+        self.assertGreater(layers["max_downstream_length_m"], 0)
+
+    def test_complete_shapefile_and_dem_generate_professional_pdf(self):
+        try:
+            import shapefile
+            import rasterio
+            from rasterio.transform import from_origin
+            from pypdf import PdfReader
+        except ImportError:
+            self.skipTest("Dependencias geoespaciales no instaladas")
+        generated = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base = root / "mburucuya"
+            writer = shapefile.Writer(str(base))
+            writer.field("NOMBRE", "C")
+            ring = [
+                [-57.77, -28.09], [-57.77, -28.06], [-57.72, -28.06],
+                [-57.72, -28.09], [-57.77, -28.09],
+            ]
+            writer.poly([ring])
+            writer.record("Mburucuya")
+            writer.close()
+            base.with_suffix(".prj").write_text(
+                'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'
+                'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]',
+                encoding="utf-8",
+            )
+            dem_path = root / "dem_mburucuya.tif"
+            y, x = np.mgrid[0:80, 0:120]
+            values = (130 - y * 1.1 + np.sin(x / 8) * 4).astype("float32")
+            with rasterio.open(
+                dem_path, "w", driver="GTiff", width=values.shape[1], height=values.shape[0],
+                count=1, dtype="float32", crs="EPSG:4326",
+                transform=from_origin(-57.78, -28.055, 0.0005, 0.0005), nodata=-9999,
+            ) as dataset:
+                dataset.write(values, 1)
+            assets = [
+                GeoAsset(str(base.with_suffix(suffix)), f"mburucuya{suffix}")
+                for suffix in (".shp", ".shx", ".dbf", ".prj")
+            ] + [GeoAsset(str(dem_path), dem_path.name, "image/tiff")]
+            package = analyze_geospatial_package(
+                assets, "Hacer informe topografico del campo Mburucuya"
+            )
+            generated = [Path(asset.path) for asset in package["generated_assets"]]
+            pdf_path = next(path for path in generated if path.suffix.lower() == ".pdf")
+            self.assertGreater(pdf_path.stat().st_size, 50_000)
+            self.assertEqual(len(PdfReader(str(pdf_path)).pages), 10)
+            self.assertTrue(package["overlay_geometries"])
+            dem_result = next(item for item in package["results"] if item["type"] == "dem")
+            self.assertLess(dem_result["metrics"]["cell_count"], values.size)
+            self.assertGreater(dem_result["metrics"]["cell_count"], values.size / 3)
+        for path in generated:
+            path.unlink(missing_ok=True)
 
     def test_reads_kml_polygon_boundary(self):
         kml = """<?xml version="1.0" encoding="UTF-8"?>

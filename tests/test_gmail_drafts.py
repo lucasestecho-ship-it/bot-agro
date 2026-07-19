@@ -12,10 +12,15 @@ class FakeGmailService:
 
     def __init__(self):
         self.created = []
+        self.sent = []
 
     def create_draft(self, to_email, subject, body_text, attachments=None):
         self.created.append((to_email, subject, body_text))
         return {"id": "gmail-draft-1", "message": {"id": "gmail-message-1"}}
+
+    def send_draft(self, gmail_draft_id):
+        self.sent.append(gmail_draft_id)
+        return {"id": "gmail-sent-message-1", "threadId": "gmail-thread-1"}
 
 
 class GmailDraftTests(unittest.TestCase):
@@ -54,6 +59,37 @@ class GmailDraftTests(unittest.TestCase):
                 source_text=draft["summary"],
             )
             self.assertIsNone(result)
+
+    def test_only_an_explicit_named_draft_is_sent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CapatazStore(data_dir=Path(temp_dir))
+            source_text = "Preparar correo para cliente@example.com con el informe"
+            draft = heuristic_analysis(source_text)
+            confirmed = store.confirm_intake(draft, source_text=source_text)
+            gmail = FakeGmailService()
+            manager = EmailDraftManager(store, gmail_service=gmail)
+            prepared = manager.prepare(
+                confirmed["event"], draft, {"runs": [], "decision": None}, source_text=source_text
+            )
+
+            sent = manager.send_confirmed(prepared["id"])
+
+            self.assertEqual(gmail.sent, ["gmail-draft-1"])
+            self.assertEqual(sent["status"], "sent")
+            self.assertEqual(sent["to_email"], "cliente@example.com")
+            repeated = manager.send_confirmed(prepared["id"])
+            self.assertTrue(repeated["already_sent"])
+            self.assertEqual(gmail.sent, ["gmail-draft-1"])
+
+    def test_send_requires_exact_existing_draft_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = EmailDraftManager(
+                CapatazStore(data_dir=Path(temp_dir)), gmail_service=FakeGmailService()
+            )
+            with self.assertRaisesRegex(ValueError, "ID del borrador"):
+                manager.send_confirmed("")
+            with self.assertRaisesRegex(ValueError, "No encontre"):
+                manager.send_confirmed("email-inexistente")
 
     def test_due_client_gets_daily_followup_draft(self):
         with tempfile.TemporaryDirectory() as temp_dir:

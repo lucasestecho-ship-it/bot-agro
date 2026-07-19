@@ -66,7 +66,7 @@ CDSE_NDVI_LOOKBACK_DAYS=45
 CDSE_MAX_CLOUD_PERCENT=30
 ```
 
-El bot agrupa KML, GeoTIFF y XML auxiliares de un mismo envio. Calcula topografia desde el DEM y, si el texto pide NDVI, usa el KML como area de interes para solicitar Sentinel-2 L2A. Si las credenciales no estan configuradas, no inventa un NDVI: termina la topografia y muestra el faltante.
+El bot agrupa el paquete durante ocho segundos para recibir todos sus componentes. La forma recomendada es un ZIP con `SHP`, `SHX`, `DBF` y `PRJ`, mas el DEM GeoTIFF; tambien admite KML y GeoJSON. Calcula elevacion, pendientes, cuencas y vias de escurrimiento, y devuelve un PDF profesional de diez paginas. Si el texto pide NDVI, usa el perimetro como area de interes para solicitar Sentinel-2 L2A. Si las credenciales no estan configuradas, no inventa un NDVI: termina la topografia y muestra el faltante.
 
 ## 5. Archivador de Supabase
 
@@ -93,7 +93,7 @@ C:\Users\Lucas Estecho\Documents\CapatazCampo\Archivo
 1. Compartir al bot: `Doña Elena. Prepará un correo a prueba@example.com con un resumen y no lo envíes.`
 2. Esperar `Trabajo terminado` en Telegram.
 3. Abrir `/campo`: debe aparecer el trabajo de los agentes y el correo preparado.
-4. Revisar Borradores en Gmail; no debe existir ningún mensaje enviado.
+4. Revisar Borradores en Gmail; no debe existir ningún mensaje enviado. Para una prueba controlada, copiar el comando exacto `/enviar_correo email-...` que devuelve el bot y comprobar que solo ese borrador se envia una vez.
 5. Hacer una recorrida con una foto y un audio, cerrarla y esperar el informe PDF/DOCX automático.
 6. Ejecutar el archivador manual y comprobar que el archivo existe en Windows antes de verificar que desapareció de Supabase Storage.
-7. Compartir juntos un KML, un DEM GeoTIFF y el pedido `analizar topografia para agua y NDVI`; debe responder una sola vez con cotas y pendientes calculadas. El NDVI se agrega si CDSE esta configurado.
+7. Compartir un ZIP con SHP/SHX/DBF/PRJ, el DEM GeoTIFF y el pedido `preparar informe topografico para agua y NDVI`; debe devolver el PDF, ademas del resumen calculado. El NDVI se agrega si CDSE esta configurado.

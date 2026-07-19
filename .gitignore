@@ -10,3 +10,5 @@ gmail_render_variables.json
 client_secret*.json
 credentials*.json
 *.partial
+output/
+tmp/
