@@ -3444,6 +3444,7 @@ async def process_telegram_geo_batch(chat_id, context):
                     when=900,
                     data={"chat_id": chat_id},
                     name=f"geo-expire-{chat_id}",
+                    job_kwargs={"misfire_grace_time": None},  # Render Free es lento: ejecutar aunque llegue tarde
                     chat_id=chat_id,
                 )
         return
@@ -3550,6 +3551,7 @@ async def process_telegram_document_batch(chat_id, context):
                     when=900,
                     data={"chat_id": chat_id},
                     name=f"doc-expire-{chat_id}",
+                    job_kwargs={"misfire_grace_time": None},  # Render Free es lento: ejecutar aunque llegue tarde
                     chat_id=chat_id,
                 )
         return
@@ -3621,6 +3623,7 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
                     when=8,
                     data={"chat_id": chat_id},
                     name=f"geo-batch-{chat_id}",
+                    job_kwargs={"misfire_grace_time": None},  # Render Free es lento: ejecutar aunque llegue tarde
                     chat_id=chat_id,
                 )
             else:
@@ -3636,6 +3639,7 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
                     when=8,
                     data={"chat_id": chat_id},
                     name=f"doc-batch-{chat_id}",
+                    job_kwargs={"misfire_grace_time": None},  # Render Free es lento: ejecutar aunque llegue tarde
                     chat_id=chat_id,
                 )
             else:
@@ -3715,6 +3719,7 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
                         when=8,
                         data={"chat_id": chat_id},
                         name=f"geo-batch-{chat_id}",
+                        job_kwargs={"misfire_grace_time": None},  # Render Free es lento: ejecutar aunque llegue tarde
                         chat_id=chat_id,
                     )
                 elif batch.get("instruction"):
@@ -3773,6 +3778,7 @@ async def handle_capataz_telegram_message(update: Update, context: ContextTypes.
                         when=8,
                         data={"chat_id": chat_id},
                         name=f"doc-batch-{chat_id}",
+                        job_kwargs={"misfire_grace_time": None},  # Render Free es lento: ejecutar aunque llegue tarde
                         chat_id=chat_id,
                     )
                 else:
