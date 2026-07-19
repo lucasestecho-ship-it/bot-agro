@@ -54,7 +54,12 @@ from capataz import (
     normalize_key,
 )
 from gmail_drafts import EmailDraftManager, GmailDraftService
-from geospatial_worker import GeoAsset, analyze_geospatial_package, is_geospatial_filename
+from geospatial_worker import (
+    GeoAsset,
+    analyze_geospatial_package,
+    cdse_configuration_status,
+    is_geospatial_filename,
+)
 from push_notifications import PushNotifier
 from consulting_reports import generate_consulting_report
 from report_playbooks import public_report_catalog
@@ -3143,12 +3148,14 @@ async def cmd_capataz_status(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
         return
     dashboard = await asyncio.to_thread(capataz_store.dashboard)
+    cdse_status = cdse_configuration_status(validate=False)
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
             "Capataz Campo activo.\n"
             f"Agentes recientes: {len(dashboard.get('agent_activity') or [])}.\n"
             f"Borradores de correo: {len(dashboard.get('email_drafts') or [])}.\n"
+            f"NDVI Sentinel: {'configurado' if cdse_status['configured'] else 'BLOQUEADO - faltan credenciales CDSE'}.\n"
             "Compartime desde WhatsApp texto, audio, foto, PDF, Word, Excel o un paquete geoespacial "
             "(ZIP con SHP/SHX/DBF/PRJ + DEM GeoTIFF).\n"
             "Usa /informes para ver los entregables que la cuadrilla puede producir."
@@ -3978,12 +3985,7 @@ async def health_campo():
         "capataz_tables": capataz_store.schema_health(),
         "push": push_notifier.status(),
         "gmail": gmail_service.status(),
-        "geospatial": {
-            "engine": "rasterio",
-            "cdse_configured": bool(
-                os.environ.get("CDSE_CLIENT_ID") and os.environ.get("CDSE_CLIENT_SECRET")
-            ),
-        },
+        "geospatial": {"engine": "rasterio", **cdse_configuration_status(validate=False)},
         "telegram": {
             "enabled": os.environ.get("ENABLE_TELEGRAM_BOT", "false").lower()
             in {"1", "true", "yes", "si"},
@@ -3992,6 +3994,12 @@ async def health_campo():
         },
         "archive": archive_manager.status(),
     }
+
+
+@fastapi_app.get("/api/health/cdse")
+async def health_cdse():
+    """Validate Copernicus OAuth without exposing any credential or token."""
+    return cdse_configuration_status(validate=True)
 
 @fastapi_app.post("/share-target")
 async def share_target(

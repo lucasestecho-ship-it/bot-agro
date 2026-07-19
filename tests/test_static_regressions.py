@@ -52,6 +52,8 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn('CommandHandler("enviar_correo", cmd_send_confirmed_email)', main_source)
         self.assertIn('name.endswith(".shp")', main_source)
         self.assertIn('name.endswith(".zip")', main_source)
+        self.assertIn('@fastapi_app.get("/api/health/cdse")', main_source)
+        self.assertIn("BLOQUEADO - faltan credenciales CDSE", main_source)
 
 
 if __name__ == "__main__":
