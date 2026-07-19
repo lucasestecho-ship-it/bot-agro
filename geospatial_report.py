@@ -335,7 +335,7 @@ def _draw_table(pdf, rows, column_widths, x, y_top, *, header=True, row_height=1
 
 def generate_geospatial_report(package: dict, output_path: str, *, instruction: str = "",
                                assets=None, logo_path: str | None = None) -> str:
-    """Build an A4 PDF using the same visual grammar as the Manuel Vilas report."""
+    """Arma el PDF A4 con la identidad visual de los informes de la consultora."""
     results = package.get("results") or []
     dem = next((item for item in results if item.get("type") == "dem"), None)
     if not dem or "_values" not in dem or "_topography" not in dem:
