@@ -3177,6 +3177,33 @@ def persist_telegram_asset(
     return row
 
 
+async def cmd_client_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
+        return
+    from client_profile import build_client_profile, format_client_profile
+
+    name = " ".join(context.args or []).strip()
+    if not name:
+        clients, _source, _warning = await asyncio.to_thread(capataz_store.list_clients)
+        names = ", ".join(sorted(str(row.get("name") or "") for row in clients if row.get("name"))) or "sin clientes registrados"
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Usa /cliente NOMBRE. Clientes conocidos: {names}."[:4000],
+        )
+        return
+    try:
+        profile = await asyncio.to_thread(build_client_profile, capataz_store, name)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=format_client_profile(profile)[:4000],
+        )
+    except Exception as exc:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"No pude armar la ficha: {str(exc)[:500]}",
+        )
+
+
 async def cmd_cleanup_storage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if MY_CHAT_ID and update.effective_chat.id != MY_CHAT_ID:
         return
@@ -3877,6 +3904,7 @@ def build_telegram_application():
     app.add_handler(CommandHandler("status", cmd_capataz_status))
     app.add_handler(CommandHandler("informes", cmd_report_catalog))
     app.add_handler(CommandHandler("limpiar", cmd_cleanup_storage))
+    app.add_handler(CommandHandler("cliente", cmd_client_profile))
     app.add_handler(CommandHandler("enviar_correo", cmd_send_confirmed_email))
     app.add_handler(MessageHandler(
         filters.TEXT | filters.VOICE | filters.AUDIO | filters.PHOTO | filters.Document.ALL,

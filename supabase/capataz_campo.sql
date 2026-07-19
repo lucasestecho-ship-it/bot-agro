@@ -260,6 +260,25 @@ add column if not exists updated_at timestamptz default now();
 create index if not exists idx_email_drafts_status_created
 on public.email_drafts (status, created_at desc);
 
+create table if not exists public.client_facts (
+  id text primary key,
+  client_id text,
+  client_name text,
+  category text,
+  variable text,
+  value_number double precision,
+  value_text text,
+  unit text,
+  fact_date date,
+  event_id text,
+  source_quote text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create index if not exists client_facts_client_name_idx on public.client_facts (client_name);
+create index if not exists client_facts_category_idx on public.client_facts (category);
+
 create table if not exists public.intake_assets (
   id text primary key,
   event_id text,
