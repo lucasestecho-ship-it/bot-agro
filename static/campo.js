@@ -1763,3 +1763,29 @@ renderSessions();
 loadDashboard();
 openNextDraft();
 window.setInterval(loadDashboard, 15 * 60 * 1000);
+
+// --- Navegacion por pestanas (reorden 2026-07) ---
+(function setupTabs() {
+  const buttons = Array.from(document.querySelectorAll(".tab-button"));
+  const views = Array.from(document.querySelectorAll(".view"));
+  const titleEl = document.getElementById("viewTitle");
+  if (!buttons.length || !views.length) return;
+  const titles = { recorrida: "Recorrida", capataz: "Capataz", historial: "Historial" };
+  function show(tab) {
+    for (const view of views) view.hidden = view.dataset.view !== tab;
+    for (const button of buttons) button.classList.toggle("active", button.dataset.tab === tab);
+    if (titleEl && titles[tab]) titleEl.textContent = titles[tab];
+    try { localStorage.setItem("campo-active-tab", tab); } catch (e) {}
+    window.scrollTo({ top: 0 });
+  }
+  for (const button of buttons) {
+    button.addEventListener("click", () => show(button.dataset.tab));
+  }
+  let initial = "recorrida";
+  try { initial = localStorage.getItem("campo-active-tab") || initial; } catch (e) {}
+  // Si llego texto compartido desde otra app, abrir directamente el Capataz.
+  if (new URLSearchParams(window.location.search).has("shared")) initial = "capataz";
+  if (sharedTextNotice && !sharedTextNotice.hidden) initial = "capataz";
+  if (!titles[initial]) initial = "recorrida";
+  show(initial);
+})();

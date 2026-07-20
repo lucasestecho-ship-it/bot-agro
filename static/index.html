@@ -14,115 +14,126 @@
     <header class="topbar">
       <div>
         <p class="eyebrow">Capataz Campo</p>
-        <h1>Qué hicieron hoy los agentes</h1>
+        <h1 id="viewTitle">Recorrida</h1>
       </div>
       <span id="connectionStatus" class="status">offline</span>
     </header>
 
-    <section class="panel work-panel">
-      <div class="list-header">
-        <div>
-          <h2>Trabajo de la cuadrilla</h2>
-          <p id="agentWorkSummary" class="section-copy">Cargando trabajos...</p>
+    <!-- ================= VISTA RECORRIDA (el circuito de campo) ================= -->
+    <div class="view" data-view="recorrida">
+      <section class="panel">
+        <div class="step-header"><span class="step-badge">1</span><h2>Preparar</h2></div>
+        <p class="section-copy">Elegí el campo antes de arrancar. El GPS se guarda con cada registro.</p>
+        <label>
+          Campo o cliente activo
+          <input id="campoInput" list="clientsDatalist" autocomplete="off" placeholder="Ej: La Susana">
+          <datalist id="clientsDatalist"></datalist>
+        </label>
+        <label>
+          Sector opcional
+          <input id="sectorInput" autocomplete="off" placeholder="Ej: lote 4, manga, bajo">
+        </label>
+        <label>
+          Nombre de recorrida
+          <input id="sessionNameInput" autocomplete="off" placeholder="Ej: control de aguadas">
+        </label>
+        <div class="gps-row">
+          <span id="gpsStatus">GPS pendiente</span>
+          <button id="gpsButton" class="compact-button" type="button">Actualizar GPS</button>
         </div>
-        <button id="refreshDashboardButton" class="compact-button" type="button">Actualizar</button>
-      </div>
-      <div id="agentWorkList" class="agent-work-list"></div>
-      <div id="emailDraftsBox" class="email-drafts-box" hidden>
-        <h3>Correos preparados</h3>
-        <div id="emailDraftsList" class="email-drafts-list"></div>
-      </div>
-    </section>
+      </section>
 
-    <section class="panel today-panel">
-      <div class="list-header">
-        <div>
-          <h2>Lo que necesita tu intervención</h2>
-          <p id="todaySummary" class="section-copy">Cargando tareas...</p>
+      <section class="panel">
+        <div class="step-header"><span class="step-badge">2</span><h2>Recorrida</h2></div>
+        <div class="list-header">
+          <span id="activeSessionStatus" class="item-meta">Sin recorrida activa</span>
         </div>
-      </div>
-      <div class="quick-buttons">
-        <button id="notificationsButton" class="secondary-button compact-button" type="button">Activar avisos</button>
-        <button id="installButton" class="secondary-button compact-button" type="button" hidden>Instalar app</button>
-      </div>
-      <ul id="todayTasksList" class="items task-list"></ul>
-      <div id="decisionsBox" class="decisions-box" hidden>
-        <h3>Por decidir</h3>
-        <ul id="decisionsList" class="items decisions-list"></ul>
-      </div>
-      <details id="uncoveredClientsBox" class="uncovered-clients" hidden>
-        <summary id="uncoveredClientsSummary">Clientes sin próximo paso</summary>
-        <ul id="uncoveredClientsList" class="items"></ul>
-      </details>
-      <div id="waterProjectsBox" class="water-projects" hidden>
-        <h3>Proyectos de agua activos</h3>
-        <ul id="waterProjectsList" class="items"></ul>
-      </div>
-    </section>
+        <div class="session-actions">
+          <button id="startSessionButton" type="button">Iniciar recorrida</button>
+          <button id="closeSessionButton" class="secondary-button" type="button">Cerrar recorrida</button>
+        </div>
+        <p class="section-copy">Al cerrar, el Capataz junta todo lo grabado y arma el informe.</p>
+      </section>
 
-    <section class="panel intake-panel">
-      <p class="eyebrow">Entrada del Capataz</p>
-      <h2>Mandales material o pediles un trabajo</h2>
-      <textarea id="noteInput" rows="4" placeholder="Ej: Doña Elena. Analicen esta recorrida, comparen alternativas y déjenme listo el correo para el cliente."></textarea>
-      <button id="analyzeTextButton" class="primary-wide" type="button">Asignar a los agentes</button>
-      <p id="sharedTextNotice" class="notice" hidden>Recibido desde otra aplicación. Revisalo y tocá “Asignar a los agentes”.</p>
-    </section>
+      <section class="actions">
+        <div class="step-header"><span class="step-badge">3</span><h2>Registrar</h2></div>
+        <button id="talkButton" class="talk" type="button">Tocar para grabar</button>
+        <div id="recordingControls" class="recording-controls" hidden>
+          <div id="recordingDuration" class="item-meta">Grabando... 0 s</div>
+          <button id="stopRecordingButton" type="button">Detener y guardar</button>
+          <button id="cancelRecordingButton" class="secondary-button" type="button">Cancelar</button>
+        </div>
+        <label class="photo-button">
+          Sacar foto
+          <input id="photoInput" type="file" accept="image/*" capture="environment">
+        </label>
+      </section>
 
-    <section class="panel">
-      <label>
-        Campo o cliente activo
-        <input id="campoInput" list="clientsDatalist" autocomplete="off" placeholder="Ej: La Susana">
-        <datalist id="clientsDatalist"></datalist>
-      </label>
-      <label>
-        Sector opcional
-        <input id="sectorInput" autocomplete="off" placeholder="Ej: lote 4, manga, bajo">
-      </label>
-      <label>
-        Nombre de recorrida
-        <input id="sessionNameInput" autocomplete="off" placeholder="Ej: control de aguadas">
-      </label>
-      <div class="gps-row">
-        <span id="gpsStatus">GPS pendiente</span>
-        <button id="gpsButton" class="compact-button" type="button">Actualizar GPS</button>
-      </div>
-    </section>
+      <section class="panel">
+        <div class="step-header"><span class="step-badge">4</span><h2>Subir</h2></div>
+        <div class="list-header">
+          <p class="section-copy">Lo grabado queda acá aunque no haya señal; se sube solo al volver la conexión.</p>
+          <button id="syncButton" class="compact-button" type="button">Sincronizar</button>
+        </div>
+        <ul id="itemsList" class="items"></ul>
+        <button id="forceSyncButton" class="secondary-button" type="button">Forzar resubida</button>
+      </section>
+    </div>
 
-    <section class="panel">
-      <div class="list-header">
-        <h2>Recorrida activa</h2>
-        <span id="activeSessionStatus" class="item-meta">Sin recorrida activa</span>
-      </div>
-      <div class="session-actions">
-        <button id="startSessionButton" type="button">Iniciar recorrida</button>
-        <button id="closeSessionButton" class="secondary-button" type="button">Cerrar recorrida</button>
-      </div>
-    </section>
+    <!-- ================= VISTA CAPATAZ (oficina) ================= -->
+    <div class="view" data-view="capataz" hidden>
+      <section class="panel intake-panel">
+        <p class="eyebrow">Entrada del Capataz</p>
+        <h2>Mandales material o pediles un trabajo</h2>
+        <textarea id="noteInput" rows="4" placeholder="Ej: Doña Elena. Analicen esta recorrida, comparen alternativas y déjenme listo el correo para el cliente."></textarea>
+        <button id="analyzeTextButton" class="primary-wide" type="button">Asignar a los agentes</button>
+        <p id="sharedTextNotice" class="notice" hidden>Recibido desde otra aplicación. Revisalo y tocá “Asignar a los agentes”.</p>
+      </section>
 
-    <section class="actions">
-      <button id="talkButton" class="talk" type="button">Tocar para grabar</button>
-      <div id="recordingControls" class="recording-controls" hidden>
-        <div id="recordingDuration" class="item-meta">Grabando... 0 s</div>
-        <button id="stopRecordingButton" type="button">Detener y guardar</button>
-        <button id="cancelRecordingButton" class="secondary-button" type="button">Cancelar</button>
-      </div>
-      <label class="photo-button">
-        Sacar foto
-        <input id="photoInput" type="file" accept="image/*" capture="environment">
-      </label>
-    </section>
+      <section class="panel today-panel">
+        <div class="list-header">
+          <div>
+            <h2>Lo que necesita tu intervención</h2>
+            <p id="todaySummary" class="section-copy">Cargando tareas...</p>
+          </div>
+        </div>
+        <div class="quick-buttons">
+          <button id="notificationsButton" class="secondary-button compact-button" type="button">Activar avisos</button>
+          <button id="installButton" class="secondary-button compact-button" type="button" hidden>Instalar app</button>
+        </div>
+        <ul id="todayTasksList" class="items task-list"></ul>
+        <div id="decisionsBox" class="decisions-box" hidden>
+          <h3>Por decidir</h3>
+          <ul id="decisionsList" class="items decisions-list"></ul>
+        </div>
+        <details id="uncoveredClientsBox" class="uncovered-clients" hidden>
+          <summary id="uncoveredClientsSummary">Clientes sin próximo paso</summary>
+          <ul id="uncoveredClientsList" class="items"></ul>
+        </details>
+        <div id="waterProjectsBox" class="water-projects" hidden>
+          <h3>Proyectos de agua activos</h3>
+          <ul id="waterProjectsList" class="items"></ul>
+        </div>
+      </section>
 
-    <section class="panel">
-      <div class="list-header">
-        <h2>Pendientes de subir</h2>
-        <button id="syncButton" class="compact-button" type="button">Sincronizar</button>
-      </div>
-      <ul id="itemsList" class="items"></ul>
-      <button id="forceSyncButton" class="secondary-button" type="button">Forzar resubida</button>
-    </section>
+      <section class="panel work-panel">
+        <div class="list-header">
+          <div>
+            <h2>Trabajo de la cuadrilla</h2>
+            <p id="agentWorkSummary" class="section-copy">Cargando trabajos...</p>
+          </div>
+          <button id="refreshDashboardButton" class="compact-button" type="button">Actualizar</button>
+        </div>
+        <div id="agentWorkList" class="agent-work-list"></div>
+        <div id="emailDraftsBox" class="email-drafts-box" hidden>
+          <h3>Correos preparados</h3>
+          <div id="emailDraftsList" class="email-drafts-list"></div>
+        </div>
+      </section>
+    </div>
 
-    <details class="technical-details">
-      <summary>Recorridas, informes y diagnóstico</summary>
+    <!-- ================= VISTA HISTORIAL ================= -->
+    <div class="view" data-view="historial" hidden>
       <section class="panel">
         <div class="list-header">
           <h2>Recorridas e informes</h2>
@@ -137,11 +148,25 @@
         </div>
         <ul id="serverItemsList" class="items"></ul>
       </section>
-      <section class="panel">
-        <h2>Diagnóstico de sincronización</h2>
-        <ul id="debugLog" class="debug-log"></ul>
-      </section>
-    </details>
+      <details class="technical-details">
+        <summary>Diagnóstico de sincronización</summary>
+        <section class="panel">
+          <ul id="debugLog" class="debug-log"></ul>
+        </section>
+      </details>
+    </div>
+
+    <nav class="tabbar" aria-label="Secciones">
+      <button type="button" class="tab-button active" data-tab="recorrida">
+        <span class="tab-icon">📍</span>Recorrida
+      </button>
+      <button type="button" class="tab-button" data-tab="capataz">
+        <span class="tab-icon">🧑‍🌾</span>Capataz
+      </button>
+      <button type="button" class="tab-button" data-tab="historial">
+        <span class="tab-icon">📄</span>Historial
+      </button>
+    </nav>
   </main>
 
   <dialog id="draftDialog" class="draft-dialog">
