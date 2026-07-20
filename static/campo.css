@@ -675,3 +675,55 @@ button:disabled,
     align-items: flex-start;
   }
 }
+
+/* --- Navegacion por pestanas (reorden 2026-07) --- */
+.app { padding-bottom: 84px; }
+.view[hidden] { display: none; }
+.tabbar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  gap: 4px;
+  padding: 8px 10px calc(10px + env(safe-area-inset-bottom, 0px));
+  background: #14402d;
+  box-shadow: 0 -3px 12px rgba(0, 0, 0, 0.25);
+  z-index: 40;
+}
+.tab-button {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 4px;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: #cfe3d6;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.tab-button .tab-icon { font-size: 1.15rem; line-height: 1; }
+.tab-button.active { background: #1f593f; color: #ffffff; }
+.step-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.step-header h2 { margin: 0; }
+.step-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #1f593f;
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.9rem;
+  flex: 0 0 auto;
+}
