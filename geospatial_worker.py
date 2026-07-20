@@ -810,6 +810,8 @@ def download_cdse_ndvi_percentile(
     start_date: date,
     end_date: date,
     percentile: int = 90,
+    width: int | None = None,
+    height: int | None = None,
 ) -> dict:
     """Descarga el percentil temporal de NDVI para un mismo periodo estacional."""
     if requests is None:
@@ -856,8 +858,8 @@ function evaluatePixel(samples) {{
             }],
         },
         "output": {
-            "width": int(os.environ.get("CDSE_NDVI_WIDTH", "768")),
-            "height": int(os.environ.get("CDSE_NDVI_HEIGHT", "768")),
+            "width": int(width or os.environ.get("CDSE_NDVI_WIDTH", "768")),
+            "height": int(height or os.environ.get("CDSE_NDVI_HEIGHT", "768")),
             "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
         },
         "evalscript": evalscript,
@@ -943,6 +945,132 @@ function evaluatePixel(s) {
         retry_after = float(response.headers.get("Retry-After") or (2 ** attempt))
         time.sleep(min(20.0, max(1.0, retry_after)))
     raise RuntimeError(last_error or "CDSE no devolvio el DEM")
+
+
+def monthly_ndvi_series(geometry: dict, stage_dir: str, months: int = 12) -> list[dict]:
+    """NDVI mediano del campo mes a mes (ultimos N meses), calculado en Python.
+
+    Devuelve [{"label": "2026-06", "mean": x, "std": y}] con la variabilidad
+    espacial (desvio) de cada mes. Los meses sin imagen valida se omiten.
+    """
+    try:
+        import rasterio
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("Falta rasterio para la serie mensual") from exc
+    today = datetime.now(timezone.utc).date()
+    first_of_month = today.replace(day=1)
+    series = []
+    cursor = first_of_month
+    ranges = []
+    for _ in range(max(1, int(months))):
+        prev_end = cursor - timedelta(days=1)
+        prev_start = prev_end.replace(day=1)
+        ranges.append((prev_start, prev_end))
+        cursor = prev_start
+    for start, end in reversed(ranges):
+        path = str(Path(stage_dir) / f"ndvi_mes_{start.year}_{start.month:02d}.tif")
+        try:
+            download_cdse_ndvi_percentile(
+                geometry, path, start_date=start, end_date=end,
+                percentile=50, width=256, height=256,
+            )
+            with rasterio.open(path) as dataset:
+                values = dataset.read(1, masked=True).filled(np.nan).astype("float64")
+            values[(values < -1) | (values > 1)] = np.nan
+            finite = values[np.isfinite(values)]
+            if finite.size < 20:
+                continue
+            series.append({
+                "label": f"{start.year}-{start.month:02d}",
+                "mean": float(np.mean(finite)),
+                "std": float(np.std(finite)),
+            })
+        except Exception:
+            continue
+    return series
+
+
+def water_percentage(ndwi_values) -> float:
+    """Porcentaje de celdas con agua (NDWI > 0) sobre las celdas validas."""
+    values = np.asarray(ndwi_values, dtype="float64")
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    return float(np.mean(finite > 0.0) * 100.0)
+
+
+def download_cdse_water_mask(geometry: dict, output_path: str, *, lookback_days: int = 30) -> dict:
+    """NDWI (McFeeters, B03/B08) del ultimo mes para estimar superficie con agua."""
+    if requests is None:
+        raise RuntimeError("Falta instalar requests en el servidor")
+    try:
+        import rasterio
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("Falta rasterio para el analisis de agua") from exc
+    token = _cdse_access_token()
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=max(7, min(int(lookback_days), 90)))
+    evalscript = """//VERSION=3
+function setup() {
+  return {input: [{bands: [\"B03\", \"B08\", \"SCL\", \"dataMask\"]}], output: {bands: 1, sampleType: \"FLOAT32\"},
+          mosaicking: \"ORBIT\"};
+}
+function evaluatePixel(samples) {
+  const values = [];
+  for (const s of samples) {
+    if (!s.dataMask || [0, 1, 3, 8, 9, 10, 11].includes(s.SCL) || (s.B03 + s.B08) === 0) continue;
+    values.push((s.B03 - s.B08) / (s.B03 + s.B08));
+  }
+  if (values.length === 0) return [NaN];
+  values.sort((a, b) => a - b);
+  return [values[Math.floor(values.length / 2)]];
+}
+"""
+    payload = {
+        "input": {
+            "bounds": {
+                "geometry": {"type": geometry["type"], "coordinates": geometry["coordinates"]},
+                "properties": {"crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"},
+            },
+            "data": [{
+                "type": "sentinel-2-l2a",
+                "dataFilter": {
+                    "timeRange": {
+                        "from": start.isoformat().replace("+00:00", "Z"),
+                        "to": end.isoformat().replace("+00:00", "Z"),
+                    },
+                    "maxCloudCoverage": int(os.environ.get("CDSE_MAX_CLOUD_PERCENT", "60")),
+                },
+                "processing": {"harmonizeValues": True},
+            }],
+        },
+        "output": {
+            "width": 512,
+            "height": 512,
+            "responses": [{"identifier": "default", "format": {"type": "image/tiff"}}],
+        },
+        "evalscript": evalscript,
+    }
+    response = requests.post(
+        "https://sh.dataspace.copernicus.eu/process/v1",
+        headers={"Authorization": f"Bearer {token}", "Accept": "image/tiff"},
+        json=payload,
+        timeout=180,
+    )
+    if not response.ok:
+        raise RuntimeError(f"CDSE Process API {response.status_code}: {response.text[:500]}")
+    Path(output_path).write_bytes(response.content)
+    with rasterio.open(output_path) as dataset:
+        values = dataset.read(1, masked=True).filled(np.nan).astype("float64")
+        bounds = [float(value) for value in dataset.bounds]
+    values[(values < -1) | (values > 1)] = np.nan
+    return {
+        "pct": water_percentage(values),
+        "_values": values,
+        "_bounds": bounds,
+        "from": start.date().isoformat(),
+        "to": end.date().isoformat(),
+    }
 
 
 def _seasonal_year_ranges(today: date, years: int = 9) -> list[tuple[date, date]]:
@@ -1258,10 +1386,28 @@ def build_multiyear_ndvi_analysis(
     stable = np.where(union_mask, stable, np.nan)
     with rasterio.open(stable_output_path, "w", **profile) as output:
         output.write(np.where(np.isfinite(stable), stable, -9999.0).astype("float32"), 1)
+    annual_series = []
+    scope_mask = union_mask
+    if pasture_rows:
+        scope_mask = np.zeros(stable.shape, dtype=bool)
+        for row in pasture_rows:
+            scope_mask |= row["_mask"]
+    for year, values in zip(years, arrays):
+        finite = values[scope_mask & np.isfinite(values)]
+        if finite.size < 10:
+            continue
+        annual_series.append({
+            "year": int(year),
+            "mean": float(np.mean(finite)),
+            "p10": float(np.percentile(finite, 10)),
+            "p90": float(np.percentile(finite, 90)),
+        })
+
     return {
         "years": years,
         "period_from": annual_rasters[0].get("from"),
         "period_to": annual_rasters[-1].get("to"),
+        "annual_series": annual_series,
         "zoning": zoning,
         "lot_rows": lot_rows,
         "pasture_rows": sorted(
@@ -1479,6 +1625,25 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
                     except Exception:
                         Path(stable_path).unlink(missing_ok=True)
                         raise
+                    try:
+                        ndvi_analysis["monthly_series"] = monthly_ndvi_series(
+                            wgs84_geometry, stage_dir,
+                            months=int(os.environ.get("CDSE_NDVI_MONTHLY_MONTHS", "12")),
+                        )
+                    except Exception as exc:
+                        warnings.append(f"Serie mensual NDVI no calculada: {exc}")
+                    wants_water = any(
+                        token in instruction_key
+                        for token in ("inunda", "anega", "agua", "ndwi", "laguna")
+                    )
+                    if wants_water:
+                        try:
+                            water_path = str(Path(stage_dir) / "ndwi_agua.tif")
+                            ndvi_analysis["water"] = download_cdse_water_mask(
+                                wgs84_geometry, water_path
+                            )
+                        except Exception as exc:
+                            warnings.append(f"Superficie con agua no calculada: {exc}")
                 else:
                     warnings.append("NDVI multianual no calculado: menos de dos periodos validos")
 
@@ -1551,6 +1716,15 @@ def analyze_geospatial_package(assets: Iterable[GeoAsset], instruction: str = ""
             f"{len(ndvi_analysis['pasture_rows'])} lotes pastoriles y "
             f"{len(ndvi_analysis['forest_rows'])} forestaciones separadas."
         )
+        if ndvi_analysis.get("monthly_series"):
+            lines.append(
+                f"Serie mensual NDVI: {len(ndvi_analysis['monthly_series'])} meses con imagen valida."
+            )
+        water = ndvi_analysis.get("water")
+        if water and water.get("pct") == water.get("pct"):
+            lines.append(
+                f"Superficie con agua (NDWI>0, {water['from']} a {water['to']}): {water['pct']:.1f}% del area analizada."
+            )
     if warnings:
         lines.append("Advertencias: " + " | ".join(warnings))
     lines.append("Los PDF adjuntos contienen los mapas, tablas, ranking, recomendaciones y limitaciones correspondientes.")

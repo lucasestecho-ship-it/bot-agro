@@ -64,6 +64,13 @@ def _clean_name(value: str, fallback: str = "Campo sin identificar") -> str:
 
 def infer_field_name(instruction: str, assets) -> str:
     text = str(instruction or "")
+    # Las comparaciones no son el nombre del campo ("un informe como el de X").
+    text = re.sub(
+        r"\bcomo\s+(?:(?!\b(?:para|del|campo|establecimiento)\b)[^.;,])*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
     patterns = [
         r"(?:campo|establecimiento)\s+(?:de\s+|del\s+|llamado\s+)?['\"]?([\wÁÉÍÓÚÜÑáéíóúüñ ]{2,60})",
         r"(?:para|en)\s+['\"]?([\wÁÉÍÓÚÜÑáéíóúüñ ]{2,50})\s*(?:,|\.|$)",

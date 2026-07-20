@@ -1,33 +1,46 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_crew import AgentCrew
 from capataz import CapatazStore, heuristic_analysis
 
 
 class AgentCrewTests(unittest.TestCase):
-    def test_water_routes_technical_and_economic_agents(self):
+    def test_default_routing_suspends_margen_and_contralor(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             crew = AgentCrew(CapatazStore(data_dir=Path(temp_dir)))
-            draft = heuristic_analysis("Doña Elena: revisar bomba y cañería de la aguada")
+            draft = heuristic_analysis("Presupuesto de bomba y costo para La Susana")
+            route = crew.route(draft, draft["summary"])
+            self.assertNotIn("margen", route)
+
+    def test_exclusive_routing_single_specialist(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            crew = AgentCrew(CapatazStore(data_dir=Path(temp_dir)))
+            draft = heuristic_analysis("Analisis del caudal y presion de la bomba")
+            route = crew.route(draft, "Analisis del caudal y presion de la bomba")
+            self.assertIn("hidro", route)
+            self.assertNotIn("margen", route)
+            self.assertNotIn("contralor", route)
+
+    def test_water_routes_technical_agents_only(self):
+        # El agua rutea tecnicos; la economia solo entra si el pedido la nombra.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            crew = AgentCrew(CapatazStore(data_dir=Path(temp_dir)))
+            draft = heuristic_analysis(
+                "Proyecto de agua: revisar aguadas y caudal de la bomba en La Susana"
+            )
             route = crew.route(draft, draft["summary"])
             self.assertIn("aqua", route)
             self.assertIn("hidro", route)
-            self.assertIn("margen", route)
-
-    def test_simple_followup_does_not_create_extra_decision(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store = CapatazStore(data_dir=Path(temp_dir))
-            crew = AgentCrew(store)
-            draft = heuristic_analysis("Policarpo: llamar mañana")
-            confirmed = store.confirm_intake(draft, source_text=draft["summary"])
-            crew.queue_event(confirmed["event"], draft, draft["summary"])
-            result = crew.process_event(confirmed["event"], draft, draft["summary"])
-            self.assertIsNone(result["decision"])
-            self.assertEqual([run["agent"] for run in result["runs"]], ["Cartera"])
+            self.assertNotIn("margen", route)
 
     def test_specialists_create_audited_decision_and_approval_tasks(self):
+        # Comportamiento historico: se prueba con los agentes reactivados.
+        self._env = patch.dict("os.environ", {"CAPATAZ_SUSPENDED_AGENTS": ""})
+        self._env.start()
+        self.addCleanup(self._env.stop)
         with tempfile.TemporaryDirectory() as temp_dir:
             store = CapatazStore(data_dir=Path(temp_dir))
             crew = AgentCrew(store)

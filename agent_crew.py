@@ -154,6 +154,17 @@ ROUTE_KEYWORDS = {
     "tero": ("excel", "planilla", "csv", "formula", "tabla", "spreadsheet"),
 }
 
+def suspended_agents():
+    """Agentes suspendidos por Lucas (env CAPATAZ_SUSPENDED_AGENTS).
+
+    Por defecto quedan suspendidos margen (control economico) y contralor:
+    hoy no aportan y ensucian los entregables. Reactivar poniendo la variable
+    en Render con la lista deseada o vacia.
+    """
+    raw = os.environ.get("CAPATAZ_SUSPENDED_AGENTS", "margen,contralor")
+    return {normalize_key(part) for part in raw.split(",") if part.strip()}
+
+
 AGENT_ALIASES = {
     "agua": "aqua",
     "aqua": "aqua",
@@ -256,15 +267,15 @@ class AgentCrew:
                 ]
             )
         )
+        suspended = suspended_agents()
         playbook = detect_report_playbook(text_key)
         if playbook:
-            # Los entregables tienen una cuadrilla explicita. No se deja que el
-            # limite historico de seis agentes quite Informes o Margen por haber
-            # agregado Cartera de manera automatica.
             return [
                 key for key in agent_keys_for_playbook(playbook)
-                if key != "contralor"
+                if key != "contralor" and key not in suspended
             ][:6]
+        # Ruteo exclusivo: trabaja SOLO el especialista de lo pedido. Si el
+        # pedido nombra dos temas (ej. "topografia y ndvi"), entran los dos.
         selected = ["cartera"]
         for name in draft.get("agents") or []:
             key = AGENT_ALIASES.get(normalize_key(name))
@@ -275,11 +286,8 @@ class AgentCrew:
                 selected.append(key)
         if draft.get("water_project") and "aqua" not in selected:
             selected.append("aqua")
-        if draft.get("water_project") and "margen" not in selected:
-            selected.append("margen")
-        if draft.get("economic_review") and "margen" not in selected:
-            selected.append("margen")
-        return selected[:6]
+        selected = [key for key in selected if key not in suspended]
+        return (selected or ["cartera"])[:6]
 
     def _save_run(self, run):
         source, warning = self.store.save_rows("agent_runs", [run])
@@ -524,6 +532,8 @@ Salidas: {json.dumps(worker_payload, ensure_ascii=False)}
             for key in selected
         ]
         if selected == ["cartera"]:
+            return {"decision": None, "runs": worker_runs}
+        if "contralor" in suspended_agents():
             return {"decision": None, "runs": worker_runs}
         control_run = self._run_contralor(
             context,
