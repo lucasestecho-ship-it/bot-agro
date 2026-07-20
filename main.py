@@ -3426,6 +3426,13 @@ async def execute_capataz_telegram_work(
     generated_report = None
     report_error = None
     if allow_consulting_report:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Redactando el informe final. Puede tardar varios minutos; "
+                "te aviso apenas este o si algo falla."
+            ),
+        )
         try:
             generated_report = await asyncio.to_thread(
                 generate_consulting_report,

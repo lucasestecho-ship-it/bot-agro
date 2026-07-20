@@ -383,6 +383,8 @@ EVIDENCIA:
             request["reasoning_effort"] = reasoning_effort
         else:
             request["temperature"] = 0
+        # Tope duro: sin esto, una llamada colgada deja al bot "clavado" sin aviso.
+        request["timeout"] = float(os.environ.get("CAPATAZ_REPORT_TIMEOUT_SECONDS", "420"))
         response = openai_client.chat.completions.create(**request)
         return _normalize_payload(
             extract_json_object(response.choices[0].message.content),
