@@ -15,6 +15,46 @@ body {
   background: linear-gradient(180deg, #e8f1ea 0%, #f4f0e8 42%, #f7f5ef 100%);
 }
 
+.auth-gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+}
+
+.auth-gate[hidden] {
+  display: none;
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  padding: 28px;
+  border: 1px solid #d6ddd2;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 18px 48px rgba(29, 48, 35, 0.16);
+}
+
+.auth-logo {
+  width: 64px;
+  height: 64px;
+  margin-bottom: 18px;
+  border-radius: 16px;
+}
+
+.auth-copy {
+  margin: 10px 0 22px;
+  color: #5b6b60;
+  line-height: 1.45;
+}
+
+.auth-error {
+  margin: 0 0 12px;
+  color: #8f2f26;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
 button,
 input,
 textarea,
