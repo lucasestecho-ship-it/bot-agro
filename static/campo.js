@@ -4,15 +4,78 @@ const ACTIVE_SESSION_KEY = "campo.activeSession";
 const SESSIONS_KEY = "campo.sessions";
 const APP_TOKEN_KEY = "capataz.appToken";
 const nativeFetch = window.fetch.bind(window);
-let tokenPromptPromise = null;
+const authGate = document.getElementById("authGate");
+const authForm = document.getElementById("authForm");
+const authError = document.getElementById("authError");
+const appTokenInput = document.getElementById("appTokenInput");
+const authSubmitButton = document.getElementById("authSubmitButton");
+const appRoot = document.getElementById("appRoot");
+let appTokenRequestPromise = null;
 
-function requestFreshAppToken() {
-  if (!tokenPromptPromise) {
-    tokenPromptPromise = Promise.resolve().then(() => (
-      window.prompt("Clave personal de Capataz Campo", "")?.trim() || ""
-    ));
+function showApp() {
+  authGate.hidden = true;
+  appRoot.hidden = false;
+}
+
+function showLogin(message = "") {
+  appRoot.hidden = true;
+  authGate.hidden = false;
+  authError.textContent = message;
+  authError.hidden = !message;
+  window.setTimeout(() => appTokenInput.focus(), 0);
+}
+
+async function validateAppToken(token) {
+  return nativeFetch("/api/capataz/dashboard", {
+    headers: { "X-Field-App-Token": token },
+  });
+}
+
+function requestFreshAppToken(message = "") {
+  if (appTokenRequestPromise) {
+    if (message) showLogin(message);
+    return appTokenRequestPromise;
   }
-  return tokenPromptPromise;
+
+  showLogin(message);
+  appTokenRequestPromise = new Promise((resolve) => {
+    const submit = async (event) => {
+      event.preventDefault();
+      const token = appTokenInput.value.trim();
+      if (!token) return;
+
+      authSubmitButton.disabled = true;
+      authSubmitButton.textContent = "Comprobando...";
+      authError.hidden = true;
+      try {
+        const response = await validateAppToken(token);
+        if (response.status === 401) {
+          authError.textContent = "La clave no es correcta. Probá de nuevo.";
+          authError.hidden = false;
+          appTokenInput.select();
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        localStorage.setItem(APP_TOKEN_KEY, token);
+        appTokenInput.value = "";
+        showApp();
+        authForm.removeEventListener("submit", submit);
+        resolve(token);
+      } catch (error) {
+        authError.textContent = "No pude comprobar la clave. Revisá la conexión e intentá otra vez.";
+        authError.hidden = false;
+      } finally {
+        authSubmitButton.disabled = false;
+        authSubmitButton.textContent = "Entrar";
+      }
+    };
+    authForm.addEventListener("submit", submit);
+  }).finally(() => {
+    appTokenRequestPromise = null;
+  });
+  return appTokenRequestPromise;
 }
 
 window.fetch = async (input, init = {}) => {
@@ -31,14 +94,16 @@ window.fetch = async (input, init = {}) => {
     const storedToken = localStorage.getItem(APP_TOKEN_KEY) || "";
     const token = storedToken && storedToken !== attemptedToken
       ? storedToken
-      : await requestFreshAppToken();
+      : await requestFreshAppToken("Tu sesión venció. Ingresá nuevamente.");
     if (!token) return response;
     localStorage.setItem(APP_TOKEN_KEY, token);
     const headers = new Headers(options.headers || {});
     headers.set("X-Field-App-Token", token);
     response = await nativeFetch(input, { ...options, headers, _tokenRetried: true });
-    if (response.status === 401) localStorage.removeItem(APP_TOKEN_KEY);
-    window.setTimeout(() => { tokenPromptPromise = null; }, 250);
+    if (response.status === 401) {
+      localStorage.removeItem(APP_TOKEN_KEY);
+      return nativeFetch(input, options);
+    }
   }
   return response;
 };
@@ -1747,22 +1812,36 @@ if ("serviceWorker" in navigator) {
   });
 }
 
-loadInputs();
-const sharedText = localStorage.getItem("capataz.sharedText") || "";
-if (sharedText && noteInput) {
-  noteInput.value = sharedText;
-  localStorage.removeItem("capataz.sharedText");
-  if (sharedTextNotice) sharedTextNotice.hidden = false;
+async function startApp() {
+  loadInputs();
+  const sharedText = localStorage.getItem("capataz.sharedText") || "";
+  if (sharedText && noteInput) {
+    noteInput.value = sharedText;
+    localStorage.removeItem("capataz.sharedText");
+    if (sharedTextNotice) sharedTextNotice.hidden = false;
+  }
+  setConnectionStatus();
+  renderActiveSession();
+  refreshGps();
+  renderItems();
+
+  const savedToken = localStorage.getItem(APP_TOKEN_KEY) || "";
+  if (savedToken) {
+    showApp();
+  } else {
+    await requestFreshAppToken();
+  }
+
+  await Promise.allSettled([
+    renderServerItems(),
+    renderSessions(),
+    loadDashboard(),
+  ]);
+  openNextDraft();
+  window.setInterval(loadDashboard, 15 * 60 * 1000);
 }
-setConnectionStatus();
-renderActiveSession();
-refreshGps();
-renderItems();
-renderServerItems();
-renderSessions();
-loadDashboard();
-openNextDraft();
-window.setInterval(loadDashboard, 15 * 60 * 1000);
+
+startApp();
 
 // --- Navegacion por pestanas (reorden 2026-07) ---
 (function setupTabs() {
