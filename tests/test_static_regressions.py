@@ -23,6 +23,16 @@ class StaticRegressionTests(unittest.TestCase):
         body = self._function("safeExternalUrl", "urlBase64ToUint8Array")
         self.assertIn('!value.trim()', body)
 
+    def test_field_app_uses_one_login_screen_instead_of_browser_prompts(self):
+        index_source = (Path(__file__).parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+        service_worker = (Path(__file__).parents[1] / "static" / "sw.js").read_text(encoding="utf-8")
+        self.assertNotIn("window.prompt", self.source)
+        self.assertIn('id="authGate"', index_source)
+        self.assertIn('id="appTokenInput" type="password"', index_source)
+        self.assertIn("appTokenRequestPromise", self.source)
+        self.assertIn("await requestFreshAppToken()", self.source)
+        self.assertIn('CACHE_NAME = "capataz-campo-v14"', service_worker)
+
     def test_render_keeps_telegram_activation_as_a_secret_setting(self):
         render_config = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
         telegram_setting = render_config.split("- key: ENABLE_TELEGRAM_BOT", 1)[1].split(
