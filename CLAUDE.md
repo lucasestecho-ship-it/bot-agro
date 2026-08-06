@@ -9,7 +9,8 @@ Asistente de consultora agropecuaria de Lucas Estecho (Entre Ríos, Argentina). 
 - **`capataz.py`** — orquestador "Capataz": recibe eventos, enruta a los agentes, gestiona decisiones que Lucas aprueba/rechaza.
 - **`agent_crew.py`** — cuadrilla de agentes internos (corren con OpenAI en producción): Cartera, Aqua, Hidro, Topo, Margen, Informes, Comercial, Recetas, Tero, Contralor, Ejecutor. Registry en `AGENT_SPECS`.
 - **`geospatial_worker.py`** — análisis geoespacial: DEM/topografía, NDVI (rasters, KML/GeoJSON, descarga desde Copernicus CDSE).
-- **`archive_manager.py` / `windows/`** — tarea de Windows que archiva archivos pesados en la PC de Lucas.
+- **`archive_manager.py` / `windows/archivar_supabase.py`** — tarea de Windows que archiva archivos pesados en la PC de Lucas. Descarga y **borra** del storage: es archivar, no respaldar.
+- **`windows/respaldar_supabase.py`** — respaldo diario de la base a un ZIP fechado en Dropbox, con rotación. Solo lee (`/api/backup/*`), nunca borra. Cubre lo irrecuperable: recorridas, transcripciones, texto de informes, clientes, decisiones. Si se agrega una tabla nueva al esquema, hay que sumarla a `BACKUP_TABLES` en `main.py` o queda fuera del respaldo.
 - **`gmail_drafts.py`** — borradores de correo vía Gmail API.
 - **Infra:** Render Free (deploy automático al pushear a `main`), Supabase (storage temporal + cron), Telegram webhook.
 

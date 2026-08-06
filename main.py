@@ -305,6 +305,47 @@ def fetch_supabase_rows(table, columns, order=None, limit=None):
         raise RuntimeError(response.text)
     return response.json()
 
+# Tablas que entran en el respaldo. Es una lista blanca a proposito: el endpoint
+# solo lee de acá, asi que no se puede pedir una tabla arbitraria.
+# push_subscriptions queda afuera: guarda credenciales del navegador, no aporta
+# nada a un respaldo y se regenera sola cuando el telefono vuelve a suscribirse.
+BACKUP_TABLES = [
+    "field_sessions",
+    "field_items",
+    "field_reports",
+    "clients",
+    "client_events",
+    "client_facts",
+    "tasks",
+    "decisions",
+    "agent_runs",
+    "email_drafts",
+    "crop_lots",
+    "crop_events",
+    "water_projects",
+    "intake_assets",
+    "archive_objects",
+]
+BACKUP_PAGE_SIZE = 500
+BACKUP_MAX_PAGE_SIZE = 2000
+
+def fetch_backup_page(table, offset=0, limit=BACKUP_PAGE_SIZE):
+    """Una pagina de una tabla, ordenada de forma estable.
+
+    Se pide de a pedazos porque Render Free tiene poca memoria: traer una tabla
+    entera de golpe es la forma mas facil de tumbar el servicio.
+    """
+    if table not in BACKUP_TABLES:
+        raise ValueError(f"tabla no habilitada para respaldo: {table}")
+    url = (
+        f"{SUPABASE_URL}/rest/v1/{table}"
+        f"?select=*&order=id.asc&offset={int(offset)}&limit={int(limit)}"
+    )
+    response = requests.get(url, headers=supabase_headers(), timeout=60)
+    if not response.ok:
+        raise RuntimeError(response.text)
+    return response.json()
+
 def with_default_columns(row, columns):
     for column in columns:
         row.setdefault(column, None)
@@ -4086,6 +4127,38 @@ async def receive_telegram_webhook(request: Request):
     if update is not None:
         await telegram_app.update_queue.put(update)
     return {"ok": True}
+
+@fastapi_app.get("/api/backup/tables")
+async def backup_tables():
+    """Que tablas hay para respaldar. El cliente recorre esta lista."""
+    return {
+        "ok": True,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "page_size": BACKUP_PAGE_SIZE,
+        "tables": BACKUP_TABLES,
+    }
+
+@fastapi_app.get("/api/backup/table/{table}")
+async def backup_table(table: str, offset: int = 0, limit: int = BACKUP_PAGE_SIZE):
+    """Una pagina de filas de una tabla habilitada."""
+    if table not in BACKUP_TABLES:
+        raise HTTPException(status_code=404, detail=f"Tabla no habilitada: {table}")
+    limit = max(1, min(int(limit), BACKUP_MAX_PAGE_SIZE))
+    offset = max(0, int(offset))
+    try:
+        rows = fetch_backup_page(table, offset=offset, limit=limit)
+    except Exception as e:
+        logger.error(f"Respaldo ERROR en {table}: {e}")
+        raise HTTPException(status_code=502, detail=f"No se pudo leer {table}: {e}")
+    return {
+        "ok": True,
+        "table": table,
+        "offset": offset,
+        "limit": limit,
+        "count": len(rows),
+        "has_more": len(rows) == limit,
+        "rows": rows,
+    }
 
 @fastapi_app.get("/api/health/campo")
 async def health_campo():
