@@ -18,6 +18,7 @@ import requests
 from fastapi import BackgroundTasks, Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from openai import OpenAI
@@ -3997,10 +3998,19 @@ async def fastapi_lifespan(app: FastAPI):
             await telegram_app.shutdown()
 
 fastapi_app = FastAPI(title="Capataz Campo", lifespan=fastapi_lifespan)
+fastapi_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 fastapi_app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @fastapi_app.middleware("http")
 async def protect_private_api(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
     is_private_api = (
         request.url.path.startswith("/api/")
         and request.url.path != "/api/health/campo"
