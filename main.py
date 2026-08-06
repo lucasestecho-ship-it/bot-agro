@@ -121,10 +121,7 @@ REPORT_PDF_CONTENT_TYPE = "application/pdf"
 MAX_AUDIO_UPLOAD_BYTES = 30 * 1024 * 1024
 MAX_PHOTO_UPLOAD_BYTES = 20 * 1024 * 1024
 REPORT_SECTION_TITLES = [
-    "Diagnostico de situacion",
-    "Observaciones principales",
-    "Analisis economico para la decision",
-    "Recomendaciones",
+    "Observaciones de la recorrida",
 ]
 NOISE_TRANSCRIPTS = {
     "bye",
@@ -1130,16 +1127,55 @@ def valid_transcript_blocks(audios):
         )
     return blocks
 
-def transcript_report_markdown(audios):
-    transcript_blocks = valid_transcript_blocks(audios)
-    if not transcript_blocks:
-        if audios:
-            return "No se pudieron incorporar transcripciones válidas de esta recorrida."
-        return "No se registraron notas de voz en esta recorrida."
-    return "\n\n".join(
-        f"### Nota de voz {index}\n{block}"
-        for index, block in enumerate(transcript_blocks, start=1)
+def plain_observation_lines(audios):
+    """Observaciones textuales, sin narrar. Se usan solo si falla la redaccion con IA."""
+    lines = []
+    for audio in audios:
+        transcript = normalize_transcript_text(audio.get("transcript_text"))
+        if is_noise_transcript(transcript):
+            continue
+        lines.append(f"- {transcript}")
+    return lines
+
+def fallback_observations_markdown(audios):
+    lines = plain_observation_lines(audios)
+    if lines:
+        return "\n".join(lines)
+    if audios:
+        return "No se pudieron incorporar las notas de voz de esta recorrida."
+    return "No registrado en la recorrida."
+
+def general_data_markdown(session, audios, photos):
+    return (
+        "## Datos generales\n"
+        f"- Campo: {session.get('campo') or 'No registrado en la recorrida'}\n"
+        f"- Sector: {session.get('sector') or 'No registrado en la recorrida'}\n"
+        f"- Fecha de inicio: {session.get('started_at') or 'No registrado en la recorrida'}\n"
+        f"- Fecha de cierre: {session.get('closed_at') or 'No registrado en la recorrida'}\n"
+        f"- Cantidad de notas de voz: {len(audios)}\n"
+        f"- Cantidad de fotos: {len(photos)}"
     )
+
+def sanitize_observations(text):
+    """Saca encabezados y negritas: la seccion debe quedar plana o la extraccion se corta."""
+    lines = []
+    for line in (text or "").splitlines():
+        cleaned = clean_inline_markdown(line).strip()
+        if cleaned.startswith("#"):
+            cleaned = cleaned.lstrip("#").strip()
+            if not cleaned:
+                continue
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines).strip()
+
+def assemble_report_markdown(session, audios, photos, observations_text):
+    observations = sanitize_observations(observations_text) or "No registrado en la recorrida."
+    return "\n\n".join([
+        f"# Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or '')[:10]}",
+        general_data_markdown(session, audios, photos),
+        f"## Observaciones de la recorrida\n{observations}",
+    ])
 
 def audio_error_lines(audios_con_error):
     return [
@@ -1169,84 +1205,72 @@ def summarized_item_lines(items, limit=LIGHT_REPORT_ITEM_LIMIT):
     return lines
 
 def build_basic_report_markdown(session, audios, photos, items, audios_con_error=None):
+    """Informe de respaldo: si falla la redaccion con IA, las observaciones van tal cual se dictaron."""
+    return assemble_report_markdown(session, audios, photos, fallback_observations_markdown(audios))
+
+OBSERVATIONS_SYSTEM_PROMPT = (
+    "Sos un asesor agropecuario que pasa en limpio las notas de voz que dicto durante una recorrida. "
+    "Reescribis lo dictado en registro profesional e impersonal. Nunca agregas informacion propia."
+)
+
+def build_observations_prompt(session, audios, photos, items):
     transcript_blocks = valid_transcript_blocks(audios)
-    transcript_section = transcript_report_markdown(audios)
-    audio_error_count = len(audios_con_error or [])
-    summary = (
-        "Informe generado con las notas de voz y la metadata registradas durante la recorrida."
-        if transcript_blocks
-        else "Informe elaborado con la metadata disponible. No se agregan conclusiones fuera de los datos registrados."
-    )
-    return "\n\n".join([
-        f"# Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or '')[:10]}",
-        "## Datos generales\n"
-        f"- Campo: {session.get('campo') or 'No registrado en la recorrida'}\n"
-        f"- Sector: {session.get('sector') or 'No registrado en la recorrida'}\n"
-        f"- Fecha de inicio: {session.get('started_at') or 'No registrado en la recorrida'}\n"
-        f"- Fecha de cierre: {session.get('closed_at') or 'No registrado en la recorrida'}\n"
-        f"- Cantidad de notas de voz: {len(audios)}\n"
-        f"- Notas con error de transcripción: {audio_error_count}\n"
-        f"- Cantidad de fotos: {len(photos)}",
-        f"## Resumen ejecutivo\n{summary}",
-        "## Diagnostico de situacion\nNo registrado en la recorrida.",
-        "## Observaciones principales\n" + (
-            "Las observaciones de la recorrida están preservadas en la sección de notas de voz."
-            if transcript_blocks
-            else "No registrado en la recorrida."
-        ),
-        "## Analisis economico para la decision\nNo se registraron costos ni beneficios cuantificables. Completar precios, cantidades y horizonte antes de decidir una inversion.",
-        "## Recomendaciones\nRevisar las evidencias disponibles y completar observaciones manuales si corresponde.",
-        f"## Notas de voz registradas\n{transcript_section}",
-    ])
+    light_mode = len(items) > LIGHT_REPORT_ITEM_LIMIT
+    item_lines = summarized_item_lines(items) if light_mode else [format_item_line(item) for item in items]
+    return f"""
+Redacta la seccion "Observaciones de la recorrida" de un informe para un cliente real.
+
+Las notas de voz de abajo fueron dictadas por el asesor mientras caminaba el campo, en primera persona.
+Tu unica tarea es pasarlas en limpio: mismo contenido, redactado en forma impersonal y en pasado.
+
+Ejemplo de lo que se espera:
+Nota dictada: "aca estoy caminando y se ve nublado"
+Redaccion correcta: "Se observo que el dia estaba nublado."
+
+Reglas estrictas:
+- No agregues ninguna observacion, causa, diagnostico, prioridad, recomendacion ni plan de accion que no este dicho en las notas.
+- No inventes datos, dosis, precios, fechas, superficies, cantidades ni nombres.
+- Conserva TODAS las observaciones dictadas, incluidas las breves o menores. No omitas ninguna.
+- Si una nota es solo contexto (clima, donde esta parado, hora), incluila igual como observacion.
+- No interpretes las fotos ni describas su contenido visual.
+- No menciones audios, notas de voz, transcripciones, IDs, nombres de archivo ni errores internos.
+- No uses markdown de negritas con **. No escribas titulos ni encabezados.
+- Escribi en español rioplatense, claro y sobrio.
+- Devolve un parrafo breve, o viñetas con guion si hay varias observaciones separadas.
+
+Si no hay ninguna nota utilizable, responde exactamente: No registrado en la recorrida.
+
+Contexto de la recorrida (no lo repitas como observacion):
+{json.dumps(session, ensure_ascii=False, indent=2)}
+
+Notas de voz dictadas durante la recorrida:
+{chr(10).join(transcript_blocks) or "No registrado en la recorrida"}
+
+Items relevados, solo metadata (no los describas):
+{chr(10).join(item_lines) or "No registrado en la recorrida"}
+"""
 
 def build_report_markdown(session, audios, photos, items, audios_con_error=None):
     logger.info("Generando texto del informe")
-    transcript_blocks = valid_transcript_blocks(audios)
-    light_mode = len(items) > LIGHT_REPORT_ITEM_LIMIT
-    photo_lines = summarized_photo_lines(photos)
-    item_lines = summarized_item_lines(items) if light_mode else [format_item_line(item) for item in items]
-    prompt = f"""
-Redacta un informe profesional, limpio y corto para cliente.
-No inventes datos. Si falta informacion, escribir "No registrado en la recorrida".
-No interpretes fotos ni describas su contenido visual; las fotos son solo evidencia documental.
-Las recomendaciones deben basarse solo en las notas de voz transcriptas y la metadata de campo.
-Integra la dimension economica a la decision: alternativas, costos y beneficios a cuantificar, horizonte y riesgos. No inventes precios ni montos.
-Integra todas las notas de voz válidas en el resumen, el diagnóstico, las observaciones o las recomendaciones; no omitas notas por ser breves.
-No muestres IDs de audios, nombres de archivos ni errores internos.
-No escribas secciones llamadas Audios transcriptos, Audios no transcriptos, Anexo tecnico o Informe Tecnico de Consultoria Agronomica.
-No uses markdown de negritas con **.
-
-Estructura requerida:
-1. Resumen ejecutivo
-2. Diagnostico de situacion
-3. Observaciones principales
-4. Analisis economico para la decision
-5. Recomendaciones
-
-Recorrida:
-{json.dumps(session, ensure_ascii=False, indent=2)}
-
-Notas de voz transcriptas que deben incorporarse al análisis:
-{chr(10).join(transcript_blocks) or "No registrado en la recorrida"}
-
-Fotos como evidencia, solo metadata:
-{chr(10).join(photo_lines) or "No registrado en la recorrida"}
-
-Items relevados, solo metadata resumida:
-{chr(10).join(item_lines) or "No registrado en la recorrida"}
-"""
+    if not valid_transcript_blocks(audios):
+        return assemble_report_markdown(session, audios, photos, fallback_observations_markdown(audios))
     response = get_openai_client().chat.completions.create(
         model=os.environ.get("FIELD_REPORT_MODEL", "gpt-4o-mini"),
         messages=[
-            {"role": "system", "content": "Sos un asesor ganadero profesional. Escribis claro, breve, util y sin inventar datos."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": OBSERVATIONS_SYSTEM_PROMPT},
+            {"role": "user", "content": build_observations_prompt(session, audios, photos, items)},
         ],
         temperature=0.2,
     )
-    report_markdown = response.choices[0].message.content.strip()
-    return f"{report_markdown}\n\n## Notas de voz registradas\n{transcript_report_markdown(audios)}"
+    observations = response.choices[0].message.content.strip()
+    return assemble_report_markdown(session, audios, photos, observations)
 
 def markdown_summary(markdown_text):
+    observations = extract_markdown_section(markdown_text, "Observaciones de la recorrida")
+    for line in observations.splitlines():
+        cleaned = clean_inline_markdown(line).strip().lstrip("-*").strip()
+        if cleaned:
+            return cleaned[:1000]
     for line in markdown_text.splitlines():
         cleaned = clean_inline_markdown(line).strip().lstrip("#").strip()
         if cleaned and not cleaned.lower().startswith("informe de recorrida"):
@@ -1609,8 +1633,6 @@ def create_report_docx(session, items, audios, photos, markdown_text, output_pat
         set_cell_border(row[1], color="D6C7A8", size="6")
 
     add_divider(document)
-    document.add_heading("Resumen ejecutivo", level=1)
-    add_highlight_box(document, "Resumen ejecutivo", extract_markdown_section(markdown_text, "Resumen ejecutivo"))
 
     for section_title in REPORT_SECTION_TITLES:
         document.add_paragraph()
@@ -1737,7 +1759,7 @@ def create_report_pdf(session, items, audios, photos, markdown_text, output_path
     ]))
     story.extend([details_table, Spacer(1, 12)])
 
-    for section_title in ["Resumen ejecutivo", *REPORT_SECTION_TITLES]:
+    for section_title in REPORT_SECTION_TITLES:
         story.append(Paragraph(html.escape(section_title), styles["CapatazHeading"]))
         section_text = extract_markdown_section(markdown_text, section_title)
         paragraphs = [line.strip() for line in section_text.splitlines() if line.strip()]
