@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-from openai import OpenAI
+import llm
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
@@ -134,7 +134,7 @@ NOISE_TRANSCRIPTS = {
     "sin transcripción disponible",
 }
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+openai_client = llm.get_client()
 agent_crew = AgentCrew(capataz_store, openai_client=openai_client)
 push_notifier = PushNotifier(capataz_store)
 gmail_service = GmailDraftService()
@@ -150,9 +150,12 @@ archive_manager = ArchiveManager(
 )
 
 def get_openai_client():
-    if not openai_client:
+    """Cliente crudo. Solo para inyectar en modulos que lo reciben por parametro.
+    Para pedir texto o transcribir, usar llm.complete() y llm.transcribe()."""
+    client = llm.get_client()
+    if not client:
         raise RuntimeError("OPENAI_API_KEY no configurado")
-    return openai_client
+    return client
 
 # Estado en memoria de recorridas activas por chat_id
 # { chat_id: {"campo": str, "inicio": datetime, "items": [ {tipo, texto, foto_path} ]} }
@@ -1254,15 +1257,14 @@ def build_report_markdown(session, audios, photos, items, audios_con_error=None)
     logger.info("Generando texto del informe")
     if not valid_transcript_blocks(audios):
         return assemble_report_markdown(session, audios, photos, fallback_observations_markdown(audios))
-    response = get_openai_client().chat.completions.create(
-        model=os.environ.get("FIELD_REPORT_MODEL", "gpt-4o-mini"),
+    observations = llm.complete(
+        profile="informe",
         messages=[
             {"role": "system", "content": OBSERVATIONS_SYSTEM_PROMPT},
             {"role": "user", "content": build_observations_prompt(session, audios, photos, items)},
         ],
         temperature=0.2,
-    )
-    observations = response.choices[0].message.content.strip()
+    ).strip()
     return assemble_report_markdown(session, audios, photos, observations)
 
 def markdown_summary(markdown_text):
@@ -2022,20 +2024,15 @@ def get_next_receta_number(worksheet):
     return max(nums) + 1 if nums else 1
 
 def transcribe_audio(file_path):
-    with open(file_path, "rb") as audio_file:
-        transcript = get_openai_client().audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file
-        )
-    return transcript.text
+    return llm.transcribe(file_path)
 
 def image_to_base64(image_path):
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
 def transcribe_image_base64(image_base64):
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o",
+    response_text = llm.complete(
+        profile="vision",
         messages=[
             {
                 "role": "user",
@@ -2060,7 +2057,7 @@ def transcribe_image_base64(image_base64):
         ],
         max_tokens=1500
     )
-    return response.choices[0].message.content.strip()
+    return response_text.strip()
 
 def transcribe_image(image_path):
     image_base64 = image_to_base64(image_path)
@@ -2069,8 +2066,8 @@ def transcribe_image(image_path):
 def describir_imagen_recorrida(image_path):
     """Describe una foto de campo en contexto de recorrida tecnica."""
     image_base64 = image_to_base64(image_path)
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o",
+    response_text = llm.complete(
+        profile="vision",
         messages=[
             {
                 "role": "user",
@@ -2094,7 +2091,7 @@ def describir_imagen_recorrida(image_path):
         ],
         max_tokens=400
     )
-    return response.choices[0].message.content.strip()
+    return response_text.strip()
 
 def transcribe_pdf(pdf_path):
     document = fitz.open(pdf_path)
@@ -2147,11 +2144,11 @@ def clasificar_mensaje(text):
         "Responde UNICAMENTE con una de estas palabras: receta, cliente_nuevo, cliente_consulta, cliente_update, tarea, recorrida, presupuesto, compra, idea\n\n"
         f"Mensaje: {text}"
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    return response.choices[0].message.content.strip().lower()
+    return response_text.strip().lower()
 
 def extract_receta(text):
     today = datetime.now().strftime("%d/%m/%Y")
@@ -2171,11 +2168,11 @@ def extract_receta(text):
         'REGLAS: orden de carga: primero=1, segundo=2, etc. Dosis solo numero. Solo JSON sin markdown.\n'
         f'Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_cliente_nuevo(text):
@@ -2205,11 +2202,11 @@ def extract_cliente_nuevo(text):
         '}\n'
         f'Hoy es {today}. Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_cliente_update(text):
@@ -2224,11 +2221,11 @@ def extract_cliente_update(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_tarea(text):
@@ -2249,11 +2246,11 @@ def extract_tarea(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_recorrida(text):
@@ -2275,11 +2272,11 @@ def extract_recorrida(text):
         '}\n'
         f'Hoy es {today}. Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_presupuesto(text):
@@ -2301,11 +2298,11 @@ def extract_presupuesto(text):
         '}\n'
         f'Hoy es {today}. Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_compra(text):
@@ -2326,11 +2323,11 @@ def extract_compra(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def extract_idea(text):
@@ -2347,11 +2344,11 @@ def extract_idea(text):
         '}\n'
         f'Mensaje: {text}'
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def get_clientes_activos():
@@ -2444,11 +2441,11 @@ def generar_resumen_recorrida(campo, items):
         "}\n\n"
         f"Notas:\n{contenido}"
     )
-    response = get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
+    response_text = llm.complete(
+        profile="rapido",
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = response.choices[0].message.content.replace("```json", "").replace("```", "").strip()
+    raw = response_text.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 def crear_docx_recorrida(campo, fecha_str, resumen_data, items, output_path):
@@ -4106,6 +4103,14 @@ async def health_campo():
             "OPENAI_API_KEY": bool(OPENAI_API_KEY),
             "DATA_DIR": str(DATA_DIR),
             "ENABLE_TELEGRAM_BOT": os.environ.get("ENABLE_TELEGRAM_BOT", "false"),
+        },
+        "ia": {
+            "configurada": llm.is_configured(),
+            "respaldo_configurado": llm.fallback_configured(),
+            "modelo_informe": llm.model_for("informe"),
+            "modelo_rapido": llm.model_for("rapido"),
+            "modelo_vision": llm.model_for("vision"),
+            "modelo_transcripcion": llm.model_for("transcripcion"),
         },
         "storage": check_supabase_storage_health(),
         "tables": tables,
