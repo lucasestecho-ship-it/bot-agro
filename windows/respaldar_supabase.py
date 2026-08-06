@@ -328,6 +328,41 @@ def programar_tarea(python_exe, script):
         raise RuntimeError(f"No se pudo crear la tarea programada: {resultado.stderr.strip()}")
 
 
+def cargar_clave():
+    """Pide la clave una sola vez y la guarda en el almacen de Windows.
+
+    Es lo unico que no se puede automatizar: la clave no vive en el repo ni en
+    ningun archivo, solo en el keyring del equipo.
+    """
+    print("Clave de acceso de Capataz Campo")
+    print("-" * 48)
+    existente = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
+    if existente:
+        print("Ya habia una clave guardada. Si escribis una nueva, la reemplaza.")
+        print("Si no queres cambiarla, cerra esta ventana.")
+    print("\nEs la misma clave que usas para entrar a Capataz Campo desde el celular")
+    print("(FIELD_APP_TOKEN en Render). No se muestra mientras la escribis.\n")
+
+    clave = getpass.getpass("Clave: ").strip()
+    if not clave:
+        print("No escribiste nada. No se guardo nada.")
+        return 1
+
+    sugerido = valores_sugeridos()
+    print("\nProbando la clave contra el servidor...")
+    try:
+        api_get(sugerido["base_url"], "/api/backup/tables", clave)
+    except Exception as e:
+        print(f"\nLa clave no funciono: {e}")
+        print("No se guardo nada. Revisa la clave y proba de nuevo.")
+        return 1
+
+    keyring.set_password(KEYRING_SERVICE, KEYRING_USER, clave)
+    print("\nClave verificada y guardada en el almacen de Windows.")
+    print("Ya podes volver a ejecutar instalar-respaldo.bat.")
+    return 0
+
+
 def valores_sugeridos():
     """Que proponer sin preguntarle nada a nadie."""
     anterior = {}
@@ -433,9 +468,14 @@ def main():
     parser.add_argument("--base-url", dest="base_url", help="direccion de Capataz Campo")
     parser.add_argument("--carpeta", help="carpeta donde guardar los respaldos")
     parser.add_argument("--copias", type=int, help="cuantas copias conservar")
+    parser.add_argument("--cargar-clave", action="store_true", dest="cargar_clave",
+                        help="pedir y guardar la clave de acceso, nada mas")
     args = parser.parse_args()
 
     configure_logging(args.verbose or args.setup or args.verificar or args.sin_preguntas)
+
+    if args.cargar_clave:
+        return cargar_clave()
 
     if args.setup or args.sin_preguntas:
         return setup(
