@@ -690,7 +690,11 @@ async function renderSessions() {
       const report = await fetchSessionReport(session.id);
       const reportState = report.estado || "sin informe";
       const reportMarkdown = report.informe_markdown || "";
-      const reportButtonText = reportState === "error" ? "Reintentar informe" : "Generar informe";
+      const reportButtonText = reportState === "error"
+        ? "Reintentar informe"
+        : reportState === "done"
+          ? "Regenerar informe"
+          : "Generar informe";
       li.innerHTML = `
         <div class="item-main">
           <span>${escapeHtml(session.nombre || "Recorrida sin nombre")}${session.legacy ? " (datos viejos)" : ""}</span>
@@ -711,7 +715,8 @@ async function renderSessions() {
       sessionsList.appendChild(li);
       const button = li.querySelector(".generate-report-button");
       if (button) {
-        button.addEventListener("click", () => generateReportForSession(session.id, button, reportState === "error"));
+        const forceReportGeneration = reportState === "error" || reportState === "done";
+        button.addEventListener("click", () => generateReportForSession(session.id, button, forceReportGeneration));
       }
     }
   } catch (error) {

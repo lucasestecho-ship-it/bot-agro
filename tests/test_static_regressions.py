@@ -33,6 +33,11 @@ class StaticRegressionTests(unittest.TestCase):
         self.assertIn("await requestFreshAppToken()", self.source)
         self.assertIn('CACHE_NAME = "capataz-campo-v14"', service_worker)
 
+    def test_completed_field_report_can_be_regenerated(self):
+        self.assertIn('reportState === "done"\n          ? "Regenerar informe"', self.source)
+        self.assertIn('reportState === "error" || reportState === "done"', self.source)
+        self.assertIn('force ? "?force=true" : ""', self.source)
+
     def test_render_keeps_telegram_activation_as_a_secret_setting(self):
         render_config = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
         telegram_setting = render_config.split("- key: ENABLE_TELEGRAM_BOT", 1)[1].split(
