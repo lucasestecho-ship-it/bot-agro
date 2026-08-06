@@ -1113,9 +1113,7 @@ def is_noise_transcript(text):
     normalized = cleaned.lower().strip(" .,!¡¿?;:")
     if not normalized:
         return True
-    if normalized in NOISE_TRANSCRIPTS:
-        return True
-    return len(normalized) < 8
+    return normalized in NOISE_TRANSCRIPTS
 
 def valid_transcript_blocks(audios):
     blocks = []
@@ -1130,6 +1128,17 @@ def valid_transcript_blocks(audios):
             )
         )
     return blocks
+
+def transcript_report_markdown(audios):
+    transcript_blocks = valid_transcript_blocks(audios)
+    if not transcript_blocks:
+        if audios:
+            return "No se pudieron incorporar transcripciones válidas de esta recorrida."
+        return "No se registraron notas de voz en esta recorrida."
+    return "\n\n".join(
+        f"### Nota de voz {index}\n{block}"
+        for index, block in enumerate(transcript_blocks, start=1)
+    )
 
 def audio_error_lines(audios_con_error):
     return [
@@ -1159,15 +1168,14 @@ def summarized_item_lines(items, limit=LIGHT_REPORT_ITEM_LIMIT):
     return lines
 
 def build_basic_report_markdown(session, audios, photos, items, audios_con_error=None):
-    audios_con_error = audios_con_error or []
-    transcript_lines = [
-        f"### {audio.get('nombre_archivo') or audio.get('id')}\n{audio.get('transcript_text')}"
-        for audio in audios
-        if audio.get("transcript_text")
-    ]
-    if not transcript_lines:
-        transcript_lines = ["No se pudieron transcribir audios válidos de esta recorrida."]
-
+    transcript_blocks = valid_transcript_blocks(audios)
+    transcript_section = transcript_report_markdown(audios)
+    audio_error_count = len(audios_con_error or [])
+    summary = (
+        "Informe generado con las notas de voz y la metadata registradas durante la recorrida."
+        if transcript_blocks
+        else "Informe elaborado con la metadata disponible. No se agregan conclusiones fuera de los datos registrados."
+    )
     return "\n\n".join([
         f"# Informe de recorrida - {session.get('campo') or 'Campo'} - {(session.get('started_at') or '')[:10]}",
         "## Datos generales\n"
@@ -1175,85 +1183,19 @@ def build_basic_report_markdown(session, audios, photos, items, audios_con_error
         f"- Sector: {session.get('sector') or 'No registrado en la recorrida'}\n"
         f"- Fecha de inicio: {session.get('started_at') or 'No registrado en la recorrida'}\n"
         f"- Fecha de cierre: {session.get('closed_at') or 'No registrado en la recorrida'}\n"
-        f"- Cantidad de audios: {len(audios)}\n"
+        f"- Cantidad de notas de voz: {len(audios)}\n"
+        f"- Notas con error de transcripción: {audio_error_count}\n"
         f"- Cantidad de fotos: {len(photos)}",
-        "## Resumen ejecutivo\nNo registrado en la recorrida" if transcript_lines[0].startswith("No se pudieron") else "## Resumen ejecutivo\nInforme generado con las transcripciones disponibles y la metadata de campo.",
-        "## Observaciones relevadas\n" + "\n\n".join(transcript_lines),
-        "## Evidencias fotograficas\n" + ("\n".join(format_item_line(photo) for photo in photos) or "No registrado en la recorrida"),
-        "## Audios no transcriptos\n" + ("\n".join(audio_error_lines(audios_con_error)) or "No registrado en la recorrida"),
-        "## Recomendaciones / proximos pasos\nNo surgieron recomendaciones específicas de la recorrida",
-        "## Anexo tecnico\n" + ("\n".join(format_item_line(item) for item in items) or "No registrado en la recorrida"),
-    ])
-
-def build_report_markdown(session, audios, photos, items, audios_con_error=None):
-    logger.info("Generando texto del informe")
-    audios_con_error = audios_con_error or []
-    transcript_blocks = []
-    for audio in audios:
-        transcript_blocks.append(
-            "Audio {id} ({fecha}):\n{texto}".format(
-                id=audio.get("id", ""),
-                fecha=audio.get("fecha_hora") or "sin fecha",
-                texto=audio.get("transcript_text") or "Sin transcripcion disponible",
-            )
-        )
-
-    light_mode = len(items) > LIGHT_REPORT_ITEM_LIMIT
-    photo_lines = summarized_photo_lines(photos)
-    item_lines = summarized_item_lines(items) if light_mode else [format_item_line(item) for item in items]
-    audio_error_text = "\n".join(audio_error_lines(audios_con_error))
-    no_valid_audio_text = ""
-    if not any(audio.get("transcript_text") for audio in audios):
-        no_valid_audio_text = "No se pudieron transcribir audios válidos de esta recorrida."
-    prompt = f"""
-Redacta un informe tecnico/profesional de consultoria agronomica para cliente.
-No inventes datos. Si falta informacion, escribir "No registrado en la recorrida".
-No interpretes fotos ni describas su contenido visual; las fotos son solo evidencia documental.
-Las recomendaciones deben basarse solo en lo dicho en los audios transcriptos.
-
-Estructura requerida:
-1. Titulo
-2. Datos generales
-3. Resumen ejecutivo
-4. Observaciones relevadas
-5. Evidencias fotograficas
-6. Audios transcriptos
-7. Recomendaciones / proximos pasos
-8. Anexo tecnico
-9. Audios no transcriptos, si corresponde
-
-Recorrida:
-{json.dumps(session, ensure_ascii=False, indent=2)}
-
-Audios transcriptos:
-{chr(10).join(transcript_blocks) or no_valid_audio_text or "No registrado en la recorrida"}
-
-Audios no transcriptos:
-{audio_error_text or "No registrado en la recorrida"}
-
-Fotos como evidencia, sin interpretacion:
-{chr(10).join(photo_lines) or "No registrado en la recorrida"}
-
-Listado completo de items:
-{chr(10).join(item_lines) or "No registrado en la recorrida"}
-"""
-    response = get_openai_client().chat.completions.create(
-        model=os.environ.get("FIELD_REPORT_MODEL", "gpt-4o-mini"),
-        messages=[
-            {"role": "system", "content": "Sos un consultor agronomico profesional. Escribis claro, util y sin inventar datos."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content.strip()
-
-def build_basic_report_markdown(session, audios, photos, items, audios_con_error=None):
-    return "\n\n".join([
-        "## Resumen ejecutivo\nInforme elaborado con la informacion relevada durante la recorrida. No se agregan conclusiones fuera de los datos disponibles.",
+        f"## Resumen ejecutivo\n{summary}",
         "## Diagnostico de situacion\nNo registrado en la recorrida.",
-        "## Observaciones principales\nLa recorrida cuenta con evidencias documentales, coordenadas y registros de campo asociados.",
+        "## Observaciones principales\n" + (
+            "Las observaciones de la recorrida están preservadas en la sección de notas de voz."
+            if transcript_blocks
+            else "No registrado en la recorrida."
+        ),
         "## Analisis economico para la decision\nNo se registraron costos ni beneficios cuantificables. Completar precios, cantidades y horizonte antes de decidir una inversion.",
         "## Recomendaciones\nRevisar las evidencias disponibles y completar observaciones manuales si corresponde.",
+        f"## Notas de voz registradas\n{transcript_section}",
     ])
 
 def build_report_markdown(session, audios, photos, items, audios_con_error=None):
@@ -1268,8 +1210,8 @@ No inventes datos. Si falta informacion, escribir "No registrado en la recorrida
 No interpretes fotos ni describas su contenido visual; las fotos son solo evidencia documental.
 Las recomendaciones deben basarse solo en las notas de voz transcriptas y la metadata de campo.
 Integra la dimension economica a la decision: alternativas, costos y beneficios a cuantificar, horizonte y riesgos. No inventes precios ni montos.
-No copies textualmente las transcripciones.
-No muestres IDs de audios, nombres de audios, errores de audios ni frases irrelevantes.
+Integra todas las notas de voz válidas en el resumen, el diagnóstico, las observaciones o las recomendaciones; no omitas notas por ser breves.
+No muestres IDs de audios, nombres de archivos ni errores internos.
 No escribas secciones llamadas Audios transcriptos, Audios no transcriptos, Anexo tecnico o Informe Tecnico de Consultoria Agronomica.
 No uses markdown de negritas con **.
 
@@ -1283,7 +1225,7 @@ Estructura requerida:
 Recorrida:
 {json.dumps(session, ensure_ascii=False, indent=2)}
 
-Notas de voz transcriptas, solo como insumo interno:
+Notas de voz transcriptas que deben incorporarse al análisis:
 {chr(10).join(transcript_blocks) or "No registrado en la recorrida"}
 
 Fotos como evidencia, solo metadata:
@@ -1300,7 +1242,8 @@ Items relevados, solo metadata resumida:
         ],
         temperature=0.2,
     )
-    return response.choices[0].message.content.strip()
+    report_markdown = response.choices[0].message.content.strip()
+    return f"{report_markdown}\n\n## Notas de voz registradas\n{transcript_report_markdown(audios)}"
 
 def markdown_summary(markdown_text):
     for line in markdown_text.splitlines():
@@ -1927,7 +1870,8 @@ def generate_field_report(session_id, force=False):
             transcribe_field_audio(audio, work_dir)
 
         audios_con_error = [audio for audio in audios if audio.get("transcript_status") == "error"]
-        valid_audio_count = sum(1 for audio in audios if audio.get("transcript_text"))
+        valid_audio_count = len(valid_transcript_blocks(audios))
+        logger.info(f"Transcripciones incorporadas al informe: {valid_audio_count}")
         if not valid_audio_count:
             logger.info("No se pudieron transcribir audios validos de esta recorrida.")
 
