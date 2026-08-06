@@ -46,6 +46,7 @@ TASK_DAILY = "Capataz Campo - Respaldar base diariamente"
 DEFAULT_KEEP = 30
 DEFAULT_PAGE_SIZE = 500
 REQUEST_TIMEOUT = 120
+DEFAULT_BASE_URL = "https://bot-agro-campo.onrender.com"
 
 
 # ----------------------------------------------------------------- rutas y config
@@ -88,6 +89,25 @@ def load_config():
 def save_config(data):
     app_data_dir().mkdir(parents=True, exist_ok=True)
     config_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def archiver_config_path():
+    """Config del archivador, que ya guarda la direccion del servidor."""
+    return app_data_dir() / "archiver.json"
+
+
+def base_url_heredada():
+    """Direccion del servidor tomada del archivador, si ya esta instalado."""
+    path = archiver_config_path()
+    if path.exists():
+        try:
+            datos = json.loads(path.read_text(encoding="utf-8"))
+            url = (datos.get("base_url") or "").strip()
+            if url:
+                return url.rstrip("/")
+        except Exception:
+            pass
+    return ""
 
 
 def guess_dropbox_dir():
@@ -308,10 +328,8 @@ def programar_tarea(python_exe, script):
         raise RuntimeError(f"No se pudo crear la tarea programada: {resultado.stderr.strip()}")
 
 
-def setup():
-    print("Configuracion del respaldo de Capataz Campo")
-    print("-" * 48)
-
+def valores_sugeridos():
+    """Que proponer sin preguntarle nada a nadie."""
     anterior = {}
     if config_path().exists():
         try:
@@ -319,32 +337,64 @@ def setup():
         except Exception:
             anterior = {}
 
-    base_default = anterior.get("base_url", "")
-    base_url = input(f"Direccion de Capataz Campo [{base_default}]: ").strip() or base_default
+    base_url = anterior.get("base_url") or base_url_heredada() or DEFAULT_BASE_URL
+
+    carpeta = anterior.get("backup_root")
+    dropbox = None
+    if not carpeta:
+        dropbox = guess_dropbox_dir()
+        carpeta = str((dropbox or Path.home() / "Documents") / "CapatazCampo" / "respaldos")
+
+    return {
+        "base_url": base_url.rstrip("/"),
+        "backup_root": carpeta,
+        "keep": int(anterior.get("keep", DEFAULT_KEEP)),
+        "dropbox": dropbox,
+    }
+
+
+def setup(interactivo=True, base_url=None, carpeta=None, copias=None):
+    print("Configuracion del respaldo de Capataz Campo")
+    print("-" * 48)
+
+    sugerido = valores_sugeridos()
+    base_url = base_url or sugerido["base_url"]
+    carpeta = carpeta or sugerido["backup_root"]
+    conservar = int(copias or sugerido["keep"])
+
+    if sugerido["dropbox"]:
+        print("\nEncontre Dropbox. Guardo ahi: el archivo queda en el disco Y en la nube.")
+
+    if interactivo:
+        base_url = input(f"Direccion de Capataz Campo [{base_url}]: ").strip() or base_url
+        carpeta = input(f"Carpeta de respaldos [{carpeta}]: ").strip() or carpeta
+        respuesta = input(f"Cuantas copias conservar [{conservar}]: ").strip()
+        conservar = int(respuesta or conservar)
+    else:
+        print(f"\n  Servidor: {base_url}")
+        print(f"  Carpeta:  {carpeta}")
+        print(f"  Copias:   {conservar}")
+
     if not base_url:
         print("Hace falta la direccion del servidor.")
         return 1
 
-    sugerida = anterior.get("backup_root")
-    if not sugerida:
-        dropbox = guess_dropbox_dir()
-        sugerida = str((dropbox or Path.home() / "Documents") / "CapatazCampo" / "respaldos")
-        if dropbox:
-            print(f"\nEncontre Dropbox. Sugiero guardar ahi: queda en el disco y en la nube.")
-    carpeta = input(f"Carpeta de respaldos [{sugerida}]: ").strip() or sugerida
-
-    conservar = input(f"Cuantas copias conservar [{anterior.get('keep', DEFAULT_KEEP)}]: ").strip()
-    conservar = int(conservar or anterior.get("keep", DEFAULT_KEEP))
-
     token = keyring.get_password(KEYRING_SERVICE, KEYRING_USER)
     if token:
         print("\nUso la misma clave que ya tenia guardada el archivador.")
-    else:
+    elif interactivo:
         token = getpass.getpass("Clave de Capataz Campo (FIELD_APP_TOKEN): ").strip()
         if not token:
             print("Hace falta la clave.")
             return 1
         keyring.set_password(KEYRING_SERVICE, KEYRING_USER, token)
+    else:
+        print(
+            "\nNo hay ninguna clave guardada en este equipo.\n"
+            "Corre una vez:  python respaldar_supabase.py --setup\n"
+            "y cargala ahi. Despues este instalador funciona solo."
+        )
+        return 1
 
     config = {
         "base_url": base_url,
@@ -378,12 +428,22 @@ def main():
     parser.add_argument("--setup", action="store_true", help="configurar y programar")
     parser.add_argument("--verificar", action="store_true", help="revisar el ultimo respaldo")
     parser.add_argument("--verbose", action="store_true", help="mostrar el detalle en pantalla")
+    parser.add_argument("--sin-preguntas", action="store_true", dest="sin_preguntas",
+                        help="configurar sin teclear nada, usando lo que ya sabe el archivador")
+    parser.add_argument("--base-url", dest="base_url", help="direccion de Capataz Campo")
+    parser.add_argument("--carpeta", help="carpeta donde guardar los respaldos")
+    parser.add_argument("--copias", type=int, help="cuantas copias conservar")
     args = parser.parse_args()
 
-    configure_logging(args.verbose or args.setup or args.verificar)
+    configure_logging(args.verbose or args.setup or args.verificar or args.sin_preguntas)
 
-    if args.setup:
-        return setup()
+    if args.setup or args.sin_preguntas:
+        return setup(
+            interactivo=not args.sin_preguntas,
+            base_url=args.base_url,
+            carpeta=args.carpeta,
+            copias=args.copias,
+        )
 
     try:
         config = load_config()
