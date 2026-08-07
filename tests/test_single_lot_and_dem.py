@@ -167,3 +167,47 @@ class SingleLotZoningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TemporalSeriesTests(unittest.TestCase):
+    def test_water_percentage_counts_positive_ndwi(self):
+        values = np.array([[0.2, -0.3], [0.1, np.nan]])
+        self.assertAlmostEqual(geospatial_worker.water_percentage(values), 66.7, delta=0.1)
+
+    def test_water_percentage_empty_is_nan(self):
+        self.assertNotEqual(
+            geospatial_worker.water_percentage(np.array([np.nan])),
+            geospatial_worker.water_percentage(np.array([np.nan])),
+        )
+
+    def test_annual_series_present_in_analysis(self):
+        try:
+            import rasterio
+        except ImportError:
+            self.skipTest("rasterio no instalado")
+        import tempfile
+        from pathlib import Path
+        from rasterio.transform import from_bounds
+
+        size = 50
+        transform = from_bounds(-58.2, -32.77, -58.15, -32.72, size, size)
+        profile = {"driver": "GTiff", "width": size, "height": size, "count": 1,
+                   "dtype": "float32", "crs": "EPSG:4326", "transform": transform}
+        boundary = {"type": "Polygon",
+                    "coordinates": [[[-58.2, -32.77], [-58.15, -32.77], [-58.15, -32.72], [-58.2, -32.72], [-58.2, -32.77]]],
+                    "features": []}
+        with tempfile.TemporaryDirectory() as td:
+            annual = []
+            for year, base in ((2024, 0.5), (2025, 0.6), (2026, 0.7)):
+                path = str(Path(td) / f"ndvi_{year}.tif")
+                with rasterio.open(path, "w", **profile) as out:
+                    out.write(np.full((size, size), base, dtype="float32"), 1)
+                annual.append({"year": year, "path": path, "from": f"{year}-01-01", "to": f"{year}-07-19"})
+            analysis = geospatial_worker.build_multiyear_ndvi_analysis(
+                boundary, annual, str(Path(td) / "stable.tif")
+            )
+        series = analysis["annual_series"]
+        self.assertEqual([row["year"] for row in series], [2024, 2025, 2026])
+        self.assertAlmostEqual(series[0]["mean"], 0.5, places=2)
+        self.assertAlmostEqual(series[2]["mean"], 0.7, places=2)
+        self.assertLess(series[0]["mean"], series[2]["mean"])

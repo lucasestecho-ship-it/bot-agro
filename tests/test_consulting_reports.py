@@ -58,6 +58,10 @@ class ReportPlaybookTests(unittest.TestCase):
         )
 
     def test_deliverable_routes_the_complete_specialist_crew(self):
+        from unittest.mock import patch
+        env = patch.dict("os.environ", {"CAPATAZ_SUSPENDED_AGENTS": ""})
+        env.start()
+        self.addCleanup(env.stop)
         with tempfile.TemporaryDirectory() as temp_dir:
             crew = AgentCrew(CapatazStore(data_dir=Path(temp_dir)))
             draft = heuristic_analysis("Comparar presupuestos de bombas para La Susana")

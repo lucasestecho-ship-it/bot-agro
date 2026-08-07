@@ -274,6 +274,70 @@ def _save_zoning_map(analysis, output_path):
     plt.close(fig)
 
 
+def _save_annual_chart(analysis, output_path):
+    series = analysis.get("annual_series") or []
+    years = [row["year"] for row in series]
+    means = [row["mean"] for row in series]
+    p10 = [row["p10"] for row in series]
+    p90 = [row["p90"] for row in series]
+    fig, ax = plt.subplots(figsize=(6.4, 3.6), dpi=170)
+    ax.fill_between(years, p10, p90, color="#97C459", alpha=0.35, label="P10-P90 espacial")
+    ax.plot(years, means, color="#174d2d", marker="o", linewidth=1.6, label="NDVI medio")
+    ax.set_title("Variación del NDVI a lo largo de los años", color="#174d2d", fontweight="bold")
+    ax.set_xlabel("Año (mismo corte estacional)")
+    ax.set_ylabel("NDVI")
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(output_path, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_monthly_chart(monthly, output_path):
+    labels = [row["label"][2:] for row in monthly]
+    means = np.array([row["mean"] for row in monthly])
+    stds = np.array([row["std"] for row in monthly])
+    fig, ax = plt.subplots(figsize=(6.4, 3.6), dpi=170)
+    x = np.arange(len(labels))
+    ax.fill_between(x, means - stds, means + stds, color="#85B7EB", alpha=0.35, label="± desvío espacial")
+    ax.plot(x, means, color="#0C447C", marker="o", linewidth=1.6, label="NDVI mediano del mes")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, fontsize=6.5)
+    ax.set_title("Evolución mensual del NDVI (últimos 12 meses)", color="#174d2d", fontweight="bold")
+    ax.set_ylabel("NDVI")
+    ax.set_ylim(0, 1)
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(output_path, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _save_water_map(analysis, output_path):
+    from matplotlib.colors import ListedColormap
+
+    water = analysis["water"]
+    values = np.asarray(water["_values"], dtype="float64")
+    classes = np.full(values.shape, np.nan)
+    classes[np.isfinite(values) & (values <= 0)] = 0
+    classes[np.isfinite(values) & (values > 0)] = 1
+    bounds = water["_bounds"]
+    extent = [bounds[0], bounds[2], bounds[1], bounds[3]]
+    cmap = ListedColormap(["#e8e3d3", "#2b6cb0"])
+    fig, ax = plt.subplots(figsize=(7.5, 4.6), dpi=170)
+    ax.imshow(np.ma.masked_invalid(classes), extent=extent, origin="upper", cmap=cmap, vmin=0, vmax=1)
+    ax.set_title(
+        f"Agua superficial (NDWI>0): {water['pct']:.1f}% del área", color="#174d2d", fontweight="bold"
+    )
+    ax.set_xlabel("Longitud")
+    ax.set_ylabel("Latitud")
+    ax.set_aspect("equal", adjustable="box")
+    fig.tight_layout()
+    fig.savefig(output_path, facecolor="white", bbox_inches="tight")
+    plt.close(fig)
+
+
 def _save_forest_chart(rows, output_path):
     names = [row["name"] for row in rows][::-1]
     means = [row["ndvi_mean"] for row in rows][::-1]
@@ -363,10 +427,21 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
         change_chart = temp / "change.png"
         zoning = analysis.get("zoning")
         zoning_map = temp / "zoning.png"
+        annual_chart = temp / "annual.png"
+        monthly_chart = temp / "monthly.png"
+        water_map = temp / "water.png"
+        monthly = analysis.get("monthly_series") or []
+        water = analysis.get("water")
         _save_use_map(lot_rows, use_map)
         _save_stable_map(analysis, stable_map)
         if zoning:
             _save_zoning_map(analysis, zoning_map)
+        if analysis.get("annual_series"):
+            _save_annual_chart(analysis, annual_chart)
+        if monthly:
+            _save_monthly_chart(monthly, monthly_chart)
+        if water and water.get("pct") == water.get("pct"):
+            _save_water_map(analysis, water_map)
         if forests:
             _save_forest_chart(forests, forest_chart)
         if pasture:
@@ -376,6 +451,7 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
             )
             _save_change_chart(pasture, years, change_chart)
 
+        page_counter = iter(range(1, 99))
         pdf = canvas.Canvas(str(output), pagesize=landscape(A4))
         integrated = bool(analysis.get("has_soil"))
         pdf.setTitle(
@@ -384,7 +460,7 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
         pdf.setAuthor("Ing. Agr. Lucas Estecho")
 
         # 1. Resumen
-        _header_footer(pdf, 1, field_name, logo_path)
+        _header_footer(pdf, next(page_counter), field_name, logo_path)
         pdf.setFillColor(GREEN)
         pdf.setFont(FONT_BOLD, 20)
         pdf.drawString(
@@ -458,7 +534,7 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
         pdf.showPage()
 
         # 2. Lotes
-        _header_footer(pdf, 2, field_name, logo_path)
+        _header_footer(pdf, next(page_counter), field_name, logo_path)
         y = _title(pdf, "1. Lotes y uso declarado")
         y = _text(pdf, "La clasificación forestal usa el nombre del lote: Forestal, Monte, Eucalipto o Pino. El resto se mantiene como pastoril.", LEFT, y, size=8.5)
         _draw_image(pdf, use_map, LEFT + 70, y - 4, CONTENT_W - 140, 405)
@@ -466,11 +542,11 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
                    f"Forestaciones: {_fmt(analysis.get('forest_area_ha'))} ha. Pastoriles: {_fmt(analysis.get('pasture_area_ha'))} ha.", LEFT, 58, size=8.4)
         pdf.showPage()
 
-        # 3. Forestaciones
-        _header_footer(pdf, 3, field_name, logo_path)
-        y = _title(pdf, "2. Forestaciones: lectura correcta del NDVI")
-        y = _text(pdf, "En forestación, un NDVI alto indica cobertura y vigor de copa. No debe mezclarse con potreros ni usarse directamente para estimar pasto.", LEFT, y, size=8.7)
+        # 3. Forestaciones (solo si el plano identifica alguna)
         if forests:
+            _header_footer(pdf, next(page_counter), field_name, logo_path)
+            y = _title(pdf, "2. Forestaciones: lectura correcta del NDVI")
+            y = _text(pdf, "En forestación, un NDVI alto indica cobertura y vigor de copa. No debe mezclarse con potreros ni usarse directamente para estimar pasto.", LEFT, y, size=8.7)
             _draw_image(pdf, forest_chart, LEFT, y - 2, 355, 255)
             rows = [["Forestal", "ha", "NDVI medio", "P10", "P90", "CV %", "Amb. alto %"]]
             for row in forests[:10]:
@@ -480,12 +556,10 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
             _table(pdf, rows, [115, 48, 76, 58, 58, 55, 73], LEFT + 370, y - 14,
                    row_height=22, font_size=7.2)
             _box(pdf, "Las diferencias internas sirven para monitorear la forestación, detectar claros o heterogeneidad y elegir recorridas; no para cuantificar forraje.", LEFT, 90, CONTENT_W)
-        else:
-            _box(pdf, "No se identificaron forestaciones por nombre. Verificá que el campo Name/Nombre del Shapefile distinga correctamente los usos antes de interpretar el ranking.", LEFT, y - 20, CONTENT_W)
-        pdf.showPage()
+            pdf.showPage()
 
         # 4. Estable
-        _header_footer(pdf, 4, field_name, logo_path)
+        _header_footer(pdf, next(page_counter), field_name, logo_path)
         y = _title(pdf, "3. NDVI estable multianual por lote")
         y = _text(pdf, "El NDVI estable resume la capacidad histórica de expresar cobertura verde durante el mismo período estacional. No representa una fecha puntual.", LEFT, y, size=8.6)
         _draw_image(pdf, stable_map, LEFT + 65, y - 2, CONTENT_W - 130, 405)
@@ -495,8 +569,47 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
                    "Las zonas rojas y amarillas son brechas relativas que deben cruzarse con suelo, manejo, agua y recorridas.", LEFT, 58, size=8.4)
         pdf.showPage()
 
+        # Evolucion temporal: interanual y mensual (calculo directo de Sentinel-2)
+        if analysis.get("annual_series") or monthly:
+            _header_footer(pdf, next(page_counter), field_name, logo_path)
+            y = _title(pdf, "Evolución temporal del NDVI")
+            y = _text(
+                pdf,
+                "Izquierda: variación del NDVI entre años (banda P10-P90 = heterogeneidad espacial). "
+                "Derecha: evolución mensual del último año con su variabilidad. Calculado píxel a píxel "
+                "sobre Sentinel-2, sin estimaciones.",
+                LEFT, y, size=8.6,
+            )
+            if analysis.get("annual_series"):
+                _draw_image(pdf, annual_chart, LEFT, y - 6, 365, 330)
+            if monthly:
+                _draw_image(pdf, monthly_chart, LEFT + 385, y - 6, 365, 330)
+            lows = sorted(monthly, key=lambda row: row["mean"])[:2]
+            note = (
+                "Meses de menor NDVI del último año: "
+                + ", ".join(f"{row['label']} ({row['mean']:.2f})" for row in lows)
+                + ". Contrastar con carga, clima y descansos."
+            ) if monthly else "Sin serie mensual disponible en este periodo."
+            _box(pdf, note, LEFT, 76, CONTENT_W - 75)
+            pdf.showPage()
+
+        # Agua superficial / inundacion (si fue pedida)
+        if water and water.get("pct") == water.get("pct"):
+            _header_footer(pdf, next(page_counter), field_name, logo_path)
+            y = _title(pdf, "Agua superficial y anegamiento")
+            y = _text(
+                pdf,
+                f"Detección por NDWI (banda verde vs. infrarroja) entre {water['from']} y {water['to']}: "
+                f"{water['pct']:.1f}% del área analizada presenta agua superficial. Es una foto del último "
+                "mes, no un mapa de riesgo hídrico histórico.",
+                LEFT, y, size=8.6,
+            )
+            _draw_image(pdf, water_map, LEFT + 90, y - 6, CONTENT_W - 180, 360)
+            _box(pdf, "Para delimitar zonas inundables históricas y vías de escurrimiento, pedí también el análisis topográfico (usa el modelo de elevación).", LEFT, 76, CONTENT_W - 75)
+            pdf.showPage()
+
         # 5. Ranking (o ambientacion si hay un solo poligono)
-        _header_footer(pdf, 5, field_name, logo_path)
+        _header_footer(pdf, next(page_counter), field_name, logo_path)
         if zoning:
             y = _title(pdf, "4. Ambientación intracampo por NDVI estable")
             y = _text(
@@ -561,7 +674,7 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
             pdf.showPage()
 
         # 6. Tabla detallada
-        _header_footer(pdf, 6, field_name, logo_path)
+        _header_footer(pdf, next(page_counter), field_name, logo_path)
         y = _title(pdf, "5. Resultados detallados de los lotes pastoriles")
         y = _text(pdf, "NDVI med. y percentiles describen la variación espacial del NDVI estable; CV resume variabilidad entre años; Δ compara el P90 del último período con el anterior.", LEFT, y, size=8.1)
         rows = [["Lote", "ha", "NDVI med.", "P10", "P90", "Mín.", "Máx.", "CV %", "Δ reciente", "Amb. alto %", "Suelo %", "Índice", "Clase"]]
@@ -585,7 +698,7 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
         pdf.showPage()
 
         # 7. Suelos y relieve
-        _header_footer(pdf, 7, field_name, logo_path)
+        _header_footer(pdf, next(page_counter), field_name, logo_path)
         y = _title(pdf, "6. Suelos y relieve por lote")
         has_soil = bool(analysis.get("has_soil"))
         has_soil_layer = bool(analysis.get("soil_layer_present"))
@@ -658,7 +771,7 @@ def generate_ndvi_report(analysis, output_path, *, field_name, logo_path=None):
         pdf.showPage()
 
         # 8. Cambio y recomendaciones
-        _header_footer(pdf, 8, field_name, logo_path)
+        _header_footer(pdf, next(page_counter), field_name, logo_path)
         y = _title(pdf, "7. Evolución reciente y recomendaciones")
         if pasture:
             _draw_image(pdf, change_chart, LEFT + 75, y, CONTENT_W - 150, 290)
